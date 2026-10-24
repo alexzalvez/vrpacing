@@ -1,11 +1,18 @@
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -153,14 +160,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
     }
 
     const double s = g_cfg.upscaling.scale;
-    uint32_t outW = static_cast<uint32_t>(std::max(1.0, std::floor(cropW * s)));
-    uint32_t outH = static_cast<uint32_t>(std::max(1.0, std::floor(cropH * s)));
+    uint32_t outW = static_cast<uint32_t>((std::max)(1.0, std::floor(cropW * s)));
+    uint32_t outH = static_cast<uint32_t>((std::max)(1.0, std::floor(cropH * s)));
 
     const uint64_t px = static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH);
     if (px > g_cfg.upscaling.maxOutputPixels) {
         const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(px));
-        outW = static_cast<uint32_t>(std::max(1.0, std::floor(outW * factor)));
-        outH = static_cast<uint32_t>(std::max(1.0, std::floor(outH * factor)));
+        outW = static_cast<uint32_t>((std::max)(1.0, std::floor(outW * factor)));
+        outH = static_cast<uint32_t>((std::max)(1.0, std::floor(outH * factor)));
     }
 
     const int eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
@@ -238,7 +245,7 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
             g_hookedInterfaces.insert(name);
 
             unsigned int version = 0;
-            if (std::sscanf(name, "IVRCompositor_%u", &version) != 1) {
+            if (std::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
                 version = 26;
             }
 

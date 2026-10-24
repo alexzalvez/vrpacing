@@ -1,5 +1,11 @@
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -51,7 +57,7 @@ ovrGetTextureSwapChainCurrentIndexFn g_ovrGetTextureSwapChainCurrentIndex = null
 ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
-uint32_t g_oculusVersion = 32; // Default a versión moderna (>= 25)
+uint32_t g_oculusVersion = 32;
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
@@ -151,14 +157,14 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         }
 
         const double s = (g_cfg.upscaling.scale > 1.0f) ? g_cfg.upscaling.scale : 1.0f;
-        int outW = static_cast<int>(std::max(1.0, std::floor(desc.Width * s)));
-        int outH = static_cast<int>(std::max(1.0, std::floor(desc.Height * s)));
+        int outW = static_cast<int>((std::max)(1.0, std::floor(desc.Width * s)));
+        int outH = static_cast<int>((std::max)(1.0, std::floor(desc.Height * s)));
 
         const uint64_t px = static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH);
         if (px > g_cfg.upscaling.maxOutputPixels) {
             const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(px));
-            outW = static_cast<int>(std::max(1.0, std::floor(outW * factor)));
-            outH = static_cast<int>(std::max(1.0, std::floor(outH * factor)));
+            outW = static_cast<int>((std::max)(1.0, std::floor(outW * factor)));
+            outH = static_cast<int>((std::max)(1.0, std::floor(outH * factor)));
         }
 
         ovrTextureSwapChainDesc outDesc = desc;
@@ -227,7 +233,6 @@ void ProcessAndUpscaleLayer(ovrSession session,
 
         int inIdx = 0;
         g_ovrGetTextureSwapChainCurrentIndex(session, curIn, &inIdx);
-        // Como el motor ya ejecutó Commit, retrocedemos 1 posición circularmente
         inIdx = (inIdx - 1 + inLen) % inLen;
 
         ComPtr<ID3D11Texture2D> inTex;
@@ -389,7 +394,7 @@ ovrResult __cdecl Hooked_ovrSubmitFrame(ovrSession session,
 
                 modifiedLayers[i] = reinterpret_cast<const ovrLayerHeader*>(&oldDepthLayerCopy.Header);
             }
-            break; // Generalmente la capa 0 es la principal 3D
+            break;
         }
     }
 
