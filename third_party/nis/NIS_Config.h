@@ -74,7 +74,9 @@ struct NIS_ALIGNED(256) NISConfig
 
     uint32_t projCentre[2];
     uint32_t squaredRadius;
-	uint32_t debugMode;
+    uint32_t squaredMaxRadius;
+    uint32_t debugMode;
+    uint32_t reserved2[3];
 };
 
 enum class NISHDRMode : uint32_t
