@@ -31,11 +31,23 @@ jobs:
         run: |
           $out = "dist/VRPacing"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Copy-Item "build/windows-release/Release/VRPacingLayer.dll" -Destination $out -ErrorAction SilentlyContinue
-          Copy-Item "build/windows-release/Release/VRPacingHook.dll" -Destination $out -ErrorAction SilentlyContinue
-          Copy-Item "build/windows-release/Release/VRPacingTray.exe" -Destination $out -ErrorAction SilentlyContinue
-          Copy-Item "build/windows-release/VRPacingLayer.json" -Destination $out -ErrorAction SilentlyContinue
-          Copy-Item "scripts/*.ps1" -Destination $out -ErrorAction SilentlyContinue
+
+          $required = @("VRPacingLayer.dll", "VRPacingHook.dll", "VRPacingTray.exe")
+          foreach ($file in $required) {
+              $found = Get-ChildItem -Path "build/windows-release" -Filter $file -Recurse | Select-Object -First 1
+              if (-not $found) {
+                  throw "Error critico: no se encontro el binario compilado $file en build/windows-release"
+              }
+              Copy-Item $found.FullName -Destination $out
+          }
+
+          $json = Get-ChildItem -Path "build/windows-release" -Filter "VRPacingLayer.json" -Recurse | Select-Object -First 1
+          if ($json) { Copy-Item $json.FullName -Destination $out }
+
+          if (Test-Path "scripts") {
+              Copy-Item "scripts/*.ps1" -Destination $out
+          }
+
           Compress-Archive -Path "$out/*" -DestinationPath "dist/VRPacing-windows-x64.zip" -Force
 
       - name: Upload artifact
