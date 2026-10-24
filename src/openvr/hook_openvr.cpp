@@ -245,7 +245,7 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
             g_hookedInterfaces.insert(name);
 
             unsigned int version = 0;
-            if (std::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
+            if (::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
                 version = 26;
             }
 
