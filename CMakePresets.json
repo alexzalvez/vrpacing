@@ -1,0 +1,48 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VRPACING_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "windows-release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "VRPACING_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
+    }
+  ]
+}
