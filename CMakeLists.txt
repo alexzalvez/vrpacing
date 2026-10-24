@@ -56,6 +56,7 @@ if(WIN32)
 
   add_library(VRPacingLayer SHARED
     src/openxr/layer.cpp
+    src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
   )
   target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi)
@@ -66,6 +67,7 @@ if(WIN32)
     src/hook_dllmain.cpp
     src/openvr/hook_openvr.cpp
     src/oculus/hook_oculus.cpp
+    src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/injector/process_scanner.cpp
   )
