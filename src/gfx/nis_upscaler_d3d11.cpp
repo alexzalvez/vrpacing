@@ -147,9 +147,17 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     );
 
     const float radius = 0.5f * desc.radius * static_cast<float>(dstR.height);
-    constants.projCentre[0] = static_cast<float>(dstR.width) * desc.projCenterX;
-    constants.projCentre[1] = static_cast<float>(dstR.height) * desc.projCenterY;
-    constants.squaredRadius = radius * radius;
+    constants.projCentre[0] = static_cast<uint32_t>(static_cast<float>(dstR.width) * desc.projCenterX);
+    constants.projCentre[1] = static_cast<uint32_t>(static_cast<float>(dstR.height) * desc.projCenterY);
+    constants.squaredRadius = static_cast<uint32_t>(radius * radius);
+
+    if (desc.maskEnabled) {
+        const float maxRadius = 0.5f * 1.00f * static_cast<float>(dstR.height);
+        constants.squaredMaxRadius = static_cast<uint32_t>(maxRadius * maxRadius);
+    } else {
+        constants.squaredMaxRadius = 0xFFFFFFFFu;
+    }
+
     constants.debugMode = 0;
 
     ctx->UpdateSubresource(constantsBuffer_.Get(), 0, nullptr, &constants, 0, 0);
