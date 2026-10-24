@@ -3,6 +3,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <unknwn.h>
 #include <d3d11.h>
@@ -71,7 +74,7 @@ void EnsureInit() {
 
 XrSwapchain ResolveRealSwapchain(XrSwapchain maybeFake) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_swapchains.find(static_cast<uint64_t>(maybeFake));
+    auto it = g_swapchains.find(reinterpret_cast<uint64_t>(maybeFake));
     if (it == g_swapchains.end()) {
         return maybeFake;
     }
@@ -80,7 +83,7 @@ XrSwapchain ResolveRealSwapchain(XrSwapchain maybeFake) {
 
 bool GetProxy(XrSwapchain maybeFake, SwapchainProxy* out) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_swapchains.find(static_cast<uint64_t>(maybeFake));
+    auto it = g_swapchains.find(reinterpret_cast<uint64_t>(maybeFake));
     if (it == g_swapchains.end()) return false;
     *out = it->second;
     return true;
@@ -122,10 +125,10 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     XrResult res = g_nextCreateSwapchain(session, &realInfo, &real);
     if (XR_FAILED(res)) return res;
 
-    const XrSwapchain fake = static_cast<XrSwapchain>(g_fakeSwapchainCounter.fetch_add(1));
+    const XrSwapchain fake = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(g_fakeSwapchainCounter.fetch_add(1)));
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_swapchains[static_cast<uint64_t>(fake)] = {real, createInfo->width, createInfo->height, realInfo.width, realInfo.height};
+        g_swapchains[reinterpret_cast<uint64_t>(fake)] = {real, createInfo->width, createInfo->height, realInfo.width, realInfo.height};
     }
     *swapchain = fake;
     return XR_SUCCESS;
@@ -148,7 +151,7 @@ XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
     XrSwapchain real = swapchain;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_swapchains.find(static_cast<uint64_t>(swapchain));
+        auto it = g_swapchains.find(reinterpret_cast<uint64_t>(swapchain));
         if (it != g_swapchains.end()) {
             real = it->second.real;
             g_swapchains.erase(it);
