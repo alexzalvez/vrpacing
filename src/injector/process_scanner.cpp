@@ -1,10 +1,18 @@
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "process_scanner.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <string>
 #include <vector>
 
 #include "common/logging_win.h"
@@ -84,7 +92,9 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
     if (Process32FirstW(snapshot, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
-                result = InjectDllToProcess(pe.th32ProcessID, dllPath);
+                if (!ProcessHasModule(pe.th32ProcessID, L"VRPacingHook.dll")) {
+                    result = InjectDllToProcess(pe.th32ProcessID, dllPath);
+                }
                 break;
             }
         } while (Process32NextW(snapshot, &pe));
@@ -102,19 +112,27 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
 
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
+    const DWORD myPid = GetCurrentProcessId();
 
     if (Process32FirstW(snapshot, &pe)) {
         do {
-            HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
-            if (!process) {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == myPid) {
                 continue;
             }
-            CloseHandle(process);
 
-            if (ProcessHasModule(pe.th32ProcessID, L"openvr_api.dll") ||
-                ProcessHasModule(pe.th32ProcessID, L"LibOVRRT64_1.dll")) {
+            if (ProcessHasModule(pe.th32ProcessID, L"VRPacingHook.dll")) {
+                continue;
+            }
+
+            const bool isVRProcess =
+                ProcessHasModule(pe.th32ProcessID, L"openvr_api.dll") ||
+                ProcessHasModule(pe.th32ProcessID, L"LibOVRRT64_1.dll") ||
+                ProcessHasModule(pe.th32ProcessID, L"VirtualDesktop.LibOVRRT64_1.dll") ||
+                ProcessHasModule(pe.th32ProcessID, L"LibPVRRT64_1_X.dll");
+
+            if (isVRProcess) {
                 if (InjectDllToProcess(pe.th32ProcessID, dllPath)) {
-                    LogMessage(LogLevel::Info, "Inyección aplicada al proceso detectado.");
+                    LogMessage(LogLevel::Info, "Inyeccion VRPacingHook completada en PID " + std::to_string(pe.th32ProcessID));
                 }
             }
         } while (Process32NextW(snapshot, &pe));
