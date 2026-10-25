@@ -329,7 +329,7 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
         const double t1 = g_ovrGetPredictedDisplayTime(session, frameIndex + 1);
         const double dt = t1 - t0;
         if (dt > 0.004 && dt < 0.025) {
-            g_hzTracker.ObserveRuntimeHz(std::round(1.0 / dt));
+            g_hzTracker.PushHz(std::round(1.0 / dt));
         }
     }
 

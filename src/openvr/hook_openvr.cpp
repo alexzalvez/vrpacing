@@ -88,7 +88,7 @@ void UpdateOpenVRHz() {
         vr::ETrackedPropertyError propErr = vr::TrackedProp_Success;
         float freq = g_vrSystem->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &propErr);
         if (propErr == vr::TrackedProp_Success && freq > 30.0f) {
-            g_hzTracker.ObserveRuntimeHz(static_cast<double>(freq));
+            g_hzTracker.PushHz(static_cast<double>(freq));
         }
     }
 }
