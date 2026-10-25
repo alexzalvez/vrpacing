@@ -8,8 +8,9 @@ constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared";
 
 #pragma pack(push, 1)
 struct SharedState {
-    uint32_t version = 3;
+    uint32_t version = 4;
     uint32_t flags = 0;
+    uint32_t activePid = 0;
     double frameGenDivisor = 1.0;
     double offsetFps = 0.10;
     double effectiveHz = 0.0;

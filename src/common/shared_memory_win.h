@@ -66,7 +66,7 @@ public:
 
     void SyncConfig(RuntimeConfig& cfg) {
         if (!OpenOrCreate() || !shared_) return;
-        if (shared_->version != 3) return;
+        if (shared_->version != 4) return;
 
         const uint32_t flags = shared_->flags;
         cfg.enabled = (flags & kFlagEnabled) != 0;
@@ -94,6 +94,7 @@ public:
                          int32_t hresult = 0) {
         if (!OpenOrCreate() || !shared_) return;
 
+        shared_->activePid = GetCurrentProcessId();
         shared_->effectiveHz = effectiveHz;
         shared_->appliedCap = appliedCap;
         shared_->frameCounter++;

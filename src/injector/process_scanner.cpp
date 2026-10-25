@@ -123,6 +123,7 @@ bool InjectDllToProcess(DWORD pid, const std::wstring& dllPath) {
 
 struct ProcessModuleCheckResult {
     bool hasHook = false;
+    bool hasOpenXRLayer = false;
     bool isVR = false;
 };
 
@@ -140,13 +141,16 @@ ProcessModuleCheckResult CheckProcessModules(DWORD pid) {
             if (_wcsicmp(me.szModule, L"VRPacingHook.dll") == 0) {
                 res.hasHook = true;
             }
+            if (_wcsicmp(me.szModule, L"VRPacingLayer.dll") == 0) {
+                res.hasOpenXRLayer = true;
+            }
             if (_wcsicmp(me.szModule, L"openvr_api.dll") == 0 ||
                 _wcsicmp(me.szModule, L"LibOVRRT64_1.dll") == 0 ||
                 _wcsicmp(me.szModule, L"VirtualDesktop.LibOVRRT64_1.dll") == 0 ||
                 _wcsicmp(me.szModule, L"LibPVRRT64_1_X.dll") == 0) {
                 res.isVR = true;
             }
-            if (res.hasHook && res.isVR) {
+            if ((res.hasHook || res.hasOpenXRLayer) && res.isVR) {
                 break;
             }
         } while (Module32NextW(snapshot, &me));
@@ -176,7 +180,7 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
         do {
             if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
                 auto check = CheckProcessModules(pe.th32ProcessID);
-                if (!check.hasHook) {
+                if (!check.hasHook && !check.hasOpenXRLayer) {
                     result = InjectDllToProcess(pe.th32ProcessID, dllPath);
                     if (result) {
                         s_hookedPids.insert(pe.th32ProcessID);
@@ -231,8 +235,13 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
             s_inspectedPids[pe.th32ProcessID]++;
 
             auto check = CheckProcessModules(pe.th32ProcessID);
-            if (check.hasHook) {
+            if (check.hasHook || check.hasOpenXRLayer) {
                 s_hookedPids.insert(pe.th32ProcessID);
+                if (check.hasOpenXRLayer) {
+                    std::wstring ws(pe.szExeFile);
+                    LogMessage(LogLevel::Info, "Proceso VR ya gestionado por OpenXR Layer (omitiendo VRPacingHook): " +
+                               std::string(ws.begin(), ws.end()) + " [PID " + std::to_string(pe.th32ProcessID) + "]");
+                }
                 continue;
             }
 

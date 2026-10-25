@@ -152,6 +152,43 @@ void UpdateTelemetryDisplay() {
     wchar_t txtPipe[128]{};
 
     if (g_shared) {
+        // Watchdog de proceso VR: si el proceso termino, limpiar estado a Idle
+        if (g_shared->activePid != 0) {
+            HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, g_shared->activePid);
+            if (hProc) {
+                DWORD waitRes = WaitForSingleObject(hProc, 0);
+                CloseHandle(hProc);
+                if (waitRes == WAIT_OBJECT_0) {
+                    g_shared->activePid = 0;
+                    wcscpy_s(g_shared->activeApi, L"Idle");
+                    wcscpy_s(g_shared->hookedProcess, L"None");
+                    g_shared->inputWidth = 0;
+                    g_shared->inputHeight = 0;
+                    g_shared->outputWidth = 0;
+                    g_shared->outputHeight = 0;
+                    g_shared->dxgiFormat = 0;
+                    g_shared->upscaleStatus = 0;
+                    g_shared->lastHResult = 0;
+                    g_shared->appliedCap = 0.0;
+                    vrpacing::LogMessage(vrpacing::LogLevel::Info, "Juego VR cerrado. Telemetria e IPC restablecidos a Idle.");
+                }
+            } else {
+                if (GetLastError() == ERROR_INVALID_PARAMETER) {
+                    g_shared->activePid = 0;
+                    wcscpy_s(g_shared->activeApi, L"Idle");
+                    wcscpy_s(g_shared->hookedProcess, L"None");
+                    g_shared->inputWidth = 0;
+                    g_shared->inputHeight = 0;
+                    g_shared->outputWidth = 0;
+                    g_shared->outputHeight = 0;
+                    g_shared->dxgiFormat = 0;
+                    g_shared->upscaleStatus = 0;
+                    g_shared->lastHResult = 0;
+                    g_shared->appliedCap = 0.0;
+                }
+            }
+        }
+
         const bool hasApi = (g_shared->activeApi[0] != L'\0' &&
                              wcscmp(g_shared->activeApi, L"Idle") != 0 &&
                              wcscmp(g_shared->activeApi, L"none") != 0);
@@ -586,7 +623,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared = reinterpret_cast<vrpacing::SharedState*>(view);
     if (g_shared) {
         *g_shared = {};
-        g_shared->version = 3;
+        g_shared->version = 4;
+        g_shared->activePid = 0;
         UpdateSharedStateFlags();
         wcscpy_s(g_shared->activeApi, L"Idle");
     }
