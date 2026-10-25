@@ -41,6 +41,29 @@ jobs:
               Copy-Item $found.FullName -Destination $out
           }
 
+          @'
+{
+  "enabled": true,
+  "upscaling": {
+    "enabled": true,
+    "scale": 2.0,
+    "sharpness": 0.0,
+    "radius": 0.60,
+    "maxOutputPixels": 32000000
+  },
+  "mask": {
+    "enabled": true
+  },
+  "pacing": {
+    "enabled": true,
+    "offsetFps": 0.1,
+    "frameGenDivisor": 1.0
+  }
+}
+'@ | Set-Content -Path "$out/vrpacing.json" -NoNewline
+          if ($false) {
+          }
+
           $json = Get-ChildItem -Path "build/windows-release" -Filter "VRPacingLayer.json" -Recurse | Select-Object -First 1
           if ($json) { Copy-Item $json.FullName -Destination $out }
 
