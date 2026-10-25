@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cwchar>
+#include <filesystem>
 #include <string>
 
 #include "common/config_json.h"
@@ -79,6 +80,23 @@ std::wstring ExeDir() {
     const auto pos = p.find_last_of(L"\\/");
     if (pos != std::wstring::npos) p.resize(pos);
     return p;
+}
+
+void RegisterOpenXrImplicitLayer() {
+    const std::wstring jsonPath = ExeDir() + L"\\VRPacingLayer.json";
+    if (!std::filesystem::exists(jsonPath)) {
+        return;
+    }
+
+    HKEY hKey = nullptr;
+    const wchar_t* subKey = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr);
+    if (status == ERROR_SUCCESS) {
+        DWORD val = 0; // 0 = Always enabled
+        RegSetValueExW(hKey, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKey);
+        vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registrada en HKCU.");
+    }
 }
 
 void UpdateSharedStateFlags() {
@@ -187,7 +205,6 @@ void UpdateTelemetryDisplay() {
             wcscpy_s(txtPipe, L"NIS Pipeline: Idle");
         }
 
-        // Update Tray Icon Tooltip
         wchar_t tip[128]{};
         if (hasApi && g_shared->appliedCap > 0.0) {
             swprintf_s(tip, L"VRPacing [%s] | %.2f FPS (%.1f Hz)",
@@ -262,7 +279,6 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
         SendMessageW(hCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
     };
 
-    // SECTION 1: Telemetry & Lab Diagnostics
     HWND hGrpStatus = CreateWindowExW(0, L"BUTTON", L" Telemetry & Lab Diagnostics ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       15, 10, 434, 142, hwnd, nullptr, hInst, nullptr);
@@ -303,7 +319,6 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                      30, 112, 400, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblPipeline, g_hFontBold);
 
-    // SECTION 2: Spatial Upscaling
     HWND hGrpUpscale = CreateWindowExW(0, L"BUTTON", L" Spatial Upscaling (NVIDIA Image Scaling) ",
                                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                        15, 160, 434, 75, hwnd, nullptr, hInst, nullptr);
@@ -319,7 +334,6 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                      30, 206, 400, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblFixed, g_hFontNormal);
 
-    // SECTION 3: Frame Pacing
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Deterministic Frame Pacing ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       15, 245, 434, 215, hwnd, nullptr, hInst, nullptr);
@@ -361,7 +375,6 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     30, 402, 404, 48, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblNote, g_hFontNormal);
 
-    // SECTION 4: Action Buttons
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                         15, 470, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_MINIMIZE), hInst, nullptr);
@@ -384,6 +397,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
             CreateUiElements(hwnd, cs->hInstance);
             SyncUiWithConfig();
+            RegisterOpenXrImplicitLayer();
             SetTimer(hwnd, IDT_SCANNER_TIMER, 500, nullptr);
             return 0;
         }

@@ -17,6 +17,12 @@ jobs:
       - name: Setup MSVC developer prompt
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Compile NIS Compute Shader
+        shell: pwsh
+        run: |
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I third_party/nis /Fh src/gfx/shader_nis_upscale.h /Vn g_NISUpscaleShader third_party/nis/NIS_Upscale.hlsl
+          Write-Host "Compute Shader NIS compilado exitosamente en src/gfx/shader_nis_upscale.h"
+
       - name: Configure
         run: cmake --preset windows-release -DVRPACING_BUILD_TESTS=ON
 

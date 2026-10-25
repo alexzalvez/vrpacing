@@ -135,7 +135,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         dstR.height = dstHeight;
     }
 
-    D3D11State state{};
+    D3D11PipelineBackup state{};
     StoreD3D11State(ctx, state);
 
     NISConfig constants{};
@@ -149,12 +149,12 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     const float radius = 0.5f * desc.radius * static_cast<float>(dstR.height);
     constants.projCentre[0] = static_cast<uint32_t>(static_cast<float>(dstR.width) * desc.projCenterX);
     constants.projCentre[1] = static_cast<uint32_t>(static_cast<float>(dstR.height) * desc.projCenterY);
-    constants.squaredRadius = static_cast<uint32_t>(radius * radius);
 
     if (desc.maskEnabled) {
-        const float maxRadius = 0.5f * 1.00f * static_cast<float>(dstR.height);
-        constants.squaredMaxRadius = static_cast<uint32_t>(maxRadius * maxRadius);
+        constants.squaredRadius = static_cast<uint32_t>(radius * radius);
+        constants.squaredMaxRadius = constants.squaredRadius;
     } else {
+        constants.squaredRadius = 0xFFFFFFFFu;
         constants.squaredMaxRadius = 0xFFFFFFFFu;
     }
 
@@ -172,21 +172,15 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     ctx->CSSetShaderResources(0, 3, srvs);
 
     ID3D11UnorderedAccessView* uavs[1] = { dstUav };
-    UINT uavCount = static_cast<UINT>(-1);
-    ctx->CSSetUnorderedAccessViews(0, 1, uavs, &uavCount);
+    UINT initCounts[1] = { 0 };
+    ctx->CSSetUnorderedAccessViews(0, 1, uavs, initCounts);
 
     ctx->CSSetConstantBuffers(0, 1, constantsBuffer_.GetAddressOf());
     ctx->CSSetShader(upscaleShader_.Get(), nullptr, 0);
 
-    const UINT dispatchX = static_cast<UINT>(std::ceil(static_cast<float>(dstR.width) / 32.0f));
-    const UINT dispatchY = static_cast<UINT>(std::ceil(static_cast<float>(dstR.height) / 24.0f));
-    ctx->Dispatch(dispatchX, dispatchY, 1);
-
-    ID3D11ShaderResourceView* nullSrvs[3] = { nullptr, nullptr, nullptr };
-    ctx->CSSetShaderResources(0, 3, nullSrvs);
-
-    ID3D11UnorderedAccessView* nullUavs[1] = { nullptr };
-    ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, &uavCount);
+    const UINT groupsX = (dstR.width + 31) / 32;
+    const UINT groupsY = (dstR.height + 23) / 24;
+    ctx->Dispatch(groupsX, groupsY, 1);
 
     RestoreD3D11State(ctx, state);
     return true;
@@ -209,8 +203,9 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     }
 
     D3D11_TEXTURE2D_DESC srcDesc{};
-    D3D11_TEXTURE2D_DESC dstDesc{};
     src->GetDesc(&srcDesc);
+
+    D3D11_TEXTURE2D_DESC dstDesc{};
     dst->GetDesc(&dstDesc);
 
     auto srcSrv = GetOrCreateSrv(src, desc.srcArrayIndex);
