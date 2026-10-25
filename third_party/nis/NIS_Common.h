@@ -38,8 +38,9 @@ cbuffer cb : register(b0)
 
     uint2 projCentre;
     uint squaredRadius;
-    uint debugMode;
     uint squaredMaxRadius;
+    uint debugMode;
+    uint3 reserved2;
 };
 
 SamplerState samplerLinearClamp : register(s0);

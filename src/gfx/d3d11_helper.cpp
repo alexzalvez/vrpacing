@@ -120,68 +120,39 @@ ComPtr<ID3D11Texture2D> CreatePostProcessTexture(ID3D11Device* device, uint32_t 
     td.SampleDesc.Quality = 0;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    td.CPUAccessFlags = 0;
+    td.MiscFlags = 0;
 
-    ComPtr<ID3D11Texture2D> tex;
-    CheckResult("creando postprocess texture", device->CreateTexture2D(&td, nullptr, tex.GetAddressOf()));
-    return tex;
+    ComPtr<ID3D11Texture2D> post;
+    CheckResult("creando post texture", device->CreateTexture2D(&td, nullptr, post.GetAddressOf()));
+    return post;
 }
 
 void StoreD3D11State(ID3D11DeviceContext* context, D3D11State& state) {
-    context->VSGetShader(state.vertexShader.ReleaseAndGetAddressOf(), nullptr, nullptr);
-    context->PSGetShader(state.pixelShader.ReleaseAndGetAddressOf(), nullptr, nullptr);
     context->CSGetShader(state.computeShader.ReleaseAndGetAddressOf(), nullptr, nullptr);
-    context->IAGetInputLayout(state.inputLayout.ReleaseAndGetAddressOf());
-    context->IAGetPrimitiveTopology(&state.topology);
-    context->IAGetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, state.vertexBuffers, state.strides, state.offsets);
-    context->IAGetIndexBuffer(state.indexBuffer.ReleaseAndGetAddressOf(), &state.format, &state.offset);
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, state.renderTargets, state.depthStencil.GetAddressOf());
-    context->RSGetState(state.rasterizerState.ReleaseAndGetAddressOf());
-    context->OMGetDepthStencilState(state.depthStencilState.ReleaseAndGetAddressOf(), &state.stencilRef);
-    context->RSGetViewports(&state.numViewports, nullptr);
-    context->RSGetViewports(&state.numViewports, state.viewports);
-    context->VSGetConstantBuffers(0, 1, state.vsConstantBuffer.GetAddressOf());
-    context->PSGetConstantBuffers(0, 1, state.psConstantBuffer.GetAddressOf());
-    context->CSGetConstantBuffers(0, 1, state.csConstantBuffer.GetAddressOf());
+    context->CSGetConstantBuffers(0, 1, state.csConstantBuffer.ReleaseAndGetAddressOf());
     context->CSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, state.csShaderResources);
     context->CSGetUnorderedAccessViews(0, D3D11_1_UAV_SLOT_COUNT, state.csUavs);
 }
 
 void RestoreD3D11State(ID3D11DeviceContext* context, const D3D11State& state) {
-    context->VSSetShader(state.vertexShader.Get(), nullptr, 0);
-    context->PSSetShader(state.pixelShader.Get(), nullptr, 0);
     context->CSSetShader(state.computeShader.Get(), nullptr, 0);
-    context->IASetInputLayout(state.inputLayout.Get());
-    context->IASetPrimitiveTopology(state.topology);
-    context->IASetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, state.vertexBuffers, state.strides, state.offsets);
-
-    for (int i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++i) {
-        if (state.vertexBuffers[i]) state.vertexBuffers[i]->Release();
-    }
-
-    context->IASetIndexBuffer(state.indexBuffer.Get(), state.format, state.offset);
-    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, state.renderTargets, state.depthStencil.Get());
-
-    for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-        if (state.renderTargets[i]) state.renderTargets[i]->Release();
-    }
-
-    context->RSSetState(state.rasterizerState.Get());
-    context->OMSetDepthStencilState(state.depthStencilState.Get(), state.stencilRef);
-    context->RSSetViewports(state.numViewports, state.viewports);
-    context->VSSetConstantBuffers(0, 1, state.vsConstantBuffer.GetAddressOf());
-    context->PSSetConstantBuffers(0, 1, state.psConstantBuffer.GetAddressOf());
     context->CSSetConstantBuffers(0, 1, state.csConstantBuffer.GetAddressOf());
     context->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, state.csShaderResources);
 
     for (int i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++i) {
-        if (state.csShaderResources[i]) state.csShaderResources[i]->Release();
+        if (state.csShaderResources[i]) {
+            state.csShaderResources[i]->Release();
+        }
     }
 
     UINT initCounts[D3D11_1_UAV_SLOT_COUNT] = {};
     context->CSSetUnorderedAccessViews(0, D3D11_1_UAV_SLOT_COUNT, state.csUavs, initCounts);
 
     for (int i = 0; i < D3D11_1_UAV_SLOT_COUNT; ++i) {
-        if (state.csUavs[i]) state.csUavs[i]->Release();
+        if (state.csUavs[i]) {
+            state.csUavs[i]->Release();
+        }
     }
 }
 
@@ -193,24 +164,24 @@ ComPtr<ID3D11ShaderResourceView> CreateShaderResourceView(ID3D11Device* device, 
     srvd.Format = TranslateTypelessFormats(td.Format);
 
     if (td.ArraySize > 1) {
-        if (arrayIndex >= 0) {
-            srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvd.Texture2DArray.FirstArraySlice = arrayIndex;
-            srvd.Texture2DArray.ArraySize = 1;
-            srvd.Texture2DArray.MipLevels = td.MipLevels;
-        } else {
-            srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvd.Texture2DArray.FirstArraySlice = 0;
-            srvd.Texture2DArray.ArraySize = td.ArraySize;
-            srvd.Texture2DArray.MipLevels = td.MipLevels;
-        }
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        srvd.Texture2DArray.FirstArraySlice = (arrayIndex >= 0) ? static_cast<UINT>(arrayIndex) : 0;
+        srvd.Texture2DArray.ArraySize = (arrayIndex >= 0) ? 1 : td.ArraySize;
+        srvd.Texture2DArray.MipLevels = td.MipLevels ? td.MipLevels : 1;
+        srvd.Texture2DArray.MostDetailedMip = 0;
     } else {
         srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvd.Texture2D.MipLevels = td.MipLevels;
+        srvd.Texture2D.MipLevels = td.MipLevels ? td.MipLevels : 1;
+        srvd.Texture2D.MostDetailedMip = 0;
     }
 
     ComPtr<ID3D11ShaderResourceView> srv;
-    CheckResult("creando SRV", device->CreateShaderResourceView(texture, &srvd, srv.GetAddressOf()));
+    HRESULT hr = device->CreateShaderResourceView(texture, &srvd, srv.GetAddressOf());
+    if (FAILED(hr)) {
+        // Fallback para texturas sin formato typeless
+        hr = device->CreateShaderResourceView(texture, nullptr, srv.GetAddressOf());
+        CheckResult("creando SRV fallback", hr);
+    }
     return srv;
 }
 
@@ -220,26 +191,28 @@ ComPtr<ID3D11UnorderedAccessView> CreateUnorderedAccessView(ID3D11Device* device
 
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavd{};
     uavd.Format = TranslateTypelessFormats(td.Format);
+    if (uavd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        uavd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else if (uavd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        uavd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
 
     if (td.ArraySize > 1) {
-        if (arrayIndex >= 0) {
-            uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
-            uavd.Texture2DArray.FirstArraySlice = arrayIndex;
-            uavd.Texture2DArray.ArraySize = 1;
-            uavd.Texture2DArray.MipSlice = 0;
-        } else {
-            uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
-            uavd.Texture2DArray.FirstArraySlice = 0;
-            uavd.Texture2DArray.ArraySize = td.ArraySize;
-            uavd.Texture2DArray.MipSlice = 0;
-        }
+        uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        uavd.Texture2DArray.FirstArraySlice = (arrayIndex >= 0) ? static_cast<UINT>(arrayIndex) : 0;
+        uavd.Texture2DArray.ArraySize = (arrayIndex >= 0) ? 1 : td.ArraySize;
+        uavd.Texture2DArray.MipSlice = 0;
     } else {
         uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
         uavd.Texture2D.MipSlice = 0;
     }
 
     ComPtr<ID3D11UnorderedAccessView> uav;
-    CheckResult("creando UAV", device->CreateUnorderedAccessView(texture, &uavd, uav.GetAddressOf()));
+    HRESULT hr = device->CreateUnorderedAccessView(texture, &uavd, uav.GetAddressOf());
+    if (FAILED(hr)) {
+        hr = device->CreateUnorderedAccessView(texture, nullptr, uav.GetAddressOf());
+        CheckResult("creando UAV fallback", hr);
+    }
     return uav;
 }
 

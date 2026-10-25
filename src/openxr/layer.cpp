@@ -232,7 +232,12 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     appDesc.Format = static_cast<DXGI_FORMAT>(createInfo->format);
     appDesc.SampleDesc.Count = createInfo->sampleCount ? createInfo->sampleCount : 1;
     appDesc.Usage = D3D11_USAGE_DEFAULT;
-    appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (isColor && (appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+        appDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    } else if (isColor && (appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+        appDesc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    }
 
     uint32_t imgCount = 0;
     g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
