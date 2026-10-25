@@ -26,6 +26,7 @@
 #include "common/config_json.h"
 #include "common/frame_limiter_win.h"
 #include "common/logging_win.h"
+#include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -49,6 +50,8 @@ FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
 NisUpscalerD3D11 g_upscaler;
+SharedMemoryClient g_shm;
+vr::IVRSystem* g_vrSystem = nullptr;
 
 struct OpenVREyeOutput {
     ComPtr<ID3D11Texture2D> texture;
@@ -73,6 +76,23 @@ void EnsureInit() {
     });
 }
 
+void UpdateOpenVRHz() {
+    if (!g_vrSystem && g_origGetGenericInterface) {
+        int err = 0;
+        void* sys = g_origGetGenericInterface(vr::IVRSystem_Version, &err);
+        if (sys) {
+            g_vrSystem = reinterpret_cast<vr::IVRSystem*>(sys);
+        }
+    }
+    if (g_vrSystem) {
+        vr::ETrackedPropertyError propErr = vr::TrackedProp_Success;
+        float freq = g_vrSystem->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &propErr);
+        if (propErr == vr::TrackedProp_Success && freq > 30.0f) {
+            g_hzTracker.ObserveRuntimeHz(static_cast<double>(freq));
+        }
+    }
+}
+
 vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          vr::TrackedDevicePose_t* pRenderPoseArray,
                                          uint32_t unRenderPoseArrayCount,
@@ -84,16 +104,24 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     }
     inWait = true;
 
+    g_shm.SyncConfig(g_cfg);
+    UpdateOpenVRHz();
+
+    const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
+    double targetFps = 0.0;
+
     if (g_cfg.pacing.enabled) {
-        const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
         LimitInputs lim{};
         lim.hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
         lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
-        g_limiter.SetTargetFps(vrpacing::ComputeTargetFps(lim));
+        targetFps = vrpacing::ComputeTargetFps(lim);
+        g_limiter.SetTargetFps(targetFps);
         g_limiter.WaitBeforeRuntime();
     }
+
+    g_shm.UpdateTelemetry(L"OpenVR", hz, targetFps);
 
     vr::EVRCompositorError err = g_origWaitGetPoses(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     inWait = false;
@@ -237,6 +265,11 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
     void* iface = g_origGetGenericInterface(name, error);
     if (!iface || !name) {
         return iface;
+    }
+
+    if (std::strstr(name, "IVRSystem")) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_vrSystem = reinterpret_cast<vr::IVRSystem*>(iface);
     }
 
     if (std::strstr(name, "IVRCompositor")) {

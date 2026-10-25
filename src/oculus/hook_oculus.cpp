@@ -21,6 +21,7 @@
 #include "common/config_json.h"
 #include "common/frame_limiter_win.h"
 #include "common/logging_win.h"
+#include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "third_party/oculus/ovr_minimal.h"
 #include "vrpacing/hz_tracker.h"
@@ -34,6 +35,7 @@ using ovrInitializeFn = ovrResult(__cdecl*)(const ovrInitParams*);
 using ovrSubmitFrameFn = ovrResult(__cdecl*)(ovrSession, long long, const ovrViewScaleDesc*, ovrLayerHeader const* const*, unsigned int);
 using ovrWaitToBeginFrameFn = ovrResult(__cdecl*)(ovrSession, long long);
 using ovrGetFovTextureSizeFn = ovrSizei(__cdecl*)(ovrSession, ovrEyeType, ovrFovPort, float);
+using ovrGetPredictedDisplayTimeFn = double(__cdecl*)(ovrSession, long long);
 
 using ovrCreateTextureSwapChainDXFn = ovrResult(__cdecl*)(ovrSession, IUnknown*, const ovrTextureSwapChainDesc*, ovrTextureSwapChain*);
 using ovrGetTextureSwapChainLengthFn = ovrResult(__cdecl*)(ovrSession, ovrTextureSwapChain, int*);
@@ -48,6 +50,7 @@ ovrSubmitFrameFn g_origSubmit = nullptr;
 ovrSubmitFrameFn g_origSubmit2 = nullptr;
 ovrWaitToBeginFrameFn g_origWaitToBeginFrame = nullptr;
 ovrGetFovTextureSizeFn g_origGetFovTextureSize = nullptr;
+ovrGetPredictedDisplayTimeFn g_ovrGetPredictedDisplayTime = nullptr;
 
 ovrCreateTextureSwapChainDXFn g_ovrCreateTextureSwapChainDX = nullptr;
 ovrGetTextureSwapChainLengthFn g_ovrGetTextureSwapChainLength = nullptr;
@@ -62,6 +65,7 @@ FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
 NisUpscalerD3D11 g_upscaler;
+SharedMemoryClient g_shm;
 
 struct OculusOutputSwapchain {
     ovrTextureSwapChain chain = nullptr;
@@ -312,22 +316,39 @@ void ProcessAndUpscaleLayer(ovrSession session,
 ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
     if (params) {
         g_oculusVersion = params->RequestedMinorVersion;
-        LogMessage(LogLevel::Info, "Oculus Hook: Inicializado con versión minor " + std::to_string(g_oculusVersion));
+        LogMessage(LogLevel::Info, "Oculus Hook: Inicializado con version minor " + std::to_string(g_oculusVersion));
     }
     return g_origInitialize ? g_origInitialize(params) : 0;
 }
 
 ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frameIndex) {
+    g_shm.SyncConfig(g_cfg);
+
+    if (g_ovrGetPredictedDisplayTime) {
+        const double t0 = g_ovrGetPredictedDisplayTime(session, frameIndex);
+        const double t1 = g_ovrGetPredictedDisplayTime(session, frameIndex + 1);
+        const double dt = t1 - t0;
+        if (dt > 0.004 && dt < 0.025) {
+            g_hzTracker.ObserveRuntimeHz(std::round(1.0 / dt));
+        }
+    }
+
+    const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
+    double targetFps = 0.0;
+
     if (g_cfg.pacing.enabled) {
-        const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
         LimitInputs lim{};
         lim.hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
         lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
-        g_limiter.SetTargetFps(vrpacing::ComputeTargetFps(lim));
+        targetFps = vrpacing::ComputeTargetFps(lim);
+        g_limiter.SetTargetFps(targetFps);
         g_limiter.WaitBeforeRuntime();
     }
+
+    g_shm.UpdateTelemetry(L"LibOVR", hz, targetFps);
+
     return g_origWaitToBeginFrame ? g_origWaitToBeginFrame(session, frameIndex) : 0;
 }
 
@@ -429,6 +450,7 @@ void InstallOculusHooks() {
     g_ovrGetTextureSwapChainCurrentIndex = reinterpret_cast<ovrGetTextureSwapChainCurrentIndexFn>(GetProcAddress(mod, "ovr_GetTextureSwapChainCurrentIndex"));
     g_ovrCommitTextureSwapChain = reinterpret_cast<ovrCommitTextureSwapChainFn>(GetProcAddress(mod, "ovr_CommitTextureSwapChain"));
     g_ovrDestroyTextureSwapChain = reinterpret_cast<ovrDestroyTextureSwapChainFn>(GetProcAddress(mod, "ovr_DestroyTextureSwapChain"));
+    g_ovrGetPredictedDisplayTime = reinterpret_cast<ovrGetPredictedDisplayTimeFn>(GetProcAddress(mod, "ovr_GetPredictedDisplayTime"));
 
     auto initFn = reinterpret_cast<ovrInitializeFn>(GetProcAddress(mod, "ovr_Initialize"));
     auto submit = reinterpret_cast<ovrSubmitFrameFn>(GetProcAddress(mod, "ovr_SubmitFrame"));
