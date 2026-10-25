@@ -4,7 +4,6 @@
 
 #include <cmath>
 #include <algorithm>
-#include <unordered_set>
 
 #include "d3d11_helper.h"
 #include "shader_nis_upscale.h"
@@ -98,6 +97,14 @@ ComPtr<ID3D11UnorderedAccessView> NisUpscalerD3D11::GetOrCreateUav(ID3D11Texture
     }
 
     auto uav = CreateUnorderedAccessView(device_.Get(), tex, arrayIndex);
+    if (uav) {
+        ComPtr<ID3D11DeviceContext> ctx;
+        device_->GetImmediateContext(ctx.GetAddressOf());
+        if (ctx) {
+            const float kBlack[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            ctx->ClearUnorderedAccessViewFloat(uav.Get(), kBlack);
+        }
+    }
     uavCache_[key] = uav;
     return uav;
 }
@@ -118,14 +125,6 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     if (totalPixels > desc.maxOutputPixels) {
         LogMessage(LogLevel::Warn, "NisUpscalerD3D11: Omitido por exceder maxOutputPixels.");
         return false;
-    }
-
-    thread_local static std::unordered_set<ID3D11UnorderedAccessView*> clearedUavs;
-    if (clearedUavs.find(dstUav) == clearedUavs.end()) {
-        const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-        ctx->ClearUnorderedAccessViewFloat(dstUav, clearColor);
-        if (clearedUavs.size() > 64) clearedUavs.clear();
-        clearedUavs.insert(dstUav);
     }
 
     ViewportRect srcR = desc.srcRect;

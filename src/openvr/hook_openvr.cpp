@@ -58,7 +58,7 @@ uint32_t g_lastFormat = 0;
 int32_t g_upscaleStatus = 0;
 int32_t g_lastHResult = 0;
 
-struct OpenVREyeOutput {
+struct OpenVROutputTexture {
     ComPtr<ID3D11Texture2D> texture;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -67,7 +67,7 @@ struct OpenVREyeOutput {
 struct OpenVRContext {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    OpenVREyeOutput outputs[2];
+    OpenVROutputTexture sharedOutput;
 };
 
 OpenVRContext g_ovrCtx;
@@ -87,6 +87,12 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          uint32_t unRenderPoseArrayCount,
                                          vr::TrackedDevicePose_t* pGamePoseArray,
                                          uint32_t unGamePoseArrayCount) {
+    thread_local bool inWait = false;
+    if (inWait) {
+        return g_origWaitGetPoses(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+    }
+    inWait = true;
+
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
@@ -120,6 +126,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         }
     }
 
+    inWait = false;
     return res;
 }
 
@@ -212,13 +219,12 @@ vr::EVRCompositorError HookedSubmit(void* self,
                    " Scale=" + std::to_string(g_cfg.upscaling.scale));
     }
 
-    const int eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
-    auto& eyeOut = g_ovrCtx.outputs[eyeIdx];
+    auto& sharedOut = g_ovrCtx.sharedOutput;
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!eyeOut.texture || eyeOut.width != outW || eyeOut.height != outH) {
-            eyeOut.texture.Reset();
+        if (!sharedOut.texture || sharedOut.width != outW || sharedOut.height != outH) {
+            sharedOut.texture.Reset();
 
             D3D11_TEXTURE2D_DESC outDesc{};
             outDesc.Width = outW;
@@ -233,18 +239,23 @@ vr::EVRCompositorError HookedSubmit(void* self,
             outDesc.CPUAccessFlags = 0;
             outDesc.MiscFlags = 0;
 
-            HRESULT hr = g_ovrCtx.device->CreateTexture2D(&outDesc, nullptr, eyeOut.texture.GetAddressOf());
+            HRESULT hr = g_ovrCtx.device->CreateTexture2D(&outDesc, nullptr, sharedOut.texture.GetAddressOf());
             if (FAILED(hr)) {
                 g_upscaleStatus = -1;
                 g_lastHResult = hr;
-                LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura de salida escalada. HR=" + std::to_string(hr));
+                LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura compartida escalada. HR=" + std::to_string(hr));
                 inSubmit = false;
                 return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
             }
-            eyeOut.width = outW;
-            eyeOut.height = outH;
+            sharedOut.width = outW;
+            sharedOut.height = outH;
+            LogMessage(LogLevel::Info, "OpenVR: Textura unica compartida alocada: " + std::to_string(outW) + "x" + std::to_string(outH));
         }
     }
+
+    // Desvincular RTVs activos para evitar contencion de pipeline con el Compute Shader
+    ID3D11RenderTargetView* nullRTV[1] = { nullptr };
+    g_ovrCtx.context->OMSetRenderTargets(1, nullRTV, nullptr);
 
     UpscaleDispatchDesc dispatch{};
     dispatch.srcRect = { cropX, cropY, cropW, cropH };
@@ -256,7 +267,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
     dispatch.maskEnabled = g_cfg.mask.enabled;
     dispatch.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
-    if (!g_upscaler.Upscale(g_ovrCtx.context.Get(), inTex, eyeOut.texture.Get(), dispatch)) {
+    if (!g_upscaler.Upscale(g_ovrCtx.context.Get(), inTex, sharedOut.texture.Get(), dispatch)) {
         g_upscaleStatus = -3;
         inSubmit = false;
         return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
@@ -264,7 +275,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     g_upscaleStatus = 1;
     vr::Texture_t replacedTex = *pTexture;
-    replacedTex.handle = eyeOut.texture.Get();
+    replacedTex.handle = sharedOut.texture.Get();
 
     vr::VRTextureBounds_t outBounds{};
     outBounds.uMin = isFlippedX ? 1.0f : 0.0f;

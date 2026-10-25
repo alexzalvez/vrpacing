@@ -51,15 +51,15 @@ ComPtr<ID3D11Buffer> CreateConstantsBuffer(ID3D11Device* device, uint32_t size) 
 
 ComPtr<ID3D11SamplerState> CreateLinearSampler(ID3D11Device* device) {
     D3D11_SAMPLER_DESC sd{};
-    sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.MipLODBias = 0;
+    sd.MipLODBias = 0.0f;
     sd.MaxAnisotropy = 1;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MinLOD = 0;
-    sd.MaxLOD = 0;
+    sd.MinLOD = 0.0f;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
     ComPtr<ID3D11SamplerState> sampler;
     CheckResult("creando sampler linear", device->CreateSamplerState(&sd, sampler.GetAddressOf()));
     return sampler;
@@ -178,7 +178,6 @@ ComPtr<ID3D11ShaderResourceView> CreateShaderResourceView(ID3D11Device* device, 
     ComPtr<ID3D11ShaderResourceView> srv;
     HRESULT hr = device->CreateShaderResourceView(texture, &srvd, srv.GetAddressOf());
     if (FAILED(hr)) {
-        // Fallback para texturas sin formato typeless
         hr = device->CreateShaderResourceView(texture, nullptr, srv.GetAddressOf());
         CheckResult("creando SRV fallback", hr);
     }
