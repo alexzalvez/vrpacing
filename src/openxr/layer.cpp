@@ -383,8 +383,8 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     XrResult res = g_nextWaitFrame(session, info, state);
-    if (XR_SUCCEEDED(res) && state && state->predictedFrameDuration > 0) {
-        const double measuredHz = 1e9 / static_cast<double>(state->predictedFrameDuration);
+    if (XR_SUCCEEDED(res) && state && state->predictedDisplayPeriod > 0) {
+        const double measuredHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
         if (measuredHz > 30.0 && measuredHz < 200.0) {
             g_hzTracker.PushHz(std::round(measuredHz));
         }
@@ -448,21 +448,24 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     if (XR_FAILED(r) || !visibilityMask || !g_cfg.mask.enabled) return r;
 
     if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
-        const float radius = g_cfg.upscaling.radius;
-        const auto verts = GenerateCircleComplementVertices(radius, 32);
-        const auto indices = GenerateCircleComplementIndices(32);
+        EllipseMaskParams params{};
+        params.radiusX = g_cfg.upscaling.radius;
+        params.radiusY = g_cfg.upscaling.radius;
+        params.segments = 32;
+        const IndexedMesh mesh = BuildEllipseOutsideMaskIndexed(params);
 
-        visibilityMask->vertexCountOutput = static_cast<uint32_t>(verts.size());
-        visibilityMask->indexCountOutput = static_cast<uint32_t>(indices.size());
+        visibilityMask->vertexCountOutput = static_cast<uint32_t>(mesh.vertices.size());
+        visibilityMask->indexCountOutput = static_cast<uint32_t>(mesh.indices.size());
 
-        if (visibilityMask->vertexCapacityInput >= verts.size() && visibilityMask->vertices) {
-            for (size_t i = 0; i < verts.size(); ++i) {
-                visibilityMask->vertices[i].x = verts[i].x;
-                visibilityMask->vertices[i].y = verts[i].y;
+        if (visibilityMask->vertexCapacityInput >= mesh.vertices.size() && visibilityMask->vertices) {
+            for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+                visibilityMask->vertices[i].x = mesh.vertices[i].x;
+                visibilityMask->vertices[i].y = mesh.vertices[i].y;
             }
         }
-        if (visibilityMask->indexCapacityInput >= indices.size() && visibilityMask->indices) {
-            std::memcpy(visibilityMask->indices, indices.data(), indices.size() * sizeof(uint32_t));
+        if (visibilityMask->indexCapacityInput >= mesh.indices.size() && visibilityMask->indices) {
+            const size_t bytes = mesh.indices.size() * sizeof(uint32_t);
+            std::memcpy(visibilityMask->indices, mesh.indices.data(), bytes);
         }
     }
     return XR_SUCCESS;

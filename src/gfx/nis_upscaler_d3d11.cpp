@@ -22,7 +22,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
 
     HRESULT hr = device_->CreateComputeShader(
         g_NISUpscaleShader,
-        g_NISUpscaleShader_size,
+        sizeof(g_NISUpscaleShader),
         nullptr,
         upscaleShader_.GetAddressOf()
     );
@@ -135,7 +135,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         dstR.height = dstHeight;
     }
 
-    D3D11PipelineBackup state{};
+    D3D11State state{};
     StoreD3D11State(ctx, state);
 
     NISConfig constants{};
