@@ -69,6 +69,7 @@ struct ProxySwapchain {
     uint32_t appHeight = 0;
     uint32_t realWidth = 0;
     uint32_t realHeight = 0;
+    uint32_t arraySize = 1;
     int64_t format = 0;
 };
 
@@ -148,17 +149,16 @@ XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
     if (XR_FAILED(res) || !views || viewCapacityInput == 0) return res;
 
     g_shm.SyncConfig(g_cfg);
-    if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
-        return res;
+
+    static std::atomic<bool> s_viewsLogged{ false };
+    if (!s_viewsLogged.exchange(true) && viewCountOutput) {
+        for (uint32_t i = 0; i < *viewCountOutput; ++i) {
+            LogMessage(LogLevel::Info, "OpenXR ViewConfig[" + std::to_string(i) + "]: Nativo=" +
+                       std::to_string(views[i].recommendedImageRectWidth) + "x" +
+                       std::to_string(views[i].recommendedImageRectHeight));
+        }
     }
 
-    const float s = 1.0f / g_cfg.upscaling.scale;
-    for (uint32_t i = 0; i < *viewCountOutput; ++i) {
-        views[i].recommendedImageRectWidth = static_cast<uint32_t>(std::lround(views[i].recommendedImageRectWidth * s));
-        views[i].recommendedImageRectHeight = static_cast<uint32_t>(std::lround(views[i].recommendedImageRectHeight * s));
-        views[i].maxImageRectWidth = static_cast<uint32_t>(std::lround(views[i].maxImageRectWidth * s));
-        views[i].maxImageRectHeight = static_cast<uint32_t>(std::lround(views[i].maxImageRectHeight * s));
-    }
     return res;
 }
 
@@ -182,6 +182,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 
     const uint32_t appW = createInfo->width;
     const uint32_t appH = createInfo->height;
+    const uint32_t arrSize = createInfo->arraySize ? createInfo->arraySize : 1;
     const double s = g_cfg.upscaling.scale;
     uint32_t realW = static_cast<uint32_t>((std::max)(1.0, std::floor(appW * s)));
     uint32_t realH = static_cast<uint32_t>((std::max)(1.0, std::floor(appH * s)));
@@ -228,11 +229,11 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     appDesc.Width = appW;
     appDesc.Height = appH;
     appDesc.MipLevels = 1;
-    appDesc.ArraySize = createInfo->arraySize ? createInfo->arraySize : 1;
+    appDesc.ArraySize = arrSize;
     appDesc.Format = static_cast<DXGI_FORMAT>(createInfo->format);
     appDesc.SampleDesc.Count = createInfo->sampleCount ? createInfo->sampleCount : 1;
     appDesc.Usage = D3D11_USAGE_DEFAULT;
-        appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (isColor && (appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
         appDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     } else if (isColor && (appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
@@ -250,6 +251,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     proxy.appHeight = appH;
     proxy.realWidth = realW;
     proxy.realHeight = realH;
+    proxy.arraySize = arrSize;
     proxy.format = createInfo->format;
 
     for (uint32_t i = 0; i < imgCount; ++i) {
@@ -274,7 +276,8 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 
     LogMessage(LogLevel::Info, "OpenXR Proxy Swapchain creado: " +
                std::to_string(appW) + "x" + std::to_string(appH) +
-               " -> " + std::to_string(realW) + "x" + std::to_string(realH));
+               " (ArraySize=" + std::to_string(arrSize) + ") -> " +
+               std::to_string(realW) + "x" + std::to_string(realH));
 
     return XR_SUCCESS;
 }
@@ -351,21 +354,38 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
     proxy.acquiredIndices.pop();
 
     if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
-        UpscaleDispatchDesc desc{};
-        desc.srcRect = { 0, 0, proxy.appWidth, proxy.appHeight };
-        desc.dstRect = { 0, 0, proxy.realWidth, proxy.realHeight };
-        desc.projCenterX = 0.5f;
-        desc.projCenterY = 0.5f;
-        desc.radius = g_cfg.upscaling.radius;
-        desc.sharpness = g_cfg.upscaling.sharpness;
-        desc.maskEnabled = g_cfg.mask.enabled;
-        desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+        const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
 
-        if (g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
-            g_upscaleStatus = 1;
-        } else {
-            g_upscaleStatus = -3;
+        static std::atomic<bool> s_firstFrameLogged{ false };
+        if (!s_firstFrameLogged.exchange(true)) {
+            LogMessage(LogLevel::Info, "OpenXR [Release] Primer frame: App=" +
+                       std::to_string(proxy.appWidth) + "x" + std::to_string(proxy.appHeight) +
+                       " ArraySize=" + std::to_string(numSlices) +
+                       " FMT=" + std::to_string(proxy.format) +
+                       " -> Real=" + std::to_string(proxy.realWidth) + "x" + std::to_string(proxy.realHeight) +
+                       " Scale=" + std::to_string(g_cfg.upscaling.scale));
         }
+
+        bool allSlicesOk = true;
+        for (uint32_t slice = 0; slice < numSlices; ++slice) {
+            UpscaleDispatchDesc desc{};
+            desc.srcRect = { 0, 0, proxy.appWidth, proxy.appHeight };
+            desc.dstRect = { 0, 0, proxy.realWidth, proxy.realHeight };
+            desc.srcArrayIndex = static_cast<int>(slice);
+            desc.dstArrayIndex = static_cast<int>(slice);
+            desc.projCenterX = 0.5f;
+            desc.projCenterY = 0.5f;
+            desc.radius = g_cfg.upscaling.radius;
+            desc.sharpness = g_cfg.upscaling.sharpness;
+            desc.maskEnabled = g_cfg.mask.enabled;
+            desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+
+            if (!g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
+                allSlicesOk = false;
+            }
+        }
+
+        g_upscaleStatus = allSlicesOk ? 1 : -3;
     }
 
     return g_nextReleaseSwapchainImage(proxy.realSwapchain, releaseInfo);
