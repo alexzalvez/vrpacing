@@ -32,9 +32,9 @@ void TestMaskGeometry() {
     auto tris = vrpacing::BuildEllipseOutsideMaskTriangles(p);
     auto mesh = vrpacing::BuildEllipseOutsideMaskIndexed(p);
 
-    Check(tris.size() == 128, "mask: 2 triángulos por segmento");
-    Check(mesh.vertices.size() == 128, "mask: vértices indexados esperados");
-    Check(mesh.indices.size() == 384, "mask: índices esperados");
+    Check(tris.size() == 128, "mask: 2 triangulos por segmento");
+    Check(mesh.vertices.size() == 128, "mask: vertices indexados esperados");
+    Check(mesh.indices.size() == 384, "mask: indices esperados");
 
     Check(vrpacing::IsPointInsideEllipse(0.0f, 0.0f, p), "mask: centro dentro");
     Check(!vrpacing::IsPointInsideEllipse(1.0f, 1.0f, p), "mask: esquina fuera");
@@ -44,17 +44,28 @@ void TestLimiterMath() {
     vrpacing::LimitInputs in{};
     in.hz = 90.0;
     in.afrMultiplier = 1.0;
-    in.frameGenDivisor = 2.0;
+    in.frameGenDivisor = 1.0;
     in.offsetFps = 0.1;
 
-    const double target = vrpacing::ComputeTargetFps(in);
-    Check(std::abs(target - 44.9) < 1e-6, "limiter: fórmula base");
+    const double target1x = vrpacing::ComputeTargetFps(in);
+    Check(std::abs(target1x - 89.9) < 1e-6, "limiter: 1x native panel (89.90 FPS)");
+
+    in.frameGenDivisor = 2.0;
+    const double targetHalf = vrpacing::ComputeTargetFps(in);
+    Check(std::abs(targetHalf - 44.9) < 1e-6, "limiter: 1/2x fractional cap (44.90 FPS)");
+
+    in.frameGenDivisor = 3.0;
+    const double targetThird = vrpacing::ComputeTargetFps(in);
+    Check(std::abs(targetThird - 29.9) < 1e-6, "limiter: 1/3x fractional cap (29.90 FPS)");
+
+    in.hz = 0.0;
+    Check(vrpacing::ComputeTargetFps(in) == 0.0, "limiter: invalid hz zero");
 
     const int64_t ticks = vrpacing::ComputeFramePeriodTicks(90.0, 9000000);
     Check(ticks == 100000, "limiter: ticks exactos");
 
     const int64_t next = vrpacing::AdvanceDeadlineNoDrift(1000, 5000, 1000);
-    Check(next >= 5000, "limiter: resincronización sin deriva");
+    Check(next >= 5000, "limiter: resincronizacion sin deriva");
 }
 
 void TestHzTracker() {

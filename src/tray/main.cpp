@@ -76,6 +76,8 @@ void UpdateSharedStateFlags() {
     if (g_cfg.mask.enabled) flags |= vrpacing::kFlagMaskEnabled;
     if (g_cfg.pacing.enabled) flags |= vrpacing::kFlagPacingEnabled;
     g_shared->flags = flags;
+    g_shared->frameGenDivisor = (g_cfg.pacing.frameGenDivisor > 0.0) ? g_cfg.pacing.frameGenDivisor : 1.0;
+    g_shared->offsetFps = g_cfg.pacing.offsetFps;
 }
 
 void UpdateTrayTooltip() {
@@ -296,7 +298,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared = reinterpret_cast<vrpacing::SharedState*>(view);
     if (g_shared) {
         *g_shared = {};
-        g_shared->version = 1;
+        g_shared->version = 2;
+        g_shared->frameGenDivisor = (g_cfg.pacing.frameGenDivisor > 0.0) ? g_cfg.pacing.frameGenDivisor : 1.0;
+        g_shared->offsetFps = g_cfg.pacing.offsetFps;
         UpdateSharedStateFlags();
         wcscpy_s(g_shared->activeApi, L"idle");
     }

@@ -6,10 +6,12 @@
 namespace vrpacing {
 
 double ComputeTargetFps(const LimitInputs& in) {
-    const double divisor = (in.frameGenDivisor <= 0.0) ? 1.0 : in.frameGenDivisor;
-    const double afr = (in.afrMultiplier <= 0.0) ? 1.0 : in.afrMultiplier;
-    const double raw = (in.hz * afr / divisor) - in.offsetFps;
-    return std::clamp(raw, 10.0, 500.0);
+    if (in.hz <= 0.0 || in.frameGenDivisor <= 0.0 || in.afrMultiplier <= 0.0) {
+        return 0.0;
+    }
+    const double baseFps = (in.hz * in.afrMultiplier) / in.frameGenDivisor;
+    const double target = baseFps - in.offsetFps;
+    return (target > 1.0) ? target : 1.0;
 }
 
 int64_t ComputeFramePeriodTicks(double targetFps, int64_t qpcFrequency) {
