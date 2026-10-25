@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
