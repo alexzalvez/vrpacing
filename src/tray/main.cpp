@@ -92,7 +92,7 @@ void RegisterOpenXrImplicitLayer() {
     const wchar_t* subKey = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
     LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr);
     if (status == ERROR_SUCCESS) {
-        DWORD val = 0; // 0 = Always enabled
+        DWORD val = 0;
         RegSetValueExW(hKey, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKey);
         vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registrada en HKCU.");
@@ -398,7 +398,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateUiElements(hwnd, cs->hInstance);
             SyncUiWithConfig();
             RegisterOpenXrImplicitLayer();
-            SetTimer(hwnd, IDT_SCANNER_TIMER, 500, nullptr);
+            SetTimer(hwnd, IDT_SCANNER_TIMER, 1500, nullptr);
             return 0;
         }
 
@@ -519,6 +519,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    HANDLE hSingleMutex = CreateMutexW(nullptr, TRUE, L"Local\\VRPacingSingleInstanceMutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND hExisting = FindWindowW(L"VRPacingMainWindowClass", nullptr);
+        if (hExisting) {
+            ShowWindow(hExisting, SW_SHOW);
+            SetForegroundWindow(hExisting);
+        }
+        if (hSingleMutex) CloseHandle(hSingleMutex);
+        return 0;
+    }
+
     vrpacing::InitLogging();
     vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingTray starting...");
 
@@ -591,6 +602,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     if (view) UnmapViewOfFile(view);
     if (g_mapFile) CloseHandle(g_mapFile);
+    if (hSingleMutex) CloseHandle(hSingleMutex);
 
     return 0;
 }

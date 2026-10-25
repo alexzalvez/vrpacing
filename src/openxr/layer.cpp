@@ -204,6 +204,12 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     realDesc.height = realH;
     realDesc.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
 
+    if (realDesc.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        realDesc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else if (realDesc.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        realDesc.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+
     XrSwapchain real = XR_NULL_HANDLE;
     XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);
     if (XR_FAILED(r)) {

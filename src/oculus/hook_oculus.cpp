@@ -198,6 +198,11 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         outDesc.SampleCount = 1;
         outDesc.MipLevels = 1;
         outDesc.BindFlags = ovrTextureBind_DX_UnorderedAccess | ovrTextureBind_DX_RenderTarget;
+        if (outDesc.Format == OVR_FORMAT_R8G8B8A8_UNORM_SRGB) {
+            outDesc.Format = OVR_FORMAT_R8G8B8A8_UNORM;
+        } else if (outDesc.Format == OVR_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            outDesc.Format = OVR_FORMAT_B8G8R8A8_UNORM;
+        }
         outDesc.MiscFlags = ovrTextureMisc_AutoGenerateMips;
 
         ovrTextureSwapChain outChain = nullptr;

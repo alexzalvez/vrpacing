@@ -46,16 +46,39 @@ SamplerState samplerLinearClamp : register(s0);
 Texture2D in_texture            : register(t0);
 RWTexture2D<unorm float4> out_texture : register(u0);
 
-void FillBlack(uint2 blockIdx, uint threadIdx)
+void DirectCopy(uint2 blockIdx, uint threadIdx)
 {
+    const float4 mul = float4(1, 1, 1, 1) - debugMode * float4(0, 0.3, 0.3, 0);
     const int dstBlockX = NIS_BLOCK_WIDTH * blockIdx.x;
     const int dstBlockY = NIS_BLOCK_HEIGHT * blockIdx.y;
+
     [loop]
     for (uint k = threadIdx; k < NIS_BLOCK_WIDTH * NIS_BLOCK_HEIGHT; k += NIS_THREAD_GROUP_SIZE)
     {
         const int2 pos = int2(k % NIS_BLOCK_WIDTH, k / NIS_BLOCK_WIDTH);
-        const int dstX = dstBlockX + pos.x + kOutputViewportOriginX;
-        const int dstY = dstBlockY + pos.y + kOutputViewportOriginY;
-        out_texture[uint2(dstX, dstY)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        const int dstX = dstBlockX + pos.x;
+        const int dstY = dstBlockY + pos.y;
+
+#if NIS_VIEWPORT_SUPPORT
+        if (dstX >= (int)kOutputViewportWidth || dstY >= (int)kOutputViewportHeight) {
+            continue;
+        }
+
+        const float srcCenterX = (float(dstX) + 0.5f) * kScaleX;
+        const float srcCenterY = (float(dstY) + 0.5f) * kScaleY;
+
+        const float2 uv = float2(
+            (srcCenterX + float(kInputViewportOriginX)) * kSrcNormX,
+            (srcCenterY + float(kInputViewportOriginY)) * kSrcNormY
+        );
+#else
+        const float srcCenterX = (float(dstX) + 0.5f) * kScaleX;
+        const float srcCenterY = (float(dstY) + 0.5f) * kScaleY;
+        const float2 uv = float2(srcCenterX * kSrcNormX, srcCenterY * kSrcNormY);
+#endif
+
+        float3 c = in_texture.SampleLevel(samplerLinearClamp, uv, 0).rgb;
+        const uint2 outCoord = uint2(dstX + kOutputViewportOriginX, dstY + kOutputViewportOriginY);
+        out_texture[outCoord] = float4(c, 1.0f) * mul;
     }
 }

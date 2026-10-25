@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <unordered_set>
 
 #include "d3d11_helper.h"
 #include "shader_nis_upscale.h"
@@ -119,6 +120,14 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         return false;
     }
 
+    thread_local static std::unordered_set<ID3D11UnorderedAccessView*> clearedUavs;
+    if (clearedUavs.find(dstUav) == clearedUavs.end()) {
+        const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        ctx->ClearUnorderedAccessViewFloat(dstUav, clearColor);
+        if (clearedUavs.size() > 64) clearedUavs.clear();
+        clearedUavs.insert(dstUav);
+    }
+
     ViewportRect srcR = desc.srcRect;
     if (srcR.width == 0 || srcR.height == 0) {
         srcR.x = 0;
@@ -149,12 +158,12 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     const float radius = 0.5f * desc.radius * static_cast<float>(dstR.height);
     constants.projCentre[0] = static_cast<uint32_t>(static_cast<float>(dstR.width) * desc.projCenterX);
     constants.projCentre[1] = static_cast<uint32_t>(static_cast<float>(dstR.height) * desc.projCenterY);
+    constants.squaredRadius = static_cast<uint32_t>(radius * radius);
 
     if (desc.maskEnabled) {
-        constants.squaredRadius = static_cast<uint32_t>(radius * radius);
-        constants.squaredMaxRadius = constants.squaredRadius;
+        const float maxRadius = 0.5f * 0.88f * static_cast<float>(dstR.height);
+        constants.squaredMaxRadius = static_cast<uint32_t>(maxRadius * maxRadius);
     } else {
-        constants.squaredRadius = 0xFFFFFFFFu;
         constants.squaredMaxRadius = 0xFFFFFFFFu;
     }
 
