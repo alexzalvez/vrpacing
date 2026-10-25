@@ -67,6 +67,14 @@ RuntimeConfig g_cfg;
 NisUpscalerD3D11 g_upscaler;
 SharedMemoryClient g_shm;
 
+uint32_t g_lastInW = 0;
+uint32_t g_lastInH = 0;
+uint32_t g_lastOutW = 0;
+uint32_t g_lastOutH = 0;
+uint32_t g_lastFormat = 0;
+int32_t g_upscaleStatus = 0;
+int32_t g_lastHResult = 0;
+
 struct OculusOutputSwapchain {
     ovrTextureSwapChain chain = nullptr;
     int length = 0;
@@ -137,10 +145,17 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         if (!curIn) continue;
 
         ovrTextureSwapChainDesc desc{};
-        if (g_ovrGetTextureSwapChainDesc(session, curIn, &desc) < 0) {
-            LogMessage(LogLevel::Error, "Oculus Hook: ovr_GetTextureSwapChainDesc fallo.");
+        ovrResult descRes = g_ovrGetTextureSwapChainDesc(session, curIn, &desc);
+        if (descRes < 0) {
+            g_upscaleStatus = -1;
+            g_lastHResult = descRes;
+            LogMessage(LogLevel::Error, "Oculus Hook: ovr_GetTextureSwapChainDesc fallo. Res=" + std::to_string(descRes));
             return false;
         }
+
+        g_lastFormat = static_cast<uint32_t>(desc.Format);
+        g_lastInW = desc.Width;
+        g_lastInH = desc.Height;
 
         if (!ctx.device) {
             ComPtr<ID3D11Texture2D> inTex0;
@@ -149,13 +164,16 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
                 if (ctx.device) {
                     ctx.device->GetImmediateContext(ctx.context.ReleaseAndGetAddressOf());
                     if (!g_upscaler.IsInitialized()) {
-                        g_upscaler.Initialize(ctx.device.Get());
+                        if (!g_upscaler.Initialize(ctx.device.Get())) {
+                            g_upscaleStatus = -2;
+                        }
                     }
                 }
             }
         }
 
         if (!ctx.device) {
+            g_upscaleStatus = -2;
             LogMessage(LogLevel::Error, "Oculus Hook: No se pudo capturar ID3D11Device.");
             return false;
         }
@@ -171,6 +189,9 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
             outH = static_cast<int>((std::max)(1.0, std::floor(outH * factor)));
         }
 
+        g_lastOutW = outW;
+        g_lastOutH = outH;
+
         ovrTextureSwapChainDesc outDesc = desc;
         outDesc.Width = outW;
         outDesc.Height = outH;
@@ -180,8 +201,11 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         outDesc.MiscFlags = ovrTextureMisc_AutoGenerateMips;
 
         ovrTextureSwapChain outChain = nullptr;
-        if (g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain) < 0 || !outChain) {
-            LogMessage(LogLevel::Error, "Oculus Hook: ovr_CreateTextureSwapChainDX fallo.");
+        ovrResult createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
+        if (createRes < 0 || !outChain) {
+            g_upscaleStatus = -1;
+            g_lastHResult = createRes;
+            LogMessage(LogLevel::Error, "Oculus Hook: ovr_CreateTextureSwapChainDX fallo. Res=" + std::to_string(createRes));
             return false;
         }
 
@@ -300,12 +324,14 @@ void ProcessAndUpscaleLayer(ovrSession session,
             outViewport[eye].Size.h = static_cast<int>(dstR.height);
             anySuccess = true;
         } else {
+            g_upscaleStatus = -3;
             outColor[eye] = curIn;
             outViewport[eye] = inViewport[eye];
         }
     }
 
     if (anySuccess) {
+        g_upscaleStatus = 1; // ACTIVE OK
         g_ovrCommitTextureSwapChain(session, ctx.outputChains[0].chain);
         if (!singleTexture && ctx.outputChains[1].chain && ctx.outputChains[1].chain != ctx.outputChains[0].chain) {
             g_ovrCommitTextureSwapChain(session, ctx.outputChains[1].chain);
@@ -347,7 +373,9 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
         g_limiter.WaitBeforeRuntime();
     }
 
-    g_shm.UpdateTelemetry(L"LibOVR", hz, targetFps);
+    g_shm.UpdateTelemetry(L"LibOVR", hz, targetFps,
+                          g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                          g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     return g_origWaitToBeginFrame ? g_origWaitToBeginFrame(session, frameIndex) : 0;
 }

@@ -51,7 +51,14 @@ HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
 NisUpscalerD3D11 g_upscaler;
 SharedMemoryClient g_shm;
-vr::IVRSystem* g_vrSystem = nullptr;
+
+uint32_t g_lastInW = 0;
+uint32_t g_lastInH = 0;
+uint32_t g_lastOutW = 0;
+uint32_t g_lastOutH = 0;
+uint32_t g_lastFormat = 0;
+int32_t g_upscaleStatus = 0;
+int32_t g_lastHResult = 0;
 
 struct OpenVREyeOutput {
     ComPtr<ID3D11Texture2D> texture;
@@ -76,21 +83,27 @@ void EnsureInit() {
     });
 }
 
-void UpdateOpenVRHz() {
-    if (!g_vrSystem && g_origGetGenericInterface) {
-        int err = 0;
-        void* sys = g_origGetGenericInterface(vr::IVRSystem_Version, &err);
-        if (sys) {
-            g_vrSystem = reinterpret_cast<vr::IVRSystem*>(sys);
+void ObservePassiveHz() {
+    static int64_t s_lastPoseQpc = 0;
+    static int64_t s_qpcFreq = 0;
+
+    if (s_qpcFreq == 0) {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        s_qpcFreq = f.QuadPart;
+    }
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+
+    if (s_lastPoseQpc > 0 && s_qpcFreq > 0) {
+        const double dt = static_cast<double>(now.QuadPart - s_lastPoseQpc) / static_cast<double>(s_qpcFreq);
+        if (dt > 0.005 && dt < 0.025) { // 40 Hz to 200 Hz
+            const double measuredHz = std::round(1.0 / dt);
+            g_hzTracker.PushHz(measuredHz);
         }
     }
-    if (g_vrSystem) {
-        vr::ETrackedPropertyError propErr = vr::TrackedProp_Success;
-        float freq = g_vrSystem->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &propErr);
-        if (propErr == vr::TrackedProp_Success && freq > 30.0f) {
-            g_hzTracker.PushHz(static_cast<double>(freq));
-        }
-    }
+    s_lastPoseQpc = now.QuadPart;
 }
 
 vr::EVRCompositorError HookedWaitGetPoses(void* self,
@@ -105,7 +118,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     inWait = true;
 
     g_shm.SyncConfig(g_cfg);
-    UpdateOpenVRHz();
+    ObservePassiveHz();
 
     const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
     double targetFps = 0.0;
@@ -121,7 +134,9 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         g_limiter.WaitBeforeRuntime();
     }
 
-    g_shm.UpdateTelemetry(L"OpenVR", hz, targetFps);
+    g_shm.UpdateTelemetry(L"OpenVR", hz, targetFps,
+                          g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                          g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     vr::EVRCompositorError err = g_origWaitGetPoses(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     inWait = false;
@@ -152,7 +167,9 @@ vr::EVRCompositorError HookedSubmit(void* self,
             if (g_ovrCtx.device) {
                 g_ovrCtx.device->GetImmediateContext(g_ovrCtx.context.ReleaseAndGetAddressOf());
                 if (!g_upscaler.IsInitialized()) {
-                    g_upscaler.Initialize(g_ovrCtx.device.Get());
+                    if (!g_upscaler.Initialize(g_ovrCtx.device.Get())) {
+                        g_upscaleStatus = -2;
+                    }
                 }
             }
         }
@@ -165,6 +182,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     D3D11_TEXTURE2D_DESC inDesc{};
     inTex->GetDesc(&inDesc);
+    g_lastFormat = static_cast<uint32_t>(inDesc.Format);
 
     static const vr::VRTextureBounds_t defaultBounds{ 0.0f, 0.0f, 1.0f, 1.0f };
     const vr::VRTextureBounds_t* b = pBounds ? pBounds : &defaultBounds;
@@ -187,6 +205,9 @@ vr::EVRCompositorError HookedSubmit(void* self,
         return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
+    g_lastInW = cropW;
+    g_lastInH = cropH;
+
     const double s = g_cfg.upscaling.scale;
     uint32_t outW = static_cast<uint32_t>((std::max)(1.0, std::floor(cropW * s)));
     uint32_t outH = static_cast<uint32_t>((std::max)(1.0, std::floor(cropH * s)));
@@ -197,6 +218,9 @@ vr::EVRCompositorError HookedSubmit(void* self,
         outW = static_cast<uint32_t>((std::max)(1.0, std::floor(outW * factor)));
         outH = static_cast<uint32_t>((std::max)(1.0, std::floor(outH * factor)));
     }
+
+    g_lastOutW = outW;
+    g_lastOutH = outH;
 
     const int eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
     auto& eyeOut = g_ovrCtx.outputs[eyeIdx];
@@ -221,14 +245,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
             HRESULT hr = g_ovrCtx.device->CreateTexture2D(&outDesc, nullptr, eyeOut.texture.GetAddressOf());
             if (FAILED(hr)) {
-                LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura de salida escalada.");
+                g_upscaleStatus = -1;
+                g_lastHResult = hr;
+                LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura de salida escalada. HR=" + std::to_string(hr));
                 inSubmit = false;
                 return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
             }
             eyeOut.width = outW;
             eyeOut.height = outH;
-            LogMessage(LogLevel::Info, "OpenVR output texture creada [ojo " + std::to_string(eyeIdx) + "]: " +
-                       std::to_string(outW) + "x" + std::to_string(outH));
         }
     }
 
@@ -243,10 +267,12 @@ vr::EVRCompositorError HookedSubmit(void* self,
     dispatch.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
     if (!g_upscaler.Upscale(g_ovrCtx.context.Get(), inTex, eyeOut.texture.Get(), dispatch)) {
+        g_upscaleStatus = -3;
         inSubmit = false;
         return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
+    g_upscaleStatus = 1; // ACTIVE OK
     vr::Texture_t replacedTex = *pTexture;
     replacedTex.handle = eyeOut.texture.Get();
 
@@ -265,11 +291,6 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
     void* iface = g_origGetGenericInterface(name, error);
     if (!iface || !name) {
         return iface;
-    }
-
-    if (std::strstr(name, "IVRSystem")) {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_vrSystem = reinterpret_cast<vr::IVRSystem*>(iface);
     }
 
     if (std::strstr(name, "IVRCompositor")) {

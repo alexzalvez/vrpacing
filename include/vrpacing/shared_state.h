@@ -8,7 +8,7 @@ constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared";
 
 #pragma pack(push, 1)
 struct SharedState {
-    uint32_t version = 2;
+    uint32_t version = 3;
     uint32_t flags = 0;
     double frameGenDivisor = 1.0;
     double offsetFps = 0.10;
@@ -16,6 +16,16 @@ struct SharedState {
     double appliedCap = 0.0;
     uint64_t frameCounter = 0;
     wchar_t activeApi[32] = L"Idle";
+
+    // Lab telemetry
+    uint32_t inputWidth = 0;
+    uint32_t inputHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+    uint32_t dxgiFormat = 0;
+    int32_t upscaleStatus = 0; // 0=Idle/None, 1=Active OK, -1=Swapchain Fail, -2=Shader Init Fail, -3=UAV/SRV Fail
+    int32_t lastHResult = 0;
+    wchar_t hookedProcess[64] = L"None";
 };
 #pragma pack(pop)
 

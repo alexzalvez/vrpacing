@@ -43,6 +43,10 @@ const char* LevelText(LogLevel level) {
 
 } // namespace
 
+std::wstring GetLogFilePath() {
+    return (GetLogDir() / L"vrpacing.log").wstring();
+}
+
 void RotateLogsIfNeeded() {
     const auto dir = GetLogDir();
     const auto current = dir / "vrpacing.log";

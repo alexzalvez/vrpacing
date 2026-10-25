@@ -20,6 +20,35 @@
 namespace vrpacing {
 namespace {
 
+bool IsBlacklistedProcess(const wchar_t* exeName) {
+    if (!exeName) return true;
+
+    static const wchar_t* const kBlacklist[] = {
+        L"vrserver.exe",
+        L"vrcompositor.exe",
+        L"vrmonitor.exe",
+        L"vrdashboard.exe",
+        L"vrwebhelper.exe",
+        L"vrstartup.exe",
+        L"steamtours.exe",
+        L"steam.exe",
+        L"steamwebhelper.exe",
+        L"OVRServer_x64.exe",
+        L"OculusClient.exe",
+        L"OculusDash.exe",
+        L"VirtualDesktop.Streamer.exe",
+        L"VirtualDesktop.Server.exe",
+        L"VRPacingTray.exe"
+    };
+
+    for (const auto* blocked : kBlacklist) {
+        if (_wcsicmp(exeName, blocked) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool InjectDllToProcess(DWORD pid, const std::wstring& dllPath) {
     HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
     if (!process) {
@@ -80,6 +109,10 @@ bool ProcessHasModule(DWORD pid, const std::wstring& moduleName) {
 } // namespace
 
 bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
+    if (IsBlacklistedProcess(processName.c_str())) {
+        return false;
+    }
+
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return false;
@@ -94,6 +127,11 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
             if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
                 if (!ProcessHasModule(pe.th32ProcessID, L"VRPacingHook.dll")) {
                     result = InjectDllToProcess(pe.th32ProcessID, dllPath);
+                    if (result) {
+                        std::wstring ws(pe.szExeFile);
+                        LogMessage(LogLevel::Info, "Inyeccion manual aplicada a " + std::string(ws.begin(), ws.end()) +
+                                   " [PID " + std::to_string(pe.th32ProcessID) + "]");
+                    }
                 }
                 break;
             }
@@ -120,6 +158,10 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                 continue;
             }
 
+            if (IsBlacklistedProcess(pe.szExeFile)) {
+                continue;
+            }
+
             if (ProcessHasModule(pe.th32ProcessID, L"VRPacingHook.dll")) {
                 continue;
             }
@@ -132,7 +174,9 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
 
             if (isVRProcess) {
                 if (InjectDllToProcess(pe.th32ProcessID, dllPath)) {
-                    LogMessage(LogLevel::Info, "Inyeccion VRPacingHook completada en PID " + std::to_string(pe.th32ProcessID));
+                    std::wstring ws(pe.szExeFile);
+                    LogMessage(LogLevel::Info, "Inyeccion automatica aplicada a juego VR: " +
+                               std::string(ws.begin(), ws.end()) + " [PID " + std::to_string(pe.th32ProcessID) + "]");
                 }
             }
         } while (Process32NextW(snapshot, &pe));

@@ -74,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: VRPacing-windows-x64
-          path: dist/VRPacing-windows-x64.zip
+          path: dist/VRPacing/
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

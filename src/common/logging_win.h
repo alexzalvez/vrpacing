@@ -16,6 +16,7 @@ enum class LogLevel {
 void InitLogging();
 void RotateLogsIfNeeded();
 void LogMessage(LogLevel level, const std::string& text);
+std::wstring GetLogFilePath();
 
 } // namespace vrpacing
 
