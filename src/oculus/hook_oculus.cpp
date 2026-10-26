@@ -50,6 +50,7 @@ using ovrDestroyTextureSwapChainFn = void(__cdecl*)(ovrSession, ovrTextureSwapCh
 ovrInitializeFn g_origInitialize = nullptr;
 ovrSubmitFrameFn g_origSubmit = nullptr;
 ovrSubmitFrameFn g_origSubmit2 = nullptr;
+ovrSubmitFrameFn g_origEndFrame = nullptr;
 ovrWaitToBeginFrameFn g_origWaitToBeginFrame = nullptr;
 ovrGetFovTextureSizeFn g_origGetFovTextureSize = nullptr;
 ovrGetPredictedDisplayTimeFn g_ovrGetPredictedDisplayTime = nullptr;
@@ -270,7 +271,6 @@ void ProcessAndUpscaleLayer(ovrSession session,
     const bool singleTexture = (inRight == nullptr || inRight == inLeft);
     bool anySuccess = false;
 
-    // Desvincular RTVs activos para evitar contencion con Compute Shader
     if (ctx.context) {
         ID3D11RenderTargetView* nullRTV[1] = { nullptr };
         ctx.context->OMSetRenderTargets(1, nullRTV, nullptr);
@@ -338,7 +338,7 @@ void ProcessAndUpscaleLayer(ovrSession session,
         desc.projCenterY = projY;
         desc.radius = g_cfg.upscaling.radius;
         desc.sharpness = g_cfg.upscaling.sharpness;
-        desc.maskEnabled = g_cfg.mask.enabled;
+        desc.maskEnabled = false;
         desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
         if (g_upscaler.Upscale(ctx.context.Get(), inTex.Get(), outTex, desc)) {
@@ -492,9 +492,21 @@ ovrResult __cdecl Hooked_ovrSubmitFrame2(ovrSession session,
     return SubmitFrameInternal(g_origSubmit2 ? g_origSubmit2 : g_origSubmit, session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
 }
 
+ovrResult __cdecl Hooked_ovrEndFrame(ovrSession session,
+                                     long long frameIndex,
+                                     const ovrViewScaleDesc* viewScaleDesc,
+                                     ovrLayerHeader const* const* layerPtrList,
+                                     unsigned int layerCount) {
+    return SubmitFrameInternal(g_origEndFrame ? g_origEndFrame : (g_origSubmit ? g_origSubmit : g_origSubmit2),
+                               session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+}
+
 } // namespace
 
 void InstallOculusHooks() {
+    static std::atomic<bool> s_installed{ false };
+    if (s_installed.load()) return;
+
     InitLogging();
     g_cfg = LoadConfig();
     g_limiter.Initialize();
@@ -525,6 +537,7 @@ void InstallOculusHooks() {
     auto initFn = reinterpret_cast<ovrInitializeFn>(GetProcAddress(mod, "ovr_Initialize"));
     auto submit = reinterpret_cast<ovrSubmitFrameFn>(GetProcAddress(mod, "ovr_SubmitFrame"));
     auto submit2 = reinterpret_cast<ovrSubmitFrameFn>(GetProcAddress(mod, "ovr_SubmitFrame2"));
+    auto endFrame = reinterpret_cast<ovrSubmitFrameFn>(GetProcAddress(mod, "ovr_EndFrame"));
     auto waitBegin = reinterpret_cast<ovrWaitToBeginFrameFn>(GetProcAddress(mod, "ovr_WaitToBeginFrame"));
     auto getSize = reinterpret_cast<ovrGetFovTextureSizeFn>(GetProcAddress(mod, "ovr_GetFovTextureSize"));
 
@@ -545,6 +558,11 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(submit2));
     }
 
+    if (endFrame) {
+        MH_CreateHook(reinterpret_cast<void*>(endFrame), reinterpret_cast<void*>(&Hooked_ovrEndFrame), reinterpret_cast<void**>(&g_origEndFrame));
+        MH_EnableHook(reinterpret_cast<void*>(endFrame));
+    }
+
     if (waitBegin) {
         MH_CreateHook(reinterpret_cast<void*>(waitBegin), reinterpret_cast<void*>(&Hooked_ovrWaitToBeginFrame), reinterpret_cast<void**>(&g_origWaitToBeginFrame));
         MH_EnableHook(reinterpret_cast<void*>(waitBegin));
@@ -555,7 +573,8 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(getSize));
     }
 
-    LogMessage(LogLevel::Info, "Hooks Oculus LibOVR instalados con soporte completo D3D11 NIS.");
+    s_installed.store(true);
+    LogMessage(LogLevel::Info, "Hooks Oculus LibOVR instalados con soporte completo D3D11 NIS (SubmitFrame, SubmitFrame2, EndFrame).");
 }
 
 } // namespace vrpacing

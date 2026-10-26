@@ -17,6 +17,7 @@
 #include <cmath>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "minhook/include/MinHook.h"
@@ -36,13 +37,16 @@ using VRGetGenericInterfaceFn = void* (*)(const char*, int*);
 VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
-SubmitFn g_origSubmit = nullptr;
-
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
-WaitGetPosesFn g_origWaitGetPoses = nullptr;
 
 std::mutex g_mutex;
+std::unordered_map<void*, WaitGetPosesFn> g_origWaitGetPosesMap;
+std::unordered_map<void*, SubmitFn> g_origSubmitMap;
 std::unordered_set<std::string> g_hookedInterfaces;
+
+void* g_activeCompositor = nullptr;
+WaitGetPosesFn g_activeOrigWaitGetPoses = nullptr;
+SubmitFn g_activeOrigSubmit = nullptr;
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -88,8 +92,16 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          vr::TrackedDevicePose_t* pGamePoseArray,
                                          uint32_t unGamePoseArrayCount) {
     thread_local bool inWait = false;
-    if (inWait) {
-        return g_origWaitGetPoses(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+    WaitGetPosesFn origFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_origWaitGetPosesMap.find(self);
+        origFn = (it != g_origWaitGetPosesMap.end()) ? it->second : g_activeOrigWaitGetPoses;
+    }
+
+    if (inWait || !origFn) {
+        return origFn ? origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount)
+                      : vr::VRCompositorError_None;
     }
     inWait = true;
 
@@ -115,7 +127,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     const auto start = std::chrono::steady_clock::now();
-    vr::EVRCompositorError res = g_origWaitGetPoses(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+    vr::EVRCompositorError res = origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     const auto end = std::chrono::steady_clock::now();
 
     const double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
@@ -135,13 +147,20 @@ vr::EVRCompositorError HookedSubmit(void* self,
                                     const vr::Texture_t* pTexture,
                                     const vr::VRTextureBounds_t* pBounds,
                                     vr::EVRSubmitFlags nSubmitFlags) {
+    SubmitFn origFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_origSubmitMap.find(self);
+        origFn = (it != g_origSubmitMap.end()) ? it->second : g_activeOrigSubmit;
+    }
+
     thread_local bool inSubmit = false;
-    if (inSubmit || !pTexture || !pTexture->handle || pTexture->eType != vr::TextureType_DirectX) {
-        return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+    if (inSubmit || !origFn || !pTexture || !pTexture->handle || pTexture->eType != vr::TextureType_DirectX) {
+        return origFn ? origFn(self, eEye, pTexture, pBounds, nSubmitFlags) : vr::VRCompositorError_None;
     }
 
     if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
-        return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     inSubmit = true;
@@ -164,7 +183,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (!g_ovrCtx.device || !g_ovrCtx.context) {
         inSubmit = false;
-        return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     D3D11_TEXTURE2D_DESC inDesc{};
@@ -188,7 +207,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (cropW == 0 || cropH == 0) {
         inSubmit = false;
-        return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     g_lastInW = cropW;
@@ -245,7 +264,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
                 g_lastHResult = hr;
                 LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura compartida escalada. HR=" + std::to_string(hr));
                 inSubmit = false;
-                return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+                return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
             }
             sharedOut.width = outW;
             sharedOut.height = outH;
@@ -253,24 +272,25 @@ vr::EVRCompositorError HookedSubmit(void* self,
         }
     }
 
-    // Desvincular RTVs activos para evitar contencion de pipeline con el Compute Shader
     ID3D11RenderTargetView* nullRTV[1] = { nullptr };
     g_ovrCtx.context->OMSetRenderTargets(1, nullRTV, nullptr);
 
     UpscaleDispatchDesc dispatch{};
     dispatch.srcRect = { cropX, cropY, cropW, cropH };
     dispatch.dstRect = { 0, 0, outW, outH };
+    dispatch.srcArrayIndex = (inDesc.ArraySize > 1) ? ((eEye == vr::Eye_Right) ? 1 : 0) : 0;
+    dispatch.dstArrayIndex = 0;
     dispatch.projCenterX = 0.5f;
     dispatch.projCenterY = 0.5f;
     dispatch.radius = g_cfg.upscaling.radius;
     dispatch.sharpness = g_cfg.upscaling.sharpness;
-    dispatch.maskEnabled = g_cfg.mask.enabled;
+    dispatch.maskEnabled = false;
     dispatch.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
     if (!g_upscaler.Upscale(g_ovrCtx.context.Get(), inTex, sharedOut.texture.Get(), dispatch)) {
         g_upscaleStatus = -3;
         inSubmit = false;
-        return g_origSubmit(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     g_upscaleStatus = 1;
@@ -283,7 +303,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
     outBounds.vMin = isFlippedY ? 1.0f : 0.0f;
     outBounds.vMax = isFlippedY ? 0.0f : 1.0f;
 
-    vr::EVRCompositorError res = g_origSubmit(self, eEye, &replacedTex, &outBounds, nSubmitFlags);
+    vr::EVRCompositorError res = origFn(self, eEye, &replacedTex, &outBounds, nSubmitFlags);
     inSubmit = false;
     return res;
 }
@@ -294,38 +314,54 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
         return iface;
     }
 
-    if (std::strstr(name, "IVRCompositor")) {
+    // Filtrar estrictamente: solo enganchar clases C++ IVRCompositor_XXX
+    // Ignorar FnTable (structs de C sin vtable ni 'this') y wrappers internos
+    std::string sName(name);
+    if (sName.rfind("IVRCompositor_", 0) == 0) {
         std::lock_guard<std::mutex> lock(g_mutex);
+
+        unsigned int version = 0;
+        if (::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
+            version = 26;
+        }
+
+        uint32_t submitIndex = 5;
+        if (version < 9) {
+            submitIndex = 6;
+        } else if (version < 12) {
+            submitIndex = 4;
+        }
+
+        void** vtbl = *reinterpret_cast<void***>(iface);
+        MH_Initialize();
+
+        // Enlazar WaitGetPoses para este puntero de vtable
+        WaitGetPosesFn origWait = nullptr;
+        if (MH_CreateHook(vtbl[2], reinterpret_cast<void*>(&HookedWaitGetPoses), reinterpret_cast<void**>(&origWait)) == MH_OK) {
+            MH_EnableHook(vtbl[2]);
+            g_origWaitGetPosesMap[iface] = origWait;
+            g_activeOrigWaitGetPoses = origWait;
+        } else if (origWait) {
+            g_origWaitGetPosesMap[iface] = origWait;
+            g_activeOrigWaitGetPoses = origWait;
+        }
+
+        // Enlazar Submit para este puntero de vtable
+        SubmitFn origSub = nullptr;
+        if (MH_CreateHook(vtbl[submitIndex], reinterpret_cast<void*>(&HookedSubmit), reinterpret_cast<void**>(&origSub)) == MH_OK) {
+            MH_EnableHook(vtbl[submitIndex]);
+            g_origSubmitMap[iface] = origSub;
+            g_activeOrigSubmit = origSub;
+        } else if (origSub) {
+            g_origSubmitMap[iface] = origSub;
+            g_activeOrigSubmit = origSub;
+        }
+
+        g_activeCompositor = iface;
+
         if (g_hookedInterfaces.find(name) == g_hookedInterfaces.end()) {
             g_hookedInterfaces.insert(name);
-
-            unsigned int version = 0;
-            if (::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
-                version = 26;
-            }
-
-            uint32_t submitIndex = 5;
-            if (version < 9) {
-                submitIndex = 6;
-            } else if (version < 12) {
-                submitIndex = 4;
-            }
-
-            void** vtbl = *reinterpret_cast<void***>(iface);
-
-            MH_Initialize();
-
-            if (!g_origWaitGetPoses) {
-                MH_CreateHook(vtbl[2], reinterpret_cast<void*>(&HookedWaitGetPoses), reinterpret_cast<void**>(&g_origWaitGetPoses));
-                MH_EnableHook(vtbl[2]);
-            }
-
-            if (!g_origSubmit) {
-                MH_CreateHook(vtbl[submitIndex], reinterpret_cast<void*>(&HookedSubmit), reinterpret_cast<void**>(&g_origSubmit));
-                MH_EnableHook(vtbl[submitIndex]);
-            }
-
-            LogMessage(LogLevel::Info, "OpenVR hooks instalados en " + std::string(name) +
+            LogMessage(LogLevel::Info, "OpenVR hooks instalados en " + sName +
                        " (WaitGetPoses vtbl[2], Submit vtbl[" + std::to_string(submitIndex) + "])");
         }
     }
@@ -335,6 +371,9 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
 } // namespace
 
 void InstallOpenVRHooks() {
+    static std::atomic<bool> s_installed{ false };
+    if (s_installed.load()) return;
+
     HMODULE mod = GetModuleHandleW(L"openvr_api.dll");
     if (!mod) return;
 
@@ -342,9 +381,11 @@ void InstallOpenVRHooks() {
     if (!fn) return;
 
     MH_Initialize();
-    MH_CreateHook(reinterpret_cast<void*>(fn), reinterpret_cast<void*>(&HookedVRGetGenericInterface), reinterpret_cast<void**>(&g_origGetGenericInterface));
-    MH_EnableHook(reinterpret_cast<void*>(fn));
-    LogMessage(LogLevel::Info, "Hook OpenVR VR_GetGenericInterface instalado.");
+    if (MH_CreateHook(reinterpret_cast<void*>(fn), reinterpret_cast<void*>(&HookedVRGetGenericInterface), reinterpret_cast<void**>(&g_origGetGenericInterface)) == MH_OK) {
+        MH_EnableHook(reinterpret_cast<void*>(fn));
+        s_installed.store(true);
+        LogMessage(LogLevel::Info, "Hook OpenVR VR_GetGenericInterface instalado.");
+    }
 }
 
 } // namespace vrpacing
