@@ -25,10 +25,7 @@ void main(uint3 blockIdx : SV_GroupID, uint3 threadIdx : SV_GroupThreadID)
     if (dSq <= squaredRadius) {
         NVScaler(blockIdx.xy, threadIdx.x);
     }
-    else if (dSq <= squaredMaxRadius) {
-        DirectCopy(blockIdx.xy, threadIdx.x);
-    }
     else {
-        return;
+        DirectCopy(blockIdx.xy, threadIdx.x);
     }
 }

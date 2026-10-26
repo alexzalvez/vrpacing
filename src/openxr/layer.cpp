@@ -31,7 +31,6 @@
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "vrpacing/hz_tracker.h"
-#include "vrpacing/mask_geometry.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -51,7 +50,6 @@ PFN_xrWaitSwapchainImage g_nextWaitSwapchainImage = nullptr;
 PFN_xrReleaseSwapchainImage g_nextReleaseSwapchainImage = nullptr;
 PFN_xrEndFrame g_nextEndFrame = nullptr;
 PFN_xrWaitFrame g_nextWaitFrame = nullptr;
-PFN_xrGetVisibilityMaskKHR g_nextGetVisibilityMaskKHR = nullptr;
 PFN_xrGetSystemProperties g_nextGetSystemProperties = nullptr;
 PFN_xrEnumerateInstanceExtensionProperties g_nextEnumerateInstanceExtensionProperties = nullptr;
 
@@ -234,11 +232,8 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     appDesc.SampleDesc.Count = createInfo->sampleCount ? createInfo->sampleCount : 1;
     appDesc.Usage = D3D11_USAGE_DEFAULT;
     appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (isColor && (appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-        appDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
-    } else if (isColor && (appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
-        appDesc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
-    }
+    appDesc.CPUAccessFlags = 0;
+    appDesc.MiscFlags = 0;
 
     uint32_t imgCount = 0;
     g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
@@ -377,7 +372,7 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
             desc.projCenterY = 0.5f;
             desc.radius = g_cfg.upscaling.radius;
             desc.sharpness = g_cfg.upscaling.sharpness;
-            desc.maskEnabled = g_cfg.mask.enabled;
+            desc.maskEnabled = false;
             desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
             if (!g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
@@ -468,40 +463,6 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
     return g_nextEndFrame(session, &modified);
 }
 
-XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
-    XrSession session,
-    XrViewConfigurationType viewConfigurationType,
-    uint32_t viewIndex,
-    XrVisibilityMaskTypeKHR visibilityMaskType,
-    XrVisibilityMaskKHR* visibilityMask) {
-    EnsureInit();
-    XrResult r = g_nextGetVisibilityMaskKHR ? g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask) : XR_ERROR_FUNCTION_UNSUPPORTED;
-    if (XR_FAILED(r) || !visibilityMask || !g_cfg.mask.enabled) return r;
-
-    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
-        EllipseMaskParams params{};
-        params.radiusX = g_cfg.upscaling.radius;
-        params.radiusY = g_cfg.upscaling.radius;
-        params.segments = 32;
-        const IndexedMesh mesh = BuildEllipseOutsideMaskIndexed(params);
-
-        visibilityMask->vertexCountOutput = static_cast<uint32_t>(mesh.vertices.size());
-        visibilityMask->indexCountOutput = static_cast<uint32_t>(mesh.indices.size());
-
-        if (visibilityMask->vertexCapacityInput >= mesh.vertices.size() && visibilityMask->vertices) {
-            for (size_t i = 0; i < mesh.vertices.size(); ++i) {
-                visibilityMask->vertices[i].x = mesh.vertices[i].x;
-                visibilityMask->vertices[i].y = mesh.vertices[i].y;
-            }
-        }
-        if (visibilityMask->indexCapacityInput >= mesh.indices.size() && visibilityMask->indices) {
-            const size_t bytes = mesh.indices.size() * sizeof(uint32_t);
-            std::memcpy(visibilityMask->indices, mesh.indices.data(), bytes);
-        }
-    }
-    return XR_SUCCESS;
-}
-
 XrResult XRAPI_CALL Impl_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
     return g_nextGetSystemProperties(instance, systemId, properties);
 }
@@ -523,7 +484,6 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextReleaseSwapchainImage));
     g_nextGetInstanceProcAddr(instance, "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEndFrame));
     g_nextGetInstanceProcAddr(instance, "xrWaitFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitFrame));
-    g_nextGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetVisibilityMaskKHR));
     g_nextGetInstanceProcAddr(instance, "xrGetSystemProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetSystemProperties));
     g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));
 }
@@ -545,7 +505,6 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, 
     else if (strcmp(name, "xrReleaseSwapchainImage") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrReleaseSwapchainImage);
     else if (strcmp(name, "xrEndFrame") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEndFrame);
     else if (strcmp(name, "xrWaitFrame") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitFrame);
-    else if (strcmp(name, "xrGetVisibilityMaskKHR") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetVisibilityMaskKHR);
     else if (strcmp(name, "xrGetSystemProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetSystemProperties);
     else if (strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateInstanceExtensionProperties);
     else return g_nextGetInstanceProcAddr(instance, name, function);
