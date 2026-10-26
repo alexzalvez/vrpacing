@@ -92,6 +92,8 @@ uint32_t g_lastOutH = 0;
 uint32_t g_lastFormat = 0;
 int32_t g_upscaleStatus = 0;
 int32_t g_lastHResult = 0;
+uint32_t g_nativeViewW = 0;
+uint32_t g_nativeViewH = 0;
 
 void EnsureInit() {
     static std::once_flag flag;
@@ -144,6 +146,11 @@ XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
 
     g_shm.SyncConfig(g_cfg);
 
+    if (viewCountOutput && *viewCountOutput > 0) {
+        g_nativeViewW = views[0].recommendedImageRectWidth;
+        g_nativeViewH = views[0].recommendedImageRectHeight;
+    }
+
     static std::atomic<bool> s_viewsLogged{ false };
     if (!s_viewsLogged.exchange(true) && viewCountOutput) {
         for (uint32_t i = 0; i < *viewCountOutput; ++i) {
@@ -165,7 +172,13 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     const bool isColor = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
                          (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
 
-    if (!isColor || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
+    // Solo escalar swapchains de renderizado del visor (ArraySize=2 o resolucion representativa de ojo 3D)
+    // Ignorar capas secundarias 2D de UI/HUD
+    const bool isEyeResolution = (createInfo->arraySize >= 2) ||
+                                 (g_nativeViewW > 0 && createInfo->width >= (g_nativeViewW * 7 / 10)) ||
+                                 (createInfo->width >= 1200 && createInfo->height >= 1200);
+
+    if (!isColor || !isEyeResolution || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
         XrResult r = g_nextCreateSwapchain(session, createInfo, swapchain);
         if (XR_SUCCEEDED(r)) {
             std::lock_guard<std::mutex> lock(g_layerMutex);
@@ -432,7 +445,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.005 && dt < 0.040) { // 25 Hz a 200 Hz
+            if (dt > 0.005 && dt < 0.040) {
                 const double measuredHz = 1.0 / dt;
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;

@@ -14,7 +14,7 @@
 namespace vrpacing {
 namespace {
 
-struct StagingResources {
+struct StagingFallback {
     ID3D11Device* device = nullptr;
 
     ComPtr<ID3D11Texture2D> srcTex;
@@ -44,7 +44,7 @@ struct StagingResources {
     }
 };
 
-StagingResources g_staging;
+StagingFallback g_fallback;
 
 DXGI_FORMAT GetCompatibleUnormFormat(DXGI_FORMAT format) {
     switch (format) {
@@ -80,7 +80,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     }
 
     if (device_.Get() != device) {
-        g_staging.Reset();
+        g_fallback.Reset();
         srvCache_.clear();
         uavCache_.clear();
     }
@@ -147,8 +147,28 @@ ComPtr<ID3D11ShaderResourceView> NisUpscalerD3D11::GetOrCreateSrv(ID3D11Texture2
         srvCache_.clear();
     }
 
-    auto srv = CreateShaderResourceView(device_.Get(), tex, arrayIndex);
-    srvCache_[key] = srv;
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = GetCompatibleUnormFormat(desc.Format);
+
+    if (desc.ArraySize > 1) {
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        srvDesc.Texture2DArray.FirstArraySlice = (arrayIndex >= 0 && static_cast<UINT>(arrayIndex) < desc.ArraySize) ? static_cast<UINT>(arrayIndex) : 0;
+        srvDesc.Texture2DArray.ArraySize = 1;
+        srvDesc.Texture2DArray.MipLevels = desc.MipLevels ? desc.MipLevels : 1;
+        srvDesc.Texture2DArray.MostDetailedMip = 0;
+    } else {
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = desc.MipLevels ? desc.MipLevels : 1;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+    }
+
+    ComPtr<ID3D11ShaderResourceView> srv;
+    if (SUCCEEDED(device_->CreateShaderResourceView(tex, &srvDesc, srv.GetAddressOf()))) {
+        srvCache_[key] = srv;
+    }
     return srv;
 }
 
@@ -163,8 +183,30 @@ ComPtr<ID3D11UnorderedAccessView> NisUpscalerD3D11::GetOrCreateUav(ID3D11Texture
         uavCache_.clear();
     }
 
-    auto uav = CreateUnorderedAccessView(device_.Get(), tex, arrayIndex);
-    uavCache_[key] = uav;
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+
+    if ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0) {
+        return nullptr;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.Format = GetCompatibleUnormFormat(desc.Format);
+
+    if (desc.ArraySize > 1) {
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        uavDesc.Texture2DArray.FirstArraySlice = (arrayIndex >= 0 && static_cast<UINT>(arrayIndex) < desc.ArraySize) ? static_cast<UINT>(arrayIndex) : 0;
+        uavDesc.Texture2DArray.ArraySize = 1;
+        uavDesc.Texture2DArray.MipSlice = 0;
+    } else {
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        uavDesc.Texture2D.MipSlice = 0;
+    }
+
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    if (SUCCEEDED(device_->CreateUnorderedAccessView(tex, &uavDesc, uav.GetAddressOf()))) {
+        uavCache_[key] = uav;
+    }
     return uav;
 }
 
@@ -258,15 +300,15 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     src->GetDevice(dev.GetAddressOf());
     if (!dev) return false;
 
-    if (!initialized_ || (device_.Get() != dev.Get() && g_staging.srcTex == nullptr)) {
+    if (!initialized_ || device_.Get() != dev.Get()) {
         if (!Initialize(dev.Get())) {
             return false;
         }
     }
 
-    if (g_staging.device != device_.Get()) {
-        g_staging.Reset();
-        g_staging.device = device_.Get();
+    if (g_fallback.device != device_.Get()) {
+        g_fallback.Reset();
+        g_fallback.device = device_.Get();
     }
 
     D3D11_TEXTURE2D_DESC srcDesc{};
@@ -275,97 +317,98 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     D3D11_TEXTURE2D_DESC dstDesc{};
     dst->GetDesc(&dstDesc);
 
-    DXGI_FORMAT srcUnormFmt = (srcDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS || srcDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                              ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                              : GetCompatibleUnormFormat(srcDesc.Format);
-
-    DXGI_FORMAT dstUnormFmt = (dstDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS || dstDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                              ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                              : GetCompatibleUnormFormat(dstDesc.Format);
-
-    if (!g_staging.srcTex || g_staging.srcW != srcDesc.Width || g_staging.srcH != srcDesc.Height || g_staging.srcFmt != srcUnormFmt) {
-        g_staging.srcTex.Reset();
-        g_staging.srcSrv.Reset();
-
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = srcDesc.Width;
-        td.Height = srcDesc.Height;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = srcUnormFmt;
-        td.SampleDesc.Count = 1;
-        td.SampleDesc.Quality = 0;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        HRESULT hrTex = device_->CreateTexture2D(&td, nullptr, g_staging.srcTex.GetAddressOf());
-        if (FAILED(hrTex)) {
-            HRESULT reason = device_->GetDeviceRemovedReason();
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging Texture2D UNORM. HR=" + std::to_string(hrTex) + " Reason=" + std::to_string(reason));
-            return false;
-        }
-        HRESULT hrSrv = device_->CreateShaderResourceView(g_staging.srcTex.Get(), nullptr, g_staging.srcSrv.GetAddressOf());
-        if (FAILED(hrSrv)) {
-            HRESULT reason = device_->GetDeviceRemovedReason();
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging SRV UNORM. HR=" + std::to_string(hrSrv) + " Reason=" + std::to_string(reason));
-            return false;
-        }
-        g_staging.srcW = srcDesc.Width;
-        g_staging.srcH = srcDesc.Height;
-        g_staging.srcFmt = srcUnormFmt;
+    // RUTA 1: Zero-Copy Direct SRV (lectura directa sin subresource copy)
+    ComPtr<ID3D11ShaderResourceView> activeSrcSrv;
+    if (srcDesc.SampleDesc.Count <= 1) {
+        activeSrcSrv = GetOrCreateSrv(src, desc.srcArrayIndex);
     }
 
-    if (!g_staging.dstTex || g_staging.dstW != dstDesc.Width || g_staging.dstH != dstDesc.Height || g_staging.dstFmt != dstUnormFmt) {
-        g_staging.dstTex.Reset();
-        g_staging.dstUav.Reset();
+    // Si la lectura directa no es posible (ej: MSAA), usar fallback staging
+    if (!activeSrcSrv) {
+        DXGI_FORMAT srcUnormFmt = GetCompatibleUnormFormat(srcDesc.Format);
+        if (!g_fallback.srcTex || g_fallback.srcW != srcDesc.Width || g_fallback.srcH != srcDesc.Height || g_fallback.srcFmt != srcUnormFmt) {
+            g_fallback.srcTex.Reset();
+            g_fallback.srcSrv.Reset();
 
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = dstDesc.Width;
-        td.Height = dstDesc.Height;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = dstUnormFmt;
-        td.SampleDesc.Count = 1;
-        td.SampleDesc.Quality = 0;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = srcDesc.Width;
+            td.Height = srcDesc.Height;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = srcUnormFmt;
+            td.SampleDesc.Count = 1;
+            td.SampleDesc.Quality = 0;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-        HRESULT hrDstTex = device_->CreateTexture2D(&td, nullptr, g_staging.dstTex.GetAddressOf());
-        if (FAILED(hrDstTex)) {
-            HRESULT reason = device_->GetDeviceRemovedReason();
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging dst Texture2D UNORM. HR=" + std::to_string(hrDstTex) + " Reason=" + std::to_string(reason));
-            return false;
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, g_fallback.srcTex.GetAddressOf())) ||
+                FAILED(device_->CreateShaderResourceView(g_fallback.srcTex.Get(), nullptr, g_fallback.srcSrv.GetAddressOf()))) {
+                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error en fallback staging SRV.");
+                return false;
+            }
+            g_fallback.srcW = srcDesc.Width;
+            g_fallback.srcH = srcDesc.Height;
+            g_fallback.srcFmt = srcUnormFmt;
         }
-        HRESULT hrDstUav = device_->CreateUnorderedAccessView(g_staging.dstTex.Get(), nullptr, g_staging.dstUav.GetAddressOf());
-        if (FAILED(hrDstUav)) {
-            HRESULT reason = device_->GetDeviceRemovedReason();
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging dst UAV UNORM. HR=" + std::to_string(hrDstUav) + " Reason=" + std::to_string(reason));
-            return false;
+
+        const UINT srcSlice = (desc.srcArrayIndex >= 0 && static_cast<UINT>(desc.srcArrayIndex) < srcDesc.ArraySize)
+                              ? static_cast<UINT>(desc.srcArrayIndex) : 0;
+        const UINT srcSub = D3D11CalcSubresource(0, srcSlice, srcDesc.MipLevels);
+
+        if (srcDesc.SampleDesc.Count > 1) {
+            ctx->ResolveSubresource(g_fallback.srcTex.Get(), 0, src, srcSub, srcUnormFmt);
+        } else {
+            ctx->CopySubresourceRegion(g_fallback.srcTex.Get(), 0, 0, 0, 0, src, srcSub, nullptr);
         }
-        g_staging.dstW = dstDesc.Width;
-        g_staging.dstH = dstDesc.Height;
-        g_staging.dstFmt = dstUnormFmt;
+        activeSrcSrv = g_fallback.srcSrv;
     }
 
-    const UINT srcSlice = (desc.srcArrayIndex >= 0 && static_cast<UINT>(desc.srcArrayIndex) < srcDesc.ArraySize)
-                          ? static_cast<UINT>(desc.srcArrayIndex) : 0;
-    const UINT srcSub = D3D11CalcSubresource(0, srcSlice, srcDesc.MipLevels);
+    // RUTA 2: Zero-Copy Direct UAV (escritura directa en destino si soporta UAV)
+    ComPtr<ID3D11UnorderedAccessView> activeDstUav = GetOrCreateUav(dst, desc.dstArrayIndex);
+    const bool directWriteOk = (activeDstUav != nullptr);
 
-    if (srcDesc.SampleDesc.Count > 1) {
-        ctx->ResolveSubresource(g_staging.srcTex.Get(), 0, src, srcSub, srcUnormFmt);
-    } else {
-        ctx->CopySubresourceRegion(g_staging.srcTex.Get(), 0, 0, 0, 0, src, srcSub, nullptr);
+    // Si el destino no admite UAV directo (ej: swapchain sRGB de OpenXR), usar fallback staging
+    if (!directWriteOk) {
+        DXGI_FORMAT dstUnormFmt = GetCompatibleUnormFormat(dstDesc.Format);
+        if (!g_fallback.dstTex || g_fallback.dstW != dstDesc.Width || g_fallback.dstH != dstDesc.Height || g_fallback.dstFmt != dstUnormFmt) {
+            g_fallback.dstTex.Reset();
+            g_fallback.dstUav.Reset();
+
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = dstDesc.Width;
+            td.Height = dstDesc.Height;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = dstUnormFmt;
+            td.SampleDesc.Count = 1;
+            td.SampleDesc.Quality = 0;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, g_fallback.dstTex.GetAddressOf())) ||
+                FAILED(device_->CreateUnorderedAccessView(g_fallback.dstTex.Get(), nullptr, g_fallback.dstUav.GetAddressOf()))) {
+                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error en fallback staging UAV.");
+                return false;
+            }
+            g_fallback.dstW = dstDesc.Width;
+            g_fallback.dstH = dstDesc.Height;
+            g_fallback.dstFmt = dstUnormFmt;
+        }
+        activeDstUav = g_fallback.dstUav;
     }
 
-    if (!Upscale(ctx, g_staging.srcSrv.Get(), g_staging.dstUav.Get(),
+    if (!Upscale(ctx, activeSrcSrv.Get(), activeDstUav.Get(),
                  srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height, desc)) {
         return false;
     }
 
-    const UINT dstSlice = (desc.dstArrayIndex >= 0 && static_cast<UINT>(desc.dstArrayIndex) < dstDesc.ArraySize)
-                          ? static_cast<UINT>(desc.dstArrayIndex) : 0;
-    const UINT dstSub = D3D11CalcSubresource(0, dstSlice, dstDesc.MipLevels);
-    ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_staging.dstTex.Get(), 0, nullptr);
+    // Si usamos staging en destino, transferir resultado al swapchain
+    if (!directWriteOk) {
+        const UINT dstSlice = (desc.dstArrayIndex >= 0 && static_cast<UINT>(desc.dstArrayIndex) < dstDesc.ArraySize)
+                              ? static_cast<UINT>(desc.dstArrayIndex) : 0;
+        const UINT dstSub = D3D11CalcSubresource(0, dstSlice, dstDesc.MipLevels);
+        ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_fallback.dstTex.Get(), 0, nullptr);
+    }
 
     return true;
 }

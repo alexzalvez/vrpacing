@@ -28,10 +28,14 @@
 #include "gfx/nis_upscaler_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
+#include "openvr/hook_openvr.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace vrpacing {
+
+std::atomic<bool> g_openVrHandlingFrames{ false };
+
 namespace {
 
 using VRGetGenericInterfaceFn = void* (*)(const char*, int*);
@@ -98,7 +102,6 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          uint32_t unRenderPoseArrayCount,
                                          vr::TrackedDevicePose_t* pGamePoseArray,
                                          uint32_t unGamePoseArrayCount) {
-    thread_local bool inWait = false;
     WaitGetPosesFn origFn = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -106,9 +109,16 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         origFn = (it != g_origWaitGetPosesMap.end()) ? it->second : g_activeOrigWaitGetPoses;
     }
 
-    if (inWait || !origFn) {
-        return origFn ? origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount)
-                      : vr::VRCompositorError_None;
+    if (!origFn) return vr::VRCompositorError_None;
+
+    // Si OpenXR Layer esta activa en este proceso, ceder el control del pacing y submit
+    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr) {
+        return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+    }
+
+    thread_local bool inWait = false;
+    if (inWait) {
+        return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
     inWait = true;
 
@@ -156,7 +166,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.005 && dt < 0.040) { // 25 Hz a 200 Hz
+            if (dt > 0.005 && dt < 0.040) {
                 const double measuredHz = 1.0 / dt;
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;
@@ -185,9 +195,16 @@ vr::EVRCompositorError HookedSubmit(void* self,
         origFn = (it != g_origSubmitMap.end()) ? it->second : g_activeOrigSubmit;
     }
 
+    if (!origFn) return vr::VRCompositorError_None;
+
+    // Si OpenXR Layer esta activa en este proceso (Skyrim VR + OpenComposite / VDXR), ceder el paso
+    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr) {
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+    }
+
     thread_local bool inSubmit = false;
-    if (inSubmit || !origFn || !pTexture || !pTexture->handle || pTexture->eType != vr::TextureType_DirectX) {
-        return origFn ? origFn(self, eEye, pTexture, pBounds, nSubmitFlags) : vr::VRCompositorError_None;
+    if (inSubmit || !pTexture || !pTexture->handle || pTexture->eType != vr::TextureType_DirectX) {
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     EnsureInit();
@@ -287,7 +304,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
             outDesc.SampleDesc.Count = 1;
             outDesc.SampleDesc.Quality = 0;
             outDesc.Usage = D3D11_USAGE_DEFAULT;
-            outDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            outDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
             outDesc.CPUAccessFlags = 0;
             outDesc.MiscFlags = 0;
 
@@ -328,6 +345,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
     }
 
     g_upscaleStatus = 1;
+    g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
 
     vr::VRTextureBounds_t outBounds{};
     outBounds.uMin = isFlippedX ? 1.0f : 0.0f;

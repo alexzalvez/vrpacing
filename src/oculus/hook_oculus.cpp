@@ -25,6 +25,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "openvr/hook_openvr.h"
 #include "third_party/oculus/ovr_minimal.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -211,11 +212,17 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         outDesc.Height = outH;
         outDesc.SampleCount = 1;
         outDesc.MipLevels = 1;
-        outDesc.BindFlags = ovrTextureBind_DX_RenderTarget;
+        outDesc.BindFlags = ovrTextureBind_DX_RenderTarget | ovrTextureBind_DX_UnorderedAccess;
         outDesc.MiscFlags = 0;
 
         ovrTextureSwapChain outChain = nullptr;
         ovrResult createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
+        if (createRes < 0 || !outChain) {
+            // Reintento sin UAV si el runtime de Oculus rechaza UNORDERED_ACCESS en sRGB
+            outDesc.BindFlags = ovrTextureBind_DX_RenderTarget;
+            createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
+        }
+
         if (createRes < 0 || !outChain) {
             g_upscaleStatus = -1;
             g_lastHResult = createRes;
@@ -368,6 +375,13 @@ ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
 }
 
 ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frameIndex) {
+    if (!g_origWaitToBeginFrame) return 0;
+
+    // Si OpenXR o OpenVR ya estan manejando el frame en este proceso, ceder el control del pacing
+    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+        return g_origWaitToBeginFrame(session, frameIndex);
+    }
+
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
@@ -380,16 +394,16 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
         }
     }
 
-    const double hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
+    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
     double targetFps = 0.0;
 
     if (g_cfg.pacing.enabled) {
         LimitInputs lim{};
-        lim.hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : hz;
+        lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
         lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
-        targetFps = vrpacing::ComputeTargetFps(lim);
+        targetFps = ComputeTargetFps(lim);
         g_limiter.SetTargetFps(targetFps);
         g_limiter.WaitBeforeRuntime();
     }
@@ -398,7 +412,7 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
-    return g_origWaitToBeginFrame ? g_origWaitToBeginFrame(session, frameIndex) : 0;
+    return g_origWaitToBeginFrame(session, frameIndex);
 }
 
 ovrSizei __cdecl Hooked_ovrGetFovTextureSize(ovrSession session, ovrEyeType eye, ovrFovPort fov, float pixelsPerDisplayPixel) {
@@ -411,6 +425,13 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
                               const ovrViewScaleDesc* viewScaleDesc,
                               ovrLayerHeader const* const* layerPtrList,
                               unsigned int layerCount) {
+    if (!origFn) return 0;
+
+    // Si OpenXR Layer o OpenVR ya estan activos en este proceso, evitar duplicar escalado
+    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+        return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+    }
+
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 

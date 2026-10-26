@@ -1,277 +1,156 @@
 #ifdef _WIN32
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-#include "process_scanner.h"
+#include "injector/process_scanner.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 
+#include <algorithm>
+#include <cwctype>
+#include <filesystem>
 #include <string>
 #include <vector>
-#include <unordered_set>
-#include <unordered_map>
 
 #include "common/logging_win.h"
+#include "vrpacing/shared_state.h"
 
 namespace vrpacing {
 namespace {
 
-std::unordered_map<DWORD, int> s_inspectedPids;
-std::unordered_set<DWORD> s_hookedPids;
+bool IsProcessBlacklisted(const std::wstring& exeName) {
+    std::wstring lower = exeName;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
-bool IsBlacklistedProcess(const wchar_t* exeName) {
-    if (!exeName) return true;
-
-    static const wchar_t* const kBlacklist[] = {
-        L"vrserver.exe",
-        L"vrcompositor.exe",
-        L"vrmonitor.exe",
-        L"vrdashboard.exe",
-        L"vrwebhelper.exe",
-        L"vrstartup.exe",
-        L"steamtours.exe",
-        L"steam.exe",
-        L"steamwebhelper.exe",
-        L"OVRServer_x64.exe",
-        L"OculusClient.exe",
-        L"OculusDash.exe",
-        L"OculusMonitor.exe",
-        L"OVRRedir.exe",
-        L"OVRServiceLauncher.exe",
-        L"VirtualDesktop.Streamer.exe",
-        L"VirtualDesktop.Server.exe",
-        L"VirtualDesktop.Service.exe",
-        L"VRPacingTray.exe",
-        L"VectorXR.exe",
-        L"VectorXR_x64.exe",
-        L"explorer.exe",
-        L"dwm.exe",
-        L"svchost.exe",
-        L"RuntimeBroker.exe",
-        L"taskhostw.exe",
-        L"sihost.exe",
-        L"ctfmon.exe",
-        L"SearchHost.exe",
-        L"StartMenuExperienceHost.exe",
-        L"SystemSettings.exe",
-        L"cmd.exe",
-        L"powershell.exe",
-        L"pwsh.exe",
-        L"conhost.exe",
-        L"Code.exe",
-        L"git.exe",
+    static const wchar_t* kBlacklist[] = {
+        L"cemu.exe",
         L"devenv.exe",
-        L"chrome.exe",
-        L"msedge.exe",
-        L"firefox.exe",
-        L"discord.exe",
-        L"spotify.exe",
-        L"epicgameslauncher.exe",
-        L"origin.exe",
-        L"nvcontainer.exe",
-        L"NVIDIA Share.exe"
+        L"vrpacingtray.exe",
+        L"steam.exe",
+        L"steamtours.exe",
+        L"oculusclient.exe",
+        L"virtualdesktop.streamer.exe"
     };
 
-    for (const auto* blocked : kBlacklist) {
-        if (_wcsicmp(exeName, blocked) == 0) {
-            return true;
+    for (const auto* b : kBlacklist) {
+        if (lower == b) return true;
+    }
+    return false;
+}
+
+bool IsModuleLoadedInProcess(HANDLE hProc, const wchar_t* targetDllName) {
+    HMODULE hMods[1024];
+    DWORD cbNeeded = 0;
+    if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
+        return false;
+    }
+
+    const DWORD count = cbNeeded / sizeof(HMODULE);
+    wchar_t modName[MAX_PATH];
+
+    for (DWORD i = 0; i < count; ++i) {
+        if (GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH)) {
+            if (_wcsicmp(modName, targetDllName) == 0) {
+                return true;
+            }
         }
     }
     return false;
 }
 
-bool InjectDllToProcess(DWORD pid, const std::wstring& dllPath) {
-    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
-    if (!process) {
+bool InjectDll(DWORD pid, const std::wstring& dllPath) {
+    if (!std::filesystem::exists(dllPath)) {
+        LogMessage(LogLevel::Error, "ProcessScanner: DLL de inyeccion no encontrada en disco.");
         return false;
     }
 
-    const size_t bytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    void* remoteMem = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                               PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                               FALSE, pid);
+    if (!hProc) {
+        return false;
+    }
+
+    const size_t pathBytes = (dllPath.size() + 1) * sizeof(wchar_t);
+    void* remoteMem = VirtualAllocEx(hProc, nullptr, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remoteMem) {
-        CloseHandle(process);
+        CloseHandle(hProc);
         return false;
     }
 
-    if (!WriteProcessMemory(process, remoteMem, dllPath.c_str(), bytes, nullptr)) {
-        VirtualFreeEx(process, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(process);
+    if (!WriteProcessMemory(hProc, remoteMem, dllPath.c_str(), pathBytes, nullptr)) {
+        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+        CloseHandle(hProc);
         return false;
     }
 
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    auto loadLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(k32, "LoadLibraryW"));
-    HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLib, remoteMem, 0, nullptr);
-    if (!thread) {
-        VirtualFreeEx(process, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(process);
+    LPTHREAD_START_ROUTINE loadLibAddr = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
+
+    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, loadLibAddr, remoteMem, 0, nullptr);
+    if (!hThread) {
+        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+        CloseHandle(hProc);
         return false;
     }
 
-    WaitForSingleObject(thread, 5000);
-    CloseHandle(thread);
-    VirtualFreeEx(process, remoteMem, 0, MEM_RELEASE);
-    CloseHandle(process);
+    WaitForSingleObject(hThread, 5000);
+    CloseHandle(hThread);
+    VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+    CloseHandle(hProc);
     return true;
-}
-
-struct ProcessModuleCheckResult {
-    bool hasHook = false;
-    bool hasOpenXRLayer = false;
-    bool isVR = false;
-};
-
-ProcessModuleCheckResult CheckProcessModules(DWORD pid) {
-    ProcessModuleCheckResult res{};
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return res;
-    }
-
-    MODULEENTRY32W me{};
-    me.dwSize = sizeof(me);
-    if (Module32FirstW(snapshot, &me)) {
-        do {
-            if (_wcsicmp(me.szModule, L"VRPacingHook.dll") == 0) {
-                res.hasHook = true;
-            }
-            if (_wcsicmp(me.szModule, L"VRPacingLayer.dll") == 0) {
-                res.hasOpenXRLayer = true;
-            }
-            if (_wcsicmp(me.szModule, L"openvr_api.dll") == 0 ||
-                _wcsicmp(me.szModule, L"LibOVRRT64_1.dll") == 0 ||
-                _wcsicmp(me.szModule, L"VirtualDesktop.LibOVRRT64_1.dll") == 0 ||
-                _wcsicmp(me.szModule, L"LibPVRRT64_1_X.dll") == 0) {
-                res.isVR = true;
-            }
-            if ((res.hasHook || res.hasOpenXRLayer) && res.isVR) {
-                break;
-            }
-        } while (Module32NextW(snapshot, &me));
-    }
-
-    CloseHandle(snapshot);
-    return res;
 }
 
 } // namespace
 
-bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
-    if (IsBlacklistedProcess(processName.c_str())) {
-        return false;
-    }
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+void ProcessScanner::PollAndInject(const std::wstring& hookDllPath) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
 
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    bool result = false;
 
-    if (Process32FirstW(snapshot, &pe)) {
+    if (Process32FirstW(hSnap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
-                auto check = CheckProcessModules(pe.th32ProcessID);
-                if (!check.hasHook && !check.hasOpenXRLayer) {
-                    result = InjectDllToProcess(pe.th32ProcessID, dllPath);
-                    if (result) {
-                        s_hookedPids.insert(pe.th32ProcessID);
-                        std::wstring ws(pe.szExeFile);
-                        LogMessage(LogLevel::Info, "Inyeccion manual aplicada a " + std::string(ws.begin(), ws.end()) +
-                                   " [PID " + std::to_string(pe.th32ProcessID) + "]");
-                    }
-                }
-                break;
-            }
-        } while (Process32NextW(snapshot, &pe));
-    }
+            const DWORD pid = pe.th32ProcessID;
+            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            if (injectedPids_.find(pid) != injectedPids_.end()) continue;
 
-    CloseHandle(snapshot);
-    return result;
-}
-
-void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    const DWORD myPid = GetCurrentProcessId();
-
-    std::unordered_set<DWORD> activePids;
-
-    if (Process32FirstW(snapshot, &pe)) {
-        do {
-            activePids.insert(pe.th32ProcessID);
-
-            if (pe.th32ProcessID == 0 || pe.th32ProcessID == myPid) {
+            std::wstring exeName = pe.szExeFile;
+            if (IsProcessBlacklisted(exeName)) {
                 continue;
             }
 
-            if (s_hookedPids.find(pe.th32ProcessID) != s_hookedPids.end()) {
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+            if (!hProc) continue;
+
+            const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
+            const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||
+                                  IsModuleLoadedInProcess(hProc, L"VirtualDesktop.LibOVRRT64_1.dll");
+
+            // Si es un proceso OpenXR nativo que ya carga VRPacingLayer, omitir inyeccion de hook
+            const bool isOpenXRLayer = IsModuleLoadedInProcess(hProc, L"VRPacingLayer.dll");
+
+            if (isOpenXRLayer) {
+                injectedPids_.insert(pid);
+                LogMessage(LogLevel::Info, "Proceso VR ya gestionado por OpenXR Layer (omitiendo VRPacingHook): " +
+                           std::string(exeName.begin(), exeName.end()) + " [PID " + std::to_string(pid) + "]");
+                CloseHandle(hProc);
                 continue;
             }
 
-            auto it = s_inspectedPids.find(pe.th32ProcessID);
-            if (it != s_inspectedPids.end() && it->second >= 3) {
-                continue;
-            }
-
-            if (IsBlacklistedProcess(pe.szExeFile)) {
-                s_inspectedPids[pe.th32ProcessID] = 999;
-                continue;
-            }
-
-            s_inspectedPids[pe.th32ProcessID]++;
-
-            auto check = CheckProcessModules(pe.th32ProcessID);
-            if (check.hasHook || check.hasOpenXRLayer) {
-                s_hookedPids.insert(pe.th32ProcessID);
-                if (check.hasOpenXRLayer) {
-                    std::wstring ws(pe.szExeFile);
-                    LogMessage(LogLevel::Info, "Proceso VR ya gestionado por OpenXR Layer (omitiendo VRPacingHook): " +
-                               std::string(ws.begin(), ws.end()) + " [PID " + std::to_string(pe.th32ProcessID) + "]");
-                }
-                continue;
-            }
-
-            if (check.isVR) {
-                if (InjectDllToProcess(pe.th32ProcessID, dllPath)) {
-                    s_hookedPids.insert(pe.th32ProcessID);
-                    std::wstring ws(pe.szExeFile);
+            if (isOpenVR || isOculus) {
+                if (InjectDll(pid, hookDllPath)) {
+                    injectedPids_.insert(pid);
                     LogMessage(LogLevel::Info, "Inyeccion automatica aplicada a juego VR: " +
-                               std::string(ws.begin(), ws.end()) + " [PID " + std::to_string(pe.th32ProcessID) + "]");
+                               std::string(exeName.begin(), exeName.end()) + " [PID " + std::to_string(pid) + "]");
                 }
             }
-        } while (Process32NextW(snapshot, &pe));
-    }
 
-    CloseHandle(snapshot);
-
-    for (auto it = s_inspectedPids.begin(); it != s_inspectedPids.end(); ) {
-        if (activePids.find(it->first) == activePids.end()) {
-            it = s_inspectedPids.erase(it);
-        } else {
-            ++it;
-        }
+            CloseHandle(hProc);
+        } while (Process32NextW(hSnap, &pe));
     }
-    for (auto it = s_hookedPids.begin(); it != s_hookedPids.end(); ) {
-        if (activePids.find(*it) == activePids.end()) {
-            it = s_hookedPids.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    CloseHandle(hSnap);
 }
 
 } // namespace vrpacing
