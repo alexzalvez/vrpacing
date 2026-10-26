@@ -1,5 +1,12 @@
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "injector/process_scanner.h"
 
 #include <windows.h>
@@ -10,27 +17,55 @@
 #include <cwctype>
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "common/logging_win.h"
-#include "vrpacing/shared_state.h"
 
 namespace vrpacing {
 namespace {
 
-bool IsProcessBlacklisted(const std::wstring& exeName) {
-    std::wstring lower = exeName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+std::unordered_set<DWORD> s_hookedPids;
 
-    static const wchar_t* kBlacklist[] = {
+bool IsBlacklistedProcess(const wchar_t* exeName) {
+    if (!exeName) return true;
+
+    static const wchar_t* const kBlacklist[] = {
         L"cemu.exe",
-        L"devenv.exe",
-        L"vrpacingtray.exe",
-        L"steam.exe",
+        L"vrserver.exe",
+        L"vrcompositor.exe",
+        L"vrmonitor.exe",
+        L"vrdashboard.exe",
+        L"vrwebhelper.exe",
+        L"vrstartup.exe",
         L"steamtours.exe",
+        L"steam.exe",
+        L"steamwebhelper.exe",
+        L"ovrserver_x64.exe",
         L"oculusclient.exe",
-        L"virtualdesktop.streamer.exe"
+        L"oculusdash.exe",
+        L"oculusmonitor.exe",
+        L"ovrredir.exe",
+        L"ovrservicelauncher.exe",
+        L"virtualdesktop.streamer.exe",
+        L"virtualdesktop.server.exe",
+        L"virtualdesktop.service.exe",
+        L"vrpacingtray.exe",
+        L"vectorxr.exe",
+        L"vectorxr_x64.exe",
+        L"explorer.exe",
+        L"dwm.exe",
+        L"svchost.exe",
+        L"runtimebroker.exe",
+        L"taskhostw.exe",
+        L"sihost.exe",
+        L"ctfmon.exe",
+        L"searchhost.exe",
+        L"devenv.exe"
     };
+
+    std::wstring lower(exeName);
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
     for (const auto* b : kBlacklist) {
         if (lower == b) return true;
@@ -58,7 +93,7 @@ bool IsModuleLoadedInProcess(HANDLE hProc, const wchar_t* targetDllName) {
     return false;
 }
 
-bool InjectDll(DWORD pid, const std::wstring& dllPath) {
+bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
     if (!std::filesystem::exists(dllPath)) {
         LogMessage(LogLevel::Error, "ProcessScanner: DLL de inyeccion no encontrada en disco.");
         return false;
@@ -103,7 +138,29 @@ bool InjectDll(DWORD pid, const std::wstring& dllPath) {
 
 } // namespace
 
-void ProcessScanner::PollAndInject(const std::wstring& hookDllPath) {
+bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool injected = false;
+
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
+                if (InjectDllByPid(pe.th32ProcessID, dllPath)) {
+                    s_hookedPids.insert(pe.th32ProcessID);
+                    injected = true;
+                }
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return injected;
+}
+
+void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
 
@@ -114,36 +171,35 @@ void ProcessScanner::PollAndInject(const std::wstring& hookDllPath) {
         do {
             const DWORD pid = pe.th32ProcessID;
             if (pid == 0 || pid == GetCurrentProcessId()) continue;
-            if (injectedPids_.find(pid) != injectedPids_.end()) continue;
+            if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
 
-            std::wstring exeName = pe.szExeFile;
-            if (IsProcessBlacklisted(exeName)) {
+            if (IsBlacklistedProcess(pe.szExeFile)) {
                 continue;
             }
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProc) continue;
 
-            const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
-            const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||
-                                  IsModuleLoadedInProcess(hProc, L"VirtualDesktop.LibOVRRT64_1.dll");
-
-            // Si es un proceso OpenXR nativo que ya carga VRPacingLayer, omitir inyeccion de hook
             const bool isOpenXRLayer = IsModuleLoadedInProcess(hProc, L"VRPacingLayer.dll");
-
             if (isOpenXRLayer) {
-                injectedPids_.insert(pid);
+                s_hookedPids.insert(pid);
                 LogMessage(LogLevel::Info, "Proceso VR ya gestionado por OpenXR Layer (omitiendo VRPacingHook): " +
-                           std::string(exeName.begin(), exeName.end()) + " [PID " + std::to_string(pid) + "]");
+                           std::string(pe.szExeFile, pe.szExeFile + wcslen(pe.szExeFile)) +
+                           " [PID " + std::to_string(pid) + "]");
                 CloseHandle(hProc);
                 continue;
             }
 
+            const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
+            const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||
+                                  IsModuleLoadedInProcess(hProc, L"VirtualDesktop.LibOVRRT64_1.dll");
+
             if (isOpenVR || isOculus) {
-                if (InjectDll(pid, hookDllPath)) {
-                    injectedPids_.insert(pid);
+                if (InjectDllByPid(pid, dllPath)) {
+                    s_hookedPids.insert(pid);
                     LogMessage(LogLevel::Info, "Inyeccion automatica aplicada a juego VR: " +
-                               std::string(exeName.begin(), exeName.end()) + " [PID " + std::to_string(pid) + "]");
+                               std::string(pe.szExeFile, pe.szExeFile + wcslen(pe.szExeFile)) +
+                               " [PID " + std::to_string(pid) + "]");
                 }
             }
 
