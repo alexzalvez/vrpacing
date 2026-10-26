@@ -49,6 +49,7 @@ SubmitFn g_activeOrigSubmit = nullptr;
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
+HzTracker g_hzTracker;
 NisUpscalerD3D11 g_upscaler;
 SharedMemoryClient g_shm;
 
@@ -113,10 +114,20 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
-    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : 90.0;
+    static int64_t s_qpcFreq = 0;
+    static int64_t s_lastWaitExitQpc = 0;
+    static uint32_t s_calibrationFrames = 0;
+
+    if (s_qpcFreq == 0) {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        s_qpcFreq = f.QuadPart;
+    }
+
+    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
     double targetFps = 0.0;
 
-    if (g_cfg.pacing.enabled) {
+    if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
         LimitInputs lim{};
         lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
@@ -131,7 +142,32 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
+    LARGE_INTEGER beforeWaitQpc{};
+    QueryPerformanceCounter(&beforeWaitQpc);
+
     vr::EVRCompositorError res = origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+
+    LARGE_INTEGER afterWaitQpc{};
+    QueryPerformanceCounter(&afterWaitQpc);
+
+    if (s_qpcFreq > 0) {
+        const double waitMs = static_cast<double>(afterWaitQpc.QuadPart - beforeWaitQpc.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq);
+
+        if (s_lastWaitExitQpc > 0) {
+            const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
+            if (dt > 0.005 && dt < 0.040) { // 25 Hz a 200 Hz
+                const double measuredHz = 1.0 / dt;
+                if (s_calibrationFrames < 45) {
+                    s_calibrationFrames++;
+                    g_hzTracker.PushHz(measuredHz);
+                } else if (waitMs > 2.5) {
+                    g_hzTracker.PushHz(measuredHz);
+                }
+            }
+        }
+    }
+    s_lastWaitExitQpc = afterWaitQpc.QuadPart;
+
     inWait = false;
     return res;
 }
@@ -298,7 +334,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     outBounds.vMin = isFlippedY ? 1.0f : 0.0f;
     outBounds.vMax = isFlippedY ? 0.0f : 1.0f;
 
-    // Modificar handle in-situ para preservar VRTextureWithPose_t / VRTextureWithDepth_t
     auto* mutableTex = const_cast<vr::Texture_t*>(pTexture);
     void* origHandle = mutableTex->handle;
     mutableTex->handle = sharedOut.texture.Get();
@@ -365,7 +400,6 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
     if (sName.rfind("IVRCompositor_", 0) == 0) {
         HookCompositorInstance(name, iface);
     } else if (sName.rfind("FnTable:IVRCompositor_", 0) == 0) {
-        // Si un motor C# (Unity) solicita FnTable, resolver y enganchar la instancia C++ subyacente
         const char* cppName = name + 8;
         int dummyErr = 0;
         void* cppIface = g_origGetGenericInterface(cppName, &dummyErr);

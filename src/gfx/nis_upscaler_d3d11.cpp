@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 #include "d3d11_helper.h"
 #include "shader_nis_upscale.h"
@@ -93,7 +94,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         upscaleShader_.ReleaseAndGetAddressOf()
     );
     if (FAILED(hr)) {
-        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error al crear el Compute Shader de NIS.");
+        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error al crear el Compute Shader de NIS. HR=" + std::to_string(hr));
         return false;
     }
 
@@ -257,7 +258,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     src->GetDevice(dev.GetAddressOf());
     if (!dev) return false;
 
-    if (!initialized_ || device_.Get() != dev.Get()) {
+    if (!initialized_ || (device_.Get() != dev.Get() && g_staging.srcTex == nullptr)) {
         if (!Initialize(dev.Get())) {
             return false;
         }
@@ -297,9 +298,16 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-        if (FAILED(device_->CreateTexture2D(&td, nullptr, g_staging.srcTex.GetAddressOf())) ||
-            FAILED(device_->CreateShaderResourceView(g_staging.srcTex.Get(), nullptr, g_staging.srcSrv.GetAddressOf()))) {
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging SRV UNORM.");
+        HRESULT hrTex = device_->CreateTexture2D(&td, nullptr, g_staging.srcTex.GetAddressOf());
+        if (FAILED(hrTex)) {
+            HRESULT reason = device_->GetDeviceRemovedReason();
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging Texture2D UNORM. HR=" + std::to_string(hrTex) + " Reason=" + std::to_string(reason));
+            return false;
+        }
+        HRESULT hrSrv = device_->CreateShaderResourceView(g_staging.srcTex.Get(), nullptr, g_staging.srcSrv.GetAddressOf());
+        if (FAILED(hrSrv)) {
+            HRESULT reason = device_->GetDeviceRemovedReason();
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging SRV UNORM. HR=" + std::to_string(hrSrv) + " Reason=" + std::to_string(reason));
             return false;
         }
         g_staging.srcW = srcDesc.Width;
@@ -322,9 +330,16 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
-        if (FAILED(device_->CreateTexture2D(&td, nullptr, g_staging.dstTex.GetAddressOf())) ||
-            FAILED(device_->CreateUnorderedAccessView(g_staging.dstTex.Get(), nullptr, g_staging.dstUav.GetAddressOf()))) {
-            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging UAV UNORM.");
+        HRESULT hrDstTex = device_->CreateTexture2D(&td, nullptr, g_staging.dstTex.GetAddressOf());
+        if (FAILED(hrDstTex)) {
+            HRESULT reason = device_->GetDeviceRemovedReason();
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging dst Texture2D UNORM. HR=" + std::to_string(hrDstTex) + " Reason=" + std::to_string(reason));
+            return false;
+        }
+        HRESULT hrDstUav = device_->CreateUnorderedAccessView(g_staging.dstTex.Get(), nullptr, g_staging.dstUav.GetAddressOf());
+        if (FAILED(hrDstUav)) {
+            HRESULT reason = device_->GetDeviceRemovedReason();
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging dst UAV UNORM. HR=" + std::to_string(hrDstUav) + " Reason=" + std::to_string(reason));
             return false;
         }
         g_staging.dstW = dstDesc.Width;

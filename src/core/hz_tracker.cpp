@@ -2,84 +2,46 @@
 
 #include <algorithm>
 #include <cmath>
-#include <vector>
+#include <numeric>
 
 namespace vrpacing {
 
-HzTracker::HzTracker(HzTrackerConfig cfg) : cfg_(cfg) {}
+std::optional<double> HzTracker::SnapToCommonHz(double hz) {
+    static constexpr double kCommonRates[] = {
+        30.0, 36.0, 40.0, 45.0, 60.0, 72.0, 80.0, 90.0, 120.0, 144.0
+    };
+    constexpr double kTolerance = 0.06; // 6%
 
-bool HzTracker::PushPeriodNs(int64_t periodNs) {
-    if (periodNs <= 0) {
-        return false;
+    for (double common : kCommonRates) {
+        const double diff = std::abs(hz - common);
+        if (diff / common <= kTolerance) {
+            return common;
+        }
     }
-    const double hz = 1e9 / static_cast<double>(periodNs);
-    return PushValidatedHz(hz);
+    return std::nullopt;
 }
 
-bool HzTracker::PushHz(double hz) {
-    return PushValidatedHz(hz);
-}
+void HzTracker::PushHz(double hz) {
+    if (hz < 25.0 || hz > 200.0) return;
 
-bool HzTracker::PushValidatedHz(double hz) {
-    if (!std::isfinite(hz) || hz < cfg_.minHz || hz > cfg_.maxHz) {
-        return false;
+    samples_.push_back(hz);
+    if (samples_.size() > 60) {
+        samples_.erase(samples_.begin());
     }
-
-    lastRawHz_ = hz;
-    window_.push_back(hz);
-    while (window_.size() > cfg_.windowSize) {
-        window_.pop_front();
-    }
-
-    if (!emaHz_) {
-        emaHz_ = hz;
-    } else {
-        emaHz_ = (cfg_.emaAlpha * hz) + ((1.0 - cfg_.emaAlpha) * (*emaHz_));
-    }
-
-    if (emaHz_ && hz > 0.0) {
-        const double ratio = *emaHz_ / hz;
-        likelyHalfRate_ = std::abs(ratio - 2.0) < 0.08 || std::abs((1.0 / ratio) - 2.0) < 0.08;
-    }
-
-    return true;
 }
 
 std::optional<double> HzTracker::GetEffectiveHz() const {
-    if (!emaHz_) {
-        return std::nullopt;
-    }
-    if (window_.size() < 3) {
-        return emaHz_;
-    }
+    if (samples_.empty()) return std::nullopt;
 
-    const double med = MedianWindow();
-    return (*emaHz_ * 0.65) + (med * 0.35);
-}
-
-double HzTracker::ComputeTargetFps(const LimitInputs& in) const {
-    LimitInputs adjusted = in;
-    if (const auto hz = GetEffectiveHz()) {
-        adjusted.hz = *hz;
-    }
-    return vrpacing::ComputeTargetFps(adjusted);
-}
-
-bool HzTracker::IsLikelyRuntimeHalfRate() const {
-    return likelyHalfRate_;
-}
-
-double HzTracker::MedianWindow() const {
-    std::vector<double> sorted(window_.begin(), window_.end());
+    std::vector<double> sorted = samples_;
     std::sort(sorted.begin(), sorted.end());
-    const size_t n = sorted.size();
-    if (n == 0) {
-        return 0.0;
-    }
-    if (n % 2 == 1) {
-        return sorted[n / 2];
-    }
-    return 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+    const double median = sorted[sorted.size() / 2];
+
+    return SnapToCommonHz(median).value_or(median);
+}
+
+void HzTracker::Reset() {
+    samples_.clear();
 }
 
 } // namespace vrpacing

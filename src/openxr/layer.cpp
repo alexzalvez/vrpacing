@@ -113,11 +113,6 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
             if (d3d->device) {
                 g_d3d11Device = d3d->device;
                 g_d3d11Device->GetImmediateContext(g_d3d11Context.ReleaseAndGetAddressOf());
-                if (!g_upscaler.IsInitialized()) {
-                    if (!g_upscaler.Initialize(g_d3d11Device.Get())) {
-                        g_upscaleStatus = -2;
-                    }
-                }
                 LogMessage(LogLevel::Info, "OpenXR Layer: ID3D11Device capturado en xrCreateSession.");
             }
             break;
@@ -201,9 +196,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     XrSwapchainCreateInfo realDesc = *createInfo;
     realDesc.width = realW;
     realDesc.height = realH;
-    // Sin necesidad de forzar UAV sobre el swapchain sRGB
-
-    // Preservar formato nativo sRGB del swapchain (gestionado por staging UNORM)
 
     XrSwapchain real = XR_NULL_HANDLE;
     XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);
@@ -219,22 +211,34 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
         return XR_SUCCESS;
     }
 
+    uint32_t imgCount = 0;
+    g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
+    std::vector<XrSwapchainImageD3D11KHR> realImgs(imgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+    g_nextEnumerateSwapchainImages(real, imgCount, &imgCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(realImgs.data()));
+
     D3D11_TEXTURE2D_DESC appDesc{};
+    if (imgCount > 0 && realImgs[0].texture) {
+        realImgs[0].texture->GetDesc(&appDesc);
+    } else {
+        appDesc.Format = static_cast<DXGI_FORMAT>(createInfo->format);
+    }
     appDesc.Width = appW;
     appDesc.Height = appH;
-    appDesc.MipLevels = 1;
     appDesc.ArraySize = arrSize;
-    appDesc.Format = static_cast<DXGI_FORMAT>(createInfo->format);
     appDesc.SampleDesc.Count = createInfo->sampleCount ? createInfo->sampleCount : 1;
+    appDesc.SampleDesc.Quality = 0;
+    appDesc.MipLevels = 1;
     appDesc.Usage = D3D11_USAGE_DEFAULT;
     appDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     appDesc.CPUAccessFlags = 0;
     appDesc.MiscFlags = 0;
 
-    uint32_t imgCount = 0;
-    g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
-    std::vector<XrSwapchainImageD3D11KHR> realImgs(imgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-    g_nextEnumerateSwapchainImages(real, imgCount, &imgCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(realImgs.data()));
+    // Conforme a XR_KHR_D3D11_enable, texturas sRGB de la app deben ser TYPELESS
+    if (appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        appDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    } else if (appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        appDesc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    }
 
     ProxySwapchain proxy{};
     proxy.realSwapchain = real;
@@ -253,7 +257,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
         if (FAILED(hr)) {
             g_upscaleStatus = -1;
             g_lastHResult = hr;
-            LogMessage(LogLevel::Error, "OpenXR Layer: Error al crear textura intermedia D3D11.");
+            LogMessage(LogLevel::Error, "OpenXR Layer: Error al crear textura intermedia D3D11. HR=" + std::to_string(hr));
             g_nextDestroySwapchain(real);
             return XR_ERROR_RUNTIME_FAILURE;
         }
@@ -386,12 +390,22 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
-    const auto hz = g_hzTracker.GetEffectiveHz().value_or(90.0);
+    static int64_t s_qpcFreq = 0;
+    static int64_t s_lastWaitExitQpc = 0;
+    static uint32_t s_calibrationFrames = 0;
+
+    if (s_qpcFreq == 0) {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        s_qpcFreq = f.QuadPart;
+    }
+
+    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
     double targetFps = 0.0;
 
-    if (g_cfg.pacing.enabled) {
+    if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
         LimitInputs lim{};
-        lim.hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : hz;
+        lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
         lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
@@ -404,11 +418,36 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
+    LARGE_INTEGER beforeWaitQpc{};
+    QueryPerformanceCounter(&beforeWaitQpc);
+
     XrResult res = g_nextWaitFrame(session, info, state);
+
+    LARGE_INTEGER afterWaitQpc{};
+    QueryPerformanceCounter(&afterWaitQpc);
+
+    if (s_qpcFreq > 0) {
+        const double waitMs = static_cast<double>(afterWaitQpc.QuadPart - beforeWaitQpc.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq);
+
+        if (s_lastWaitExitQpc > 0) {
+            const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
+            if (dt > 0.005 && dt < 0.040) { // 25 Hz a 200 Hz
+                const double measuredHz = 1.0 / dt;
+                if (s_calibrationFrames < 45) {
+                    s_calibrationFrames++;
+                    g_hzTracker.PushHz(measuredHz);
+                } else if (waitMs > 2.5) {
+                    g_hzTracker.PushHz(measuredHz);
+                }
+            }
+        }
+    }
+    s_lastWaitExitQpc = afterWaitQpc.QuadPart;
+
     if (XR_SUCCEEDED(res) && state && state->predictedDisplayPeriod > 0) {
-        const double measuredHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
-        if (measuredHz > 30.0 && measuredHz < 200.0) {
-            g_hzTracker.PushHz(std::round(measuredHz));
+        const double displayHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
+        if (displayHz > 30.0 && displayHz < 200.0 && s_calibrationFrames < 45) {
+            g_hzTracker.PushHz(std::round(displayHz));
         }
     }
     return res;
