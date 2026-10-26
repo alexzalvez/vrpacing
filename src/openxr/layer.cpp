@@ -201,13 +201,9 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     XrSwapchainCreateInfo realDesc = *createInfo;
     realDesc.width = realW;
     realDesc.height = realH;
-    realDesc.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+    // Sin necesidad de forzar UAV sobre el swapchain sRGB
 
-    if (realDesc.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-        realDesc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    } else if (realDesc.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-        realDesc.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
+    // Preservar formato nativo sRGB del swapchain (gestionado por staging UNORM)
 
     XrSwapchain real = XR_NULL_HANDLE;
     XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);

@@ -4,11 +4,11 @@
 
 namespace vrpacing {
 
-constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared";
+constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared_v5";
 
 #pragma pack(push, 1)
 struct SharedState {
-    uint32_t version = 4;
+    uint32_t version = 5;
     uint32_t flags = 0;
     uint32_t activePid = 0;
     double frameGenDivisor = 1.0;

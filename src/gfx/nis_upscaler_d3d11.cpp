@@ -11,11 +11,77 @@
 #include "nis/NIS_Config.h"
 
 namespace vrpacing {
+namespace {
+
+struct StagingResources {
+    ID3D11Device* device = nullptr;
+
+    ComPtr<ID3D11Texture2D> srcTex;
+    ComPtr<ID3D11ShaderResourceView> srcSrv;
+    uint32_t srcW = 0;
+    uint32_t srcH = 0;
+    DXGI_FORMAT srcFmt = DXGI_FORMAT_UNKNOWN;
+
+    ComPtr<ID3D11Texture2D> dstTex;
+    ComPtr<ID3D11UnorderedAccessView> dstUav;
+    uint32_t dstW = 0;
+    uint32_t dstH = 0;
+    DXGI_FORMAT dstFmt = DXGI_FORMAT_UNKNOWN;
+
+    void Reset() {
+        device = nullptr;
+        srcTex.Reset();
+        srcSrv.Reset();
+        srcW = 0;
+        srcH = 0;
+        srcFmt = DXGI_FORMAT_UNKNOWN;
+        dstTex.Reset();
+        dstUav.Reset();
+        dstW = 0;
+        dstH = 0;
+        dstFmt = DXGI_FORMAT_UNKNOWN;
+    }
+};
+
+StagingResources g_staging;
+
+DXGI_FORMAT GetCompatibleUnormFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:
+        return format;
+    }
+}
+
+} // namespace
 
 bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     if (!device) {
         LogMessage(LogLevel::Error, "NisUpscalerD3D11: Puntero ID3D11Device nulo.");
         return false;
+    }
+
+    if (device_.Get() != device) {
+        g_staging.Reset();
+        srvCache_.clear();
+        uavCache_.clear();
     }
 
     device_ = device;
@@ -24,7 +90,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         g_NISUpscaleShader,
         sizeof(g_NISUpscaleShader),
         nullptr,
-        upscaleShader_.GetAddressOf()
+        upscaleShader_.ReleaseAndGetAddressOf()
     );
     if (FAILED(hr)) {
         LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error al crear el Compute Shader de NIS.");
@@ -52,10 +118,10 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         texData.pSysMem = coef_scale;
         texData.SysMemPitch = kFilterSize * 4;
         texData.SysMemSlicePitch = kFilterSize * 4 * kPhaseCount;
-        CheckResult("creando textura coeficientes scaler", device_->CreateTexture2D(&td, &texData, scalerCoeffTexture_.GetAddressOf()));
+        CheckResult("creando textura coeficientes scaler", device_->CreateTexture2D(&td, &texData, scalerCoeffTexture_.ReleaseAndGetAddressOf()));
 
         texData.pSysMem = coef_usm;
-        CheckResult("creando textura coeficientes USM", device_->CreateTexture2D(&td, &texData, usmCoeffTexture_.GetAddressOf()));
+        CheckResult("creando textura coeficientes USM", device_->CreateTexture2D(&td, &texData, usmCoeffTexture_.ReleaseAndGetAddressOf()));
 
         scalerCoeffView_ = CreateShaderResourceView(device_.Get(), scalerCoeffTexture_.Get());
         usmCoeffView_ = CreateShaderResourceView(device_.Get(), usmCoeffTexture_.Get());
@@ -187,12 +253,19 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         return false;
     }
 
-    if (!initialized_) {
-        ComPtr<ID3D11Device> dev;
-        src->GetDevice(dev.GetAddressOf());
-        if (!dev || !Initialize(dev.Get())) {
+    ComPtr<ID3D11Device> dev;
+    src->GetDevice(dev.GetAddressOf());
+    if (!dev) return false;
+
+    if (!initialized_ || device_.Get() != dev.Get()) {
+        if (!Initialize(dev.Get())) {
             return false;
         }
+    }
+
+    if (g_staging.device != device_.Get()) {
+        g_staging.Reset();
+        g_staging.device = device_.Get();
     }
 
     D3D11_TEXTURE2D_DESC srcDesc{};
@@ -201,24 +274,85 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     D3D11_TEXTURE2D_DESC dstDesc{};
     dst->GetDesc(&dstDesc);
 
-    auto srcSrv = GetOrCreateSrv(src, desc.srcArrayIndex);
-    auto dstUav = GetOrCreateUav(dst, desc.dstArrayIndex);
+    DXGI_FORMAT srcUnormFmt = (srcDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS || srcDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                              ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                              : GetCompatibleUnormFormat(srcDesc.Format);
 
-    if (!srcSrv || !dstUav) {
-        LogMessage(LogLevel::Error, "NisUpscalerD3D11: No se pudieron crear las vistas SRV/UAV de las texturas.");
+    DXGI_FORMAT dstUnormFmt = (dstDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS || dstDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                              ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                              : GetCompatibleUnormFormat(dstDesc.Format);
+
+    if (!g_staging.srcTex || g_staging.srcW != srcDesc.Width || g_staging.srcH != srcDesc.Height || g_staging.srcFmt != srcUnormFmt) {
+        g_staging.srcTex.Reset();
+        g_staging.srcSrv.Reset();
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = srcDesc.Width;
+        td.Height = srcDesc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = srcUnormFmt;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, g_staging.srcTex.GetAddressOf())) ||
+            FAILED(device_->CreateShaderResourceView(g_staging.srcTex.Get(), nullptr, g_staging.srcSrv.GetAddressOf()))) {
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging SRV UNORM.");
+            return false;
+        }
+        g_staging.srcW = srcDesc.Width;
+        g_staging.srcH = srcDesc.Height;
+        g_staging.srcFmt = srcUnormFmt;
+    }
+
+    if (!g_staging.dstTex || g_staging.dstW != dstDesc.Width || g_staging.dstH != dstDesc.Height || g_staging.dstFmt != dstUnormFmt) {
+        g_staging.dstTex.Reset();
+        g_staging.dstUav.Reset();
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = dstDesc.Width;
+        td.Height = dstDesc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = dstUnormFmt;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, g_staging.dstTex.GetAddressOf())) ||
+            FAILED(device_->CreateUnorderedAccessView(g_staging.dstTex.Get(), nullptr, g_staging.dstUav.GetAddressOf()))) {
+            LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error creando staging UAV UNORM.");
+            return false;
+        }
+        g_staging.dstW = dstDesc.Width;
+        g_staging.dstH = dstDesc.Height;
+        g_staging.dstFmt = dstUnormFmt;
+    }
+
+    const UINT srcSlice = (desc.srcArrayIndex >= 0 && static_cast<UINT>(desc.srcArrayIndex) < srcDesc.ArraySize)
+                          ? static_cast<UINT>(desc.srcArrayIndex) : 0;
+    const UINT srcSub = D3D11CalcSubresource(0, srcSlice, srcDesc.MipLevels);
+
+    if (srcDesc.SampleDesc.Count > 1) {
+        ctx->ResolveSubresource(g_staging.srcTex.Get(), 0, src, srcSub, srcUnormFmt);
+    } else {
+        ctx->CopySubresourceRegion(g_staging.srcTex.Get(), 0, 0, 0, 0, src, srcSub, nullptr);
+    }
+
+    if (!Upscale(ctx, g_staging.srcSrv.Get(), g_staging.dstUav.Get(),
+                 srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height, desc)) {
         return false;
     }
 
-    return Upscale(
-        ctx,
-        srcSrv.Get(),
-        dstUav.Get(),
-        srcDesc.Width,
-        srcDesc.Height,
-        dstDesc.Width,
-        dstDesc.Height,
-        desc
-    );
+    const UINT dstSlice = (desc.dstArrayIndex >= 0 && static_cast<UINT>(desc.dstArrayIndex) < dstDesc.ArraySize)
+                          ? static_cast<UINT>(desc.dstArrayIndex) : 0;
+    const UINT dstSub = D3D11CalcSubresource(0, dstSlice, dstDesc.MipLevels);
+    ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_staging.dstTex.Get(), 0, nullptr);
+
+    return true;
 }
 
 } // namespace vrpacing

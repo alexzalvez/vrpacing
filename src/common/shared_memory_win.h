@@ -41,6 +41,8 @@ public:
             return false;
         }
 
+        const bool newlyCreated = (GetLastError() != ERROR_ALREADY_EXISTS);
+
         view_ = MapViewOfFile(mapFile_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedState));
         if (!view_) {
             CloseHandle(mapFile_);
@@ -49,6 +51,15 @@ public:
         }
 
         shared_ = reinterpret_cast<SharedState*>(view_);
+        if (newlyCreated || shared_->version != 5) {
+            *shared_ = {};
+            shared_->version = 5;
+            shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled;
+            shared_->frameGenDivisor = 1.0;
+            shared_->offsetFps = 0.10;
+            wcscpy_s(shared_->activeApi, L"Idle");
+            wcscpy_s(shared_->hookedProcess, L"None");
+        }
         return true;
     }
 
@@ -65,19 +76,23 @@ public:
     }
 
     void SyncConfig(RuntimeConfig& cfg) {
-        if (!OpenOrCreate() || !shared_) return;
-        if (shared_->version != 4) return;
+        // Garantizar Sweet Spot activo por defecto aunque falle IPC
+        cfg.upscaling.scale = 2.0f;
+        cfg.upscaling.radius = 0.60f;
+        cfg.upscaling.sharpness = 0.0f;
+
+        if (!OpenOrCreate() || !shared_ || shared_->version != 5) {
+            cfg.enabled = true;
+            cfg.upscaling.enabled = true;
+            cfg.pacing.enabled = true;
+            return;
+        }
 
         const uint32_t flags = shared_->flags;
         cfg.enabled = (flags & kFlagEnabled) != 0;
         cfg.pacing.enabled = cfg.enabled && ((flags & kFlagPacingEnabled) != 0);
         cfg.upscaling.enabled = cfg.enabled && ((flags & kFlagUpscalingEnabled) != 0);
-        cfg.mask.enabled = cfg.enabled && ((flags & kFlagMaskEnabled) != 0);
-
-        // Locked NIS Sweet Spot
-        cfg.upscaling.scale = 2.0f;
-        cfg.upscaling.radius = 0.60f;
-        cfg.upscaling.sharpness = 0.0f;
+        cfg.mask.enabled = false;
 
         if (shared_->frameGenDivisor > 0.0) {
             cfg.pacing.frameGenDivisor = shared_->frameGenDivisor;

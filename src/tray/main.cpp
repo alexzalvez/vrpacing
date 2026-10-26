@@ -623,7 +623,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared = reinterpret_cast<vrpacing::SharedState*>(view);
     if (g_shared) {
         *g_shared = {};
-        g_shared->version = 4;
+        g_shared->version = 5;
         g_shared->activePid = 0;
         UpdateSharedStateFlags();
         wcscpy_s(g_shared->activeApi, L"Idle");
