@@ -26,6 +26,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
 using Microsoft::WRL::ComPtr;

@@ -4,6 +4,8 @@
 #include <optional>
 #include <vector>
 
+#include "vrpacing/frame_limiter_math.h"
+
 namespace vrpacing {
 
 class HzTracker {
