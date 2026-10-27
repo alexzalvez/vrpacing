@@ -114,7 +114,8 @@ public:
         cfg.upscaling.enabled = cfg.enabled && ((flags & kFlagUpscalingEnabled) != 0);
 
         cfg.mask.enabled = cfg.enabled && ((flags & kFlagMaskEnabled) != 0);
-        cfg.mask.radius = 1.00f;
+        cfg.mask.radiusX = 1.00f;
+        cfg.mask.radiusY = 1.00f;
         cfg.mask.segments = 256;
 
         if (shared_->frameGenDivisor > 0.0) {
