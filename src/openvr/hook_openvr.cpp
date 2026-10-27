@@ -111,8 +111,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
     if (!origFn) return vr::VRCompositorError_None;
 
-    // Si OpenXR Layer esta activa en este proceso, ceder el control del pacing y submit
-    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr) {
+    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
 
@@ -197,8 +196,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (!origFn) return vr::VRCompositorError_None;
 
-    // Si OpenXR Layer esta activa en este proceso (Skyrim VR + OpenComposite / VDXR), ceder el paso
-    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr) {
+    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 

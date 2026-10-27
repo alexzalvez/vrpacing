@@ -10,8 +10,11 @@
 #endif
 
 #include <windows.h>
+#include <algorithm>
+#include <cmath>
 #include <cwchar>
 #include <string>
+#include <vector>
 
 #include "vrpacing/config.h"
 #include "vrpacing/shared_state.h"
@@ -51,10 +54,10 @@ public:
         }
 
         shared_ = reinterpret_cast<SharedState*>(view_);
-        if (newlyCreated || shared_->version != 5) {
+        if (newlyCreated || shared_->version != 6) {
             *shared_ = {};
-            shared_->version = 5;
-            shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled;
+            shared_->version = 6;
+            shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled | kFlagTelemetryActive;
             shared_->frameGenDivisor = 1.0;
             shared_->offsetFps = 0.10;
             wcscpy_s(shared_->activeApi, L"Idle");
@@ -75,13 +78,28 @@ public:
         shared_ = nullptr;
     }
 
+    void SetOpenXrD3D11Pid(uint32_t pid) {
+        if (OpenOrCreate() && shared_) {
+            shared_->openXrD3D11Pid = pid;
+        }
+    }
+
+    bool IsOpenXrD3D11ActiveForCurrentProcess() {
+        if (!OpenOrCreate() || !shared_) return false;
+        return (shared_->openXrD3D11Pid != 0 && shared_->openXrD3D11Pid == GetCurrentProcessId());
+    }
+
+    bool IsTelemetryActive() {
+        if (!OpenOrCreate() || !shared_) return false;
+        return (shared_->flags & kFlagTelemetryActive) != 0;
+    }
+
     void SyncConfig(RuntimeConfig& cfg) {
-        // Garantizar Sweet Spot activo por defecto aunque falle IPC
         cfg.upscaling.scale = 2.0f;
         cfg.upscaling.radius = 0.60f;
         cfg.upscaling.sharpness = 0.0f;
 
-        if (!OpenOrCreate() || !shared_ || shared_->version != 5) {
+        if (!OpenOrCreate() || !shared_ || shared_->version != 6) {
             cfg.enabled = true;
             cfg.upscaling.enabled = true;
             cfg.pacing.enabled = true;
@@ -113,6 +131,7 @@ public:
         shared_->effectiveHz = effectiveHz;
         shared_->appliedCap = appliedCap;
         shared_->frameCounter++;
+
         if (apiName && apiName[0] != L'\0') {
             wcscpy_s(shared_->activeApi, apiName);
         }
@@ -135,6 +154,61 @@ public:
                 wcsncpy_s(shared_->hookedProcess, p.c_str(), _TRUNCATE);
             }
         }
+
+        // Si telemetría está pausada, omitir cálculo estadístico por frame (0% CPU)
+        if (!IsTelemetryActive()) {
+            return;
+        }
+
+        static int64_t s_lastQpc = 0;
+        static int64_t s_qpcFreq = 0;
+        static double s_samples[180]{};
+        static size_t s_sampleIdx = 0;
+        static size_t s_sampleCount = 0;
+        static uint32_t s_calcCounter = 0;
+
+        if (s_qpcFreq == 0) {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            s_qpcFreq = f.QuadPart;
+        }
+
+        LARGE_INTEGER nowQpc{};
+        QueryPerformanceCounter(&nowQpc);
+
+        if (s_lastQpc > 0 && s_qpcFreq > 0) {
+            const double dt = static_cast<double>(nowQpc.QuadPart - s_lastQpc) / static_cast<double>(s_qpcFreq);
+            if (dt > 0.002 && dt < 0.100) {
+                s_samples[s_sampleIdx] = dt;
+                s_sampleIdx = (s_sampleIdx + 1) % 180;
+                if (s_sampleCount < 180) s_sampleCount++;
+
+                s_calcCounter++;
+                if (s_calcCounter >= 30 && s_sampleCount >= 30) {
+                    s_calcCounter = 0;
+                    double sumDt = 0.0;
+                    std::vector<double> sorted;
+                    sorted.reserve(s_sampleCount);
+
+                    for (size_t i = 0; i < s_sampleCount; ++i) {
+                        sumDt += s_samples[i];
+                        sorted.push_back(s_samples[i]);
+                    }
+
+                    if (sumDt > 0.0) {
+                        shared_->avgFps = static_cast<double>(s_sampleCount) / sumDt;
+                    }
+
+                    std::sort(sorted.begin(), sorted.end());
+                    const size_t p99Idx = (std::min)(s_sampleCount - 1, static_cast<size_t>(std::floor(s_sampleCount * 0.99)));
+                    const double p99Dt = sorted[p99Idx];
+                    if (p99Dt > 0.0) {
+                        shared_->onePercentLowFps = 1.0 / p99Dt;
+                    }
+                }
+            }
+        }
+        s_lastQpc = nowQpc.QuadPart;
     }
 
     SharedState* GetRaw() { return shared_; }

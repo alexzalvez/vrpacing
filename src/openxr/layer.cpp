@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -95,6 +96,25 @@ int32_t g_lastHResult = 0;
 uint32_t g_nativeViewW = 0;
 uint32_t g_nativeViewH = 0;
 
+bool IsCurrentProcessBlacklisted() {
+    static int s_cached = -1;
+    if (s_cached != -1) return (s_cached == 1);
+
+    wchar_t modPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    std::wstring p(modPath);
+    const auto pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p = p.substr(pos + 1);
+    std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+
+    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe") {
+        s_cached = 1;
+        return true;
+    }
+    s_cached = 0;
+    return false;
+}
+
 void EnsureInit() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -109,6 +129,9 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     EnsureInit();
     if (!createInfo || !session) return XR_ERROR_VALIDATION_FAILURE;
 
+    g_d3d11Device.Reset();
+    g_d3d11Context.Reset();
+
     const auto* next = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
     while (next) {
         if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
@@ -117,10 +140,19 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
                 g_d3d11Device = d3d->device;
                 g_d3d11Device->GetImmediateContext(g_d3d11Context.ReleaseAndGetAddressOf());
                 LogMessage(LogLevel::Info, "OpenXR Layer: ID3D11Device capturado en xrCreateSession.");
+
+                if (!IsCurrentProcessBlacklisted()) {
+                    g_shm.OpenOrCreate();
+                    g_shm.SetOpenXrD3D11Pid(GetCurrentProcessId());
+                }
             }
             break;
         }
         next = next->next;
+    }
+
+    if (!g_d3d11Device) {
+        LogMessage(LogLevel::Info, "OpenXR Layer: Sesion no-D3D11 detectada (DX12/Vulkan). Passthrough activo.");
     }
 
     return g_nextCreateSession(instance, createInfo, session);
@@ -130,6 +162,9 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.clear();
     g_chainDims.clear();
+    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
+        g_shm.SetOpenXrD3D11Pid(0);
+    }
     return g_nextDestroySession(session);
 }
 
@@ -167,13 +202,16 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     EnsureInit();
     if (!createInfo || !swapchain) return XR_ERROR_VALIDATION_FAILURE;
 
+    // Regla 1: Si no hay dispositivo D3D11 (sesión DX12) o proceso en lista negra, jamás alterar dimensiones
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+        return g_nextCreateSwapchain(session, createInfo, swapchain);
+    }
+
     g_shm.SyncConfig(g_cfg);
 
     const bool isColor = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
                          (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
 
-    // Solo escalar swapchains de renderizado del visor (ArraySize=2 o resolucion representativa de ojo 3D)
-    // Ignorar capas secundarias 2D de UI/HUD
     const bool isEyeResolution = (createInfo->arraySize >= 2) ||
                                  (g_nativeViewW > 0 && createInfo->width >= (g_nativeViewW * 7 / 10)) ||
                                  (createInfo->width >= 1200 && createInfo->height >= 1200);
@@ -220,11 +258,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
         return r;
     }
 
-    if (!g_d3d11Device) {
-        *swapchain = real;
-        return XR_SUCCESS;
-    }
-
     uint32_t imgCount = 0;
     g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
     std::vector<XrSwapchainImageD3D11KHR> realImgs(imgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
@@ -247,7 +280,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     appDesc.CPUAccessFlags = 0;
     appDesc.MiscFlags = 0;
 
-    // Conforme a XR_KHR_D3D11_enable, texturas sRGB de la app deben ser TYPELESS
     if (appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
         appDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     } else if (appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || appDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
@@ -402,6 +434,11 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 
 XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* info, XrFrameState* state) {
     EnsureInit();
+
+    if (IsCurrentProcessBlacklisted() || !g_d3d11Device) {
+        return g_nextWaitFrame(session, info, state);
+    }
+
     g_shm.SyncConfig(g_cfg);
 
     static int64_t s_qpcFreq = 0;
@@ -522,6 +559,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateInstanceExtensionProperties(const char* laye
 
 void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrCreateSession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSession));
+    g_nextDestroySession = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySession));
     g_nextGetInstanceProcAddr(instance, "xrEnumerateViewConfigurationViews", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateViewConfigurationViews));
     g_nextGetInstanceProcAddr(instance, "xrCreateSwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSwapchain));
@@ -531,7 +569,9 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrAcquireSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextAcquireSwapchainImage));
     g_nextGetInstanceProcAddr(instance, "xrWaitSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitSwapchainImage));
     g_nextGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextReleaseSwapchainImage));
+    g_nextEndFrame = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEndFrame));
+    g_nextWaitFrame = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrWaitFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitFrame));
     g_nextGetInstanceProcAddr(instance, "xrGetSystemProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetSystemProperties));
     g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));

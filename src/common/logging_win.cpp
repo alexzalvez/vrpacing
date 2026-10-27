@@ -1,94 +1,105 @@
 #ifdef _WIN32
 
-#include "logging_win.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include "common/logging_win.h"
 
 #include <windows.h>
-
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
+#include <string>
+
+#include "vrpacing/shared_state.h"
 
 namespace vrpacing {
 namespace {
 
-std::mutex gLogMutex;
-std::ofstream gLogFile;
+std::mutex g_logMutex;
+std::wstring g_logFilePath;
+bool g_initialized = false;
 
-std::filesystem::path GetLogDir() {
-    wchar_t* localAppData = nullptr;
-    size_t len = 0;
-    _wdupenv_s(&localAppData, &len, L"LOCALAPPDATA");
-    std::filesystem::path dir = localAppData ? localAppData : L".";
-    if (localAppData) {
-        free(localAppData);
+std::wstring GetDefaultLogPath() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring p(path);
+    const auto pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) {
+        p.resize(pos);
     }
-    dir /= L"VRPacing";
-    dir /= L"logs";
-    std::filesystem::create_directories(dir);
-    return dir;
-}
-
-const char* LevelText(LogLevel level) {
-    switch (level) {
-        case LogLevel::Debug: return "DEBUG";
-        case LogLevel::Info: return "INFO";
-        case LogLevel::Warn: return "WARN";
-        case LogLevel::Error: return "ERROR";
-        default: return "UNK";
-    }
+    return p + L"\\vrpacing.log";
 }
 
 } // namespace
 
+void InitLogging(const std::wstring& customPath) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_initialized) return;
+
+    g_logFilePath = customPath.empty() ? GetDefaultLogPath() : customPath;
+    g_initialized = true;
+
+    wchar_t modPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    std::wstring exeStr(modPath);
+    const auto pos = exeStr.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) {
+        exeStr = exeStr.substr(pos + 1);
+    }
+    const DWORD pid = GetCurrentProcessId();
+
+    std::ofstream ofs(g_logFilePath, std::ios::app);
+    if (ofs.is_open()) {
+        ofs << "=== VRPacing " << kAppVersionAnsi << " | Proceso: "
+            << std::string(exeStr.begin(), exeStr.end())
+            << " [PID " << pid << "] ===" << std::endl;
+    }
+}
+
 std::wstring GetLogFilePath() {
-    return (GetLogDir() / L"vrpacing.log").wstring();
-}
-
-void RotateLogsIfNeeded() {
-    const auto dir = GetLogDir();
-    const auto current = dir / "vrpacing.log";
-    const auto old = dir / "vrpacing.prev.log";
-    if (std::filesystem::exists(current)) {
-        std::error_code ec;
-        if (std::filesystem::file_size(current, ec) > (2 * 1024 * 1024)) {
-            std::filesystem::remove(old, ec);
-            std::filesystem::rename(current, old, ec);
-        }
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (!g_initialized) {
+        return GetDefaultLogPath();
     }
+    return g_logFilePath;
 }
 
-void InitLogging() {
-    std::lock_guard<std::mutex> lock(gLogMutex);
-    if (gLogFile.is_open()) {
-        return;
-    }
-
-    RotateLogsIfNeeded();
-    const auto path = GetLogDir() / "vrpacing.log";
-    gLogFile.open(path, std::ios::app);
-}
-
-void LogMessage(LogLevel level, const std::string& text) {
-    std::lock_guard<std::mutex> lock(gLogMutex);
-    if (!gLogFile.is_open()) {
+void LogMessage(LogLevel level, const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (!g_initialized) {
         InitLogging();
     }
 
     const auto now = std::chrono::system_clock::now();
-    const auto t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    localtime_s(&tm, &t);
+    const auto inTimeT = std::chrono::system_clock::to_time_t(now);
+    std::tm tmBuffer{};
+    localtime_s(&tmBuffer, &inTimeT);
 
     std::ostringstream ss;
-    ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " [" << LevelText(level) << "] " << text << "\n";
-    OutputDebugStringA(ss.str().c_str());
-    if (gLogFile.is_open()) {
-        gLogFile << ss.str();
-        gLogFile.flush();
+    ss << std::put_time(&tmBuffer, "%Y-%m-%d %H:%M:%S") << " [";
+
+    switch (level) {
+    case LogLevel::Info:  ss << "INFO";  break;
+    case LogLevel::Warn:  ss << "WARN";  break;
+    case LogLevel::Error: ss << "ERROR"; break;
     }
+    ss << "] " << message << "\n";
+
+    std::ofstream ofs(g_logFilePath, std::ios::app);
+    if (ofs.is_open()) {
+        ofs << ss.str();
+        ofs.flush();
+    }
+    OutputDebugStringA(ss.str().c_str());
 }
 
 } // namespace vrpacing

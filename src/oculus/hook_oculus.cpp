@@ -27,6 +27,7 @@
 #include "gfx/nis_upscaler_d3d11.h"
 #include "openvr/hook_openvr.h"
 #include "third_party/oculus/ovr_minimal.h"
+#include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
 using Microsoft::WRL::ComPtr;
@@ -64,7 +65,7 @@ ovrGetTextureSwapChainCurrentIndexFn g_ovrGetTextureSwapChainCurrentIndex = null
 ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
-uint32_t g_oculusVersion = 32;
+uint32_t g_oculusVersion = 0;
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
@@ -105,6 +106,29 @@ void EnsureInit() {
         g_limiter.Initialize();
         LogMessage(LogLevel::Info, "Oculus LibOVR Hook inicializado.");
     });
+}
+
+bool IsLegacyOculusLayer(const ovrLayerHeader* header) {
+    if (!header) return false;
+    if (g_oculusVersion > 0) {
+        return g_oculusVersion < 25;
+    }
+
+    const auto* oldL = reinterpret_cast<const ovrOldLayerEyeFov*>(header);
+    const auto* newL = reinterpret_cast<const ovrLayerEyeFov*>(header);
+
+    if (oldL->ColorTexture[0] != nullptr &&
+        oldL->Viewport[0].Size.w >= 256 && oldL->Viewport[0].Size.w <= 8192 &&
+        oldL->Viewport[0].Size.h >= 256 && oldL->Viewport[0].Size.h <= 8192) {
+        if (!newL->ColorTexture[0] ||
+            newL->Viewport[0].Size.w < 256 || newL->Viewport[0].Size.w > 8192 ||
+            newL->Viewport[0].Size.h < 256 || newL->Viewport[0].Size.h > 8192) {
+            g_oculusVersion = 17;
+            LogMessage(LogLevel::Info, "Oculus Hook: Detectado layout legacy (< v25, ej. Lone Echo). Fijado g_oculusVersion = 17.");
+            return true;
+        }
+    }
+    return false;
 }
 
 void CleanupOutputChains(OculusSessionContext& ctx) {
@@ -218,7 +242,6 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         ovrTextureSwapChain outChain = nullptr;
         ovrResult createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
         if (createRes < 0 || !outChain) {
-            // Reintento sin UAV si el runtime de Oculus rechaza UNORDERED_ACCESS en sRGB
             outDesc.BindFlags = ovrTextureBind_DX_RenderTarget;
             createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
         }
@@ -369,7 +392,7 @@ void ProcessAndUpscaleLayer(ovrSession session,
 ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
     if (params) {
         g_oculusVersion = params->RequestedMinorVersion;
-        LogMessage(LogLevel::Info, "Oculus Hook: Inicializado con version minor " + std::to_string(g_oculusVersion));
+        LogMessage(LogLevel::Info, "Oculus Hook: ovr_Initialize interceptado con version minor " + std::to_string(g_oculusVersion));
     }
     return g_origInitialize ? g_origInitialize(params) : 0;
 }
@@ -377,8 +400,7 @@ ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
 ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frameIndex) {
     if (!g_origWaitToBeginFrame) return 0;
 
-    // Si OpenXR o OpenVR ya estan manejando el frame en este proceso, ceder el control del pacing
-    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return g_origWaitToBeginFrame(session, frameIndex);
     }
 
@@ -427,16 +449,23 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
                               unsigned int layerCount) {
     if (!origFn) return 0;
 
-    // Si OpenXR Layer o OpenVR ya estan activos en este proceso, evitar duplicar escalado
-    if (GetModuleHandleW(L"VRPacingLayer.dll") != nullptr || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
     }
+
+    thread_local bool inOculusSubmit = false;
+    if (inOculusSubmit) {
+        return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+    }
+    inOculusSubmit = true;
 
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
     if (!layerPtrList || layerCount == 0 || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
-        return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+        ovrResult res = origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+        inOculusSubmit = false;
+        return res;
     }
 
     static std::atomic<bool> s_submitLogged{ false };
@@ -447,49 +476,91 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
     }
 
     std::vector<const ovrLayerHeader*> modifiedLayers(layerPtrList, layerPtrList + layerCount);
+
     ovrLayerEyeFov eyeFovCopy{};
     ovrLayerEyeFovDepth depthLayerCopy{};
+
+    ovrOldLayerEyeFov oldEyeFovCopy{};
+    ovrOldLayerEyeFovDepth oldDepthCopy{};
 
     for (unsigned int i = 0; i < layerCount; ++i) {
         const auto* header = layerPtrList[i];
         if (!header) continue;
 
+        const bool isLegacy = IsLegacyOculusLayer(header);
+
         if (header->Type == ovrLayerType_EyeFov) {
-            const auto* eyeLayer = reinterpret_cast<const ovrLayerEyeFov*>(header);
-            eyeFovCopy = *eyeLayer;
+            if (isLegacy) {
+                const auto* eyeLayer = reinterpret_cast<const ovrOldLayerEyeFov*>(header);
+                oldEyeFovCopy = *eyeLayer;
 
-            ProcessAndUpscaleLayer(
-                session,
-                eyeLayer->ColorTexture[0],
-                eyeLayer->ColorTexture[1],
-                const_cast<ovrRecti*>(eyeLayer->Viewport),
-                eyeLayer->Fov,
-                eyeFovCopy.ColorTexture,
-                eyeFovCopy.Viewport
-            );
+                ProcessAndUpscaleLayer(
+                    session,
+                    eyeLayer->ColorTexture[0],
+                    eyeLayer->ColorTexture[1],
+                    const_cast<ovrRecti*>(eyeLayer->Viewport),
+                    eyeLayer->Fov,
+                    oldEyeFovCopy.ColorTexture,
+                    oldEyeFovCopy.Viewport
+                );
 
-            modifiedLayers[i] = &eyeFovCopy.Header;
+                modifiedLayers[i] = reinterpret_cast<const ovrLayerHeader*>(&oldEyeFovCopy.Header);
+            } else {
+                const auto* eyeLayer = reinterpret_cast<const ovrLayerEyeFov*>(header);
+                eyeFovCopy = *eyeLayer;
+
+                ProcessAndUpscaleLayer(
+                    session,
+                    eyeLayer->ColorTexture[0],
+                    eyeLayer->ColorTexture[1],
+                    const_cast<ovrRecti*>(eyeLayer->Viewport),
+                    eyeLayer->Fov,
+                    eyeFovCopy.ColorTexture,
+                    eyeFovCopy.Viewport
+                );
+
+                modifiedLayers[i] = &eyeFovCopy.Header;
+            }
             break;
         } else if (header->Type == ovrLayerType_EyeFovDepth) {
-            const auto* depthLayer = reinterpret_cast<const ovrLayerEyeFovDepth*>(header);
-            depthLayerCopy = *depthLayer;
+            if (isLegacy) {
+                const auto* depthLayer = reinterpret_cast<const ovrOldLayerEyeFovDepth*>(header);
+                oldDepthCopy = *depthLayer;
 
-            ProcessAndUpscaleLayer(
-                session,
-                depthLayer->ColorTexture[0],
-                depthLayer->ColorTexture[1],
-                const_cast<ovrRecti*>(depthLayer->Viewport),
-                depthLayer->Fov,
-                depthLayerCopy.ColorTexture,
-                depthLayerCopy.Viewport
-            );
+                ProcessAndUpscaleLayer(
+                    session,
+                    depthLayer->ColorTexture[0],
+                    depthLayer->ColorTexture[1],
+                    const_cast<ovrRecti*>(depthLayer->Viewport),
+                    depthLayer->Fov,
+                    oldDepthCopy.ColorTexture,
+                    oldDepthCopy.Viewport
+                );
 
-            modifiedLayers[i] = &depthLayerCopy.Header;
+                modifiedLayers[i] = reinterpret_cast<const ovrLayerHeader*>(&oldDepthCopy.Header);
+            } else {
+                const auto* depthLayer = reinterpret_cast<const ovrLayerEyeFovDepth*>(header);
+                depthLayerCopy = *depthLayer;
+
+                ProcessAndUpscaleLayer(
+                    session,
+                    depthLayer->ColorTexture[0],
+                    depthLayer->ColorTexture[1],
+                    const_cast<ovrRecti*>(depthLayer->Viewport),
+                    depthLayer->Fov,
+                    depthLayerCopy.ColorTexture,
+                    depthLayerCopy.Viewport
+                );
+
+                modifiedLayers[i] = &depthLayerCopy.Header;
+            }
             break;
         }
     }
 
-    return origFn(session, frameIndex, viewScaleDesc, modifiedLayers.data(), layerCount);
+    ovrResult res = origFn(session, frameIndex, viewScaleDesc, modifiedLayers.data(), layerCount);
+    inOculusSubmit = false;
+    return res;
 }
 
 ovrResult __cdecl Hooked_ovrSubmitFrame(ovrSession session,
@@ -520,8 +591,11 @@ ovrResult __cdecl Hooked_ovrEndFrame(ovrSession session,
 } // namespace
 
 void InstallOculusHooks() {
+    static std::mutex s_installMutex;
+    std::lock_guard<std::mutex> lock(s_installMutex);
+
     static std::atomic<bool> s_installed{ false };
-    if (s_installed.load()) return;
+    if (s_installed.exchange(true)) return;
 
     InitLogging();
     g_cfg = LoadConfig();
@@ -539,7 +613,10 @@ void InstallOculusHooks() {
         if (mod) break;
     }
 
-    if (!mod) return;
+    if (!mod) {
+        s_installed.store(false);
+        return;
+    }
 
     g_ovrCreateTextureSwapChainDX = reinterpret_cast<ovrCreateTextureSwapChainDXFn>(GetProcAddress(mod, "ovr_CreateTextureSwapChainDX"));
     g_ovrGetTextureSwapChainLength = reinterpret_cast<ovrGetTextureSwapChainLengthFn>(GetProcAddress(mod, "ovr_GetTextureSwapChainLength"));
@@ -589,7 +666,6 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(getSize));
     }
 
-    s_installed.store(true);
     LogMessage(LogLevel::Info, "Hooks Oculus LibOVR instalados con soporte completo D3D11 NIS (SubmitFrame, SubmitFrame2, EndFrame).");
 }
 

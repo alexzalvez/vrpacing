@@ -32,6 +32,7 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
 
     static const wchar_t* const kBlacklist[] = {
         L"cemu.exe",
+        L"bettervr_launcher.exe",
         L"vrserver.exe",
         L"vrcompositor.exe",
         L"vrmonitor.exe",
@@ -179,16 +180,6 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProc) continue;
-
-            const bool isOpenXRLayer = IsModuleLoadedInProcess(hProc, L"VRPacingLayer.dll");
-            if (isOpenXRLayer) {
-                s_hookedPids.insert(pid);
-                LogMessage(LogLevel::Info, "Proceso VR ya gestionado por OpenXR Layer (omitiendo VRPacingHook): " +
-                           std::string(pe.szExeFile, pe.szExeFile + wcslen(pe.szExeFile)) +
-                           " [PID " + std::to_string(pid) + "]");
-                CloseHandle(hProc);
-                continue;
-            }
 
             const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
             const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||
