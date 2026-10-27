@@ -94,6 +94,8 @@ struct OculusSessionContext {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ovrTextureSwapChain lastInputChains[ovrEye_Count] = { nullptr, nullptr };
+    int lastInputWidth[ovrEye_Count] = { 0, 0 };
+    int lastInputHeight[ovrEye_Count] = { 0, 0 };
     OculusOutputSwapchain outputChains[ovrEye_Count];
 };
 
@@ -145,21 +147,25 @@ bool IsLegacyOculusLayer(const ovrLayerHeader* header) {
 }
 
 void CleanupOutputChains(OculusSessionContext& ctx) {
+    // Corrección crítica del bug de Double-Free cuando ambos ojos comparten Swapchain
+    if (ctx.outputChains[1].chain == ctx.outputChains[0].chain) {
+        ctx.outputChains[1].chain = nullptr;
+    }
+
     for (int eye = 0; eye < ovrEye_Count; ++eye) {
         if (ctx.outputChains[eye].chain && g_ovrDestroyTextureSwapChain) {
-            if (eye == 1 && ctx.outputChains[1].chain == ctx.outputChains[0].chain) {
-                ctx.outputChains[1].chain = nullptr;
-            } else {
-                g_ovrDestroyTextureSwapChain(ctx.session, ctx.outputChains[eye].chain);
-                ctx.outputChains[eye].chain = nullptr;
-            }
+            g_ovrDestroyTextureSwapChain(ctx.session, ctx.outputChains[eye].chain);
+            ctx.outputChains[eye].chain = nullptr;
         }
         ctx.outputChains[eye].textures.clear();
         ctx.outputChains[eye].length = 0;
         ctx.outputChains[eye].width = 0;
         ctx.outputChains[eye].height = 0;
         ctx.lastInputChains[eye] = nullptr;
+        ctx.lastInputWidth[eye] = 0;
+        ctx.lastInputHeight[eye] = 0;
     }
+    g_upscaler.ClearCache();
 }
 
 bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTextureSwapChain rightInput) {
@@ -173,14 +179,23 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
 
     auto& ctx = *g_oculusCtx;
 
-    const bool chainsChanged = (leftInput != ctx.lastInputChains[0]) || (rightInput != ctx.lastInputChains[1]);
+    ovrTextureSwapChain inChains[ovrEye_Count] = { leftInput, rightInput };
+
+    ovrTextureSwapChainDesc leftDesc{};
+    bool dimChanged = false;
+    if (leftInput && g_ovrGetTextureSwapChainDesc && g_ovrGetTextureSwapChainDesc(session, leftInput, &leftDesc) >= 0) {
+        if (ctx.lastInputWidth[0] > 0 && (leftDesc.Width != ctx.lastInputWidth[0] || leftDesc.Height != ctx.lastInputHeight[0])) {
+            dimChanged = true;
+        }
+    }
+
+    const bool chainsChanged = (leftInput != ctx.lastInputChains[0]) || (rightInput != ctx.lastInputChains[1]) || dimChanged;
     if (!chainsChanged && ctx.outputChains[0].chain != nullptr) {
         return true;
     }
 
     CleanupOutputChains(ctx);
 
-    ovrTextureSwapChain inChains[ovrEye_Count] = { leftInput, rightInput };
     ctx.lastInputChains[0] = leftInput;
     ctx.lastInputChains[1] = rightInput;
 
@@ -189,6 +204,8 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
     for (int eye = 0; eye < ovrEye_Count; ++eye) {
         if (eye == 1 && singleTexture) {
             ctx.outputChains[1] = ctx.outputChains[0];
+            ctx.lastInputWidth[1] = ctx.lastInputWidth[0];
+            ctx.lastInputHeight[1] = ctx.lastInputHeight[0];
             break;
         }
 
@@ -204,6 +221,8 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
             return false;
         }
 
+        ctx.lastInputWidth[eye] = desc.Width;
+        ctx.lastInputHeight[eye] = desc.Height;
         g_lastFormat = static_cast<uint32_t>(desc.Format);
         g_lastInW = desc.Width;
         g_lastInH = desc.Height;
@@ -305,6 +324,20 @@ void ProcessAndUpscaleLayer(ovrSession session,
                             const ovrFovPort inFov[ovrEye_Count],
                             ovrTextureSwapChain outColor[ovrEye_Count],
                             ovrRecti outViewport[ovrEye_Count]) {
+    // Si las dimensiones de entrada cambiaron respecto al swapchain anterior (ej. transición pantalla carga -> 3D)
+    if (inLeft && g_oculusCtx && g_ovrGetTextureSwapChainDesc) {
+        ovrTextureSwapChainDesc curDesc{};
+        if (g_ovrGetTextureSwapChainDesc(session, inLeft, &curDesc) >= 0) {
+            if (g_oculusCtx->lastInputWidth[0] > 0 &&
+                (curDesc.Width != g_oculusCtx->lastInputWidth[0] || curDesc.Height != g_oculusCtx->lastInputHeight[0])) {
+                LogMessage(LogLevel::Info, "Oculus Hook: Cambio en resolucion de Swapchain (" +
+                           std::to_string(g_oculusCtx->lastInputWidth[0]) + "x" + std::to_string(g_oculusCtx->lastInputHeight[0]) +
+                           " -> " + std::to_string(curDesc.Width) + "x" + std::to_string(curDesc.Height) + "). Recreando salida...");
+                CleanupOutputChains(*g_oculusCtx);
+            }
+        }
+    }
+
     if (!EnsureOutputChains(session, inLeft, inRight)) {
         outColor[0] = inLeft;
         outColor[1] = inRight;

@@ -10,15 +10,21 @@ std::optional<double> HzTracker::SnapToCommonHz(double hz) {
     static constexpr double kCommonRates[] = {
         30.0, 36.0, 40.0, 45.0, 60.0, 72.0, 80.0, 90.0, 120.0, 144.0
     };
-    constexpr double kTolerance = 0.06; // 6%
+    constexpr double kTolerance = 0.08; // 8% de tolerancia
+
+    double bestDiff = 1e9;
+    std::optional<double> bestRate = std::nullopt;
 
     for (double common : kCommonRates) {
         const double diff = std::abs(hz - common);
         if (diff / common <= kTolerance) {
-            return common;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestRate = common;
+            }
         }
     }
-    return std::nullopt;
+    return bestRate;
 }
 
 bool HzTracker::PushPeriodNs(int64_t periodNs) {
@@ -44,7 +50,21 @@ std::optional<double> HzTracker::GetEffectiveHz() const {
     std::sort(sorted.begin(), sorted.end());
     const double median = sorted[sorted.size() / 2];
 
-    return SnapToCommonHz(median).value_or(median);
+    auto snapped = SnapToCommonHz(median);
+    if (snapped) {
+        return snapped;
+    }
+
+    // Si la mediana se desvió por un tirón, buscar la última muestra canónica
+    for (auto it = samples_.rbegin(); it != samples_.rend(); ++it) {
+        auto s = SnapToCommonHz(*it);
+        if (s) {
+            return s;
+        }
+    }
+
+    // Jamás retornar frecuencias erráticas (e.g. 56.2 Hz)
+    return 90.0;
 }
 
 double HzTracker::ComputeTargetFps(const LimitInputs& in) const {

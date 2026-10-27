@@ -139,6 +139,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_heavyWaitStreak = 0;
 
     if (s_qpcFreq == 0) {
         LARGE_INTEGER f{};
@@ -182,8 +183,17 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;
                     g_hzTracker.PushHz(measuredHz);
-                } else if (waitMs > 2.5) {
-                    g_hzTracker.PushHz(measuredHz);
+                } else {
+                    if (waitMs > 5.0) {
+                        s_heavyWaitStreak++;
+                        if (s_heavyWaitStreak >= 45) {
+                            s_heavyWaitStreak = 0;
+                            s_calibrationFrames = 0;
+                            g_hzTracker.Reset();
+                        }
+                    } else {
+                        s_heavyWaitStreak = 0;
+                    }
                 }
             }
         }

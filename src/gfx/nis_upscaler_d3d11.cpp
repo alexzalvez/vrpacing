@@ -73,6 +73,12 @@ DXGI_FORMAT GetCompatibleUnormFormat(DXGI_FORMAT format) {
 
 } // namespace
 
+void NisUpscalerD3D11::ClearCache() {
+    srvCache_.clear();
+    uavCache_.clear();
+    g_fallback.Reset();
+}
+
 bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     if (!device) {
         LogMessage(LogLevel::Error, "NisUpscalerD3D11: Puntero ID3D11Device nulo.");
@@ -80,9 +86,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     }
 
     if (device_.Get() != device) {
-        g_fallback.Reset();
-        srvCache_.clear();
-        uavCache_.clear();
+        ClearCache();
     }
 
     device_ = device;
@@ -168,6 +172,8 @@ ComPtr<ID3D11ShaderResourceView> NisUpscalerD3D11::GetOrCreateSrv(ID3D11Texture2
     ComPtr<ID3D11ShaderResourceView> srv;
     if (SUCCEEDED(device_->CreateShaderResourceView(tex, &srvDesc, srv.GetAddressOf()))) {
         srvCache_[key] = srv;
+    } else {
+        srvCache_[key] = nullptr;
     }
     return srv;
 }
@@ -187,6 +193,7 @@ ComPtr<ID3D11UnorderedAccessView> NisUpscalerD3D11::GetOrCreateUav(ID3D11Texture
     tex->GetDesc(&desc);
 
     if ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0) {
+        uavCache_[key] = nullptr;
         return nullptr;
     }
 
@@ -206,6 +213,8 @@ ComPtr<ID3D11UnorderedAccessView> NisUpscalerD3D11::GetOrCreateUav(ID3D11Texture
     ComPtr<ID3D11UnorderedAccessView> uav;
     if (SUCCEEDED(device_->CreateUnorderedAccessView(tex, &uavDesc, uav.GetAddressOf()))) {
         uavCache_[key] = uav;
+    } else {
+        uavCache_[key] = nullptr;
     }
     return uav;
 }
@@ -367,7 +376,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     ComPtr<ID3D11UnorderedAccessView> activeDstUav = GetOrCreateUav(dst, desc.dstArrayIndex);
     const bool directWriteOk = (activeDstUav != nullptr);
 
-    // Si el destino no admite UAV directo (ej: swapchain sRGB de OpenXR), usar fallback staging
+    // Si el destino no admite UAV directo (ej: swapchain sRGB), usar fallback staging
     if (!directWriteOk) {
         DXGI_FORMAT dstUnormFmt = GetCompatibleUnormFormat(dstDesc.Format);
         if (!g_fallback.dstTex || g_fallback.dstW != dstDesc.Width || g_fallback.dstH != dstDesc.Height || g_fallback.dstFmt != dstUnormFmt) {
@@ -407,7 +416,21 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         const UINT dstSlice = (desc.dstArrayIndex >= 0 && static_cast<UINT>(desc.dstArrayIndex) < dstDesc.ArraySize)
                               ? static_cast<UINT>(desc.dstArrayIndex) : 0;
         const UINT dstSub = D3D11CalcSubresource(0, dstSlice, dstDesc.MipLevels);
-        ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_fallback.dstTex.Get(), 0, nullptr);
+
+        if (desc.dstRect.width > 0 && desc.dstRect.height > 0 &&
+            (desc.dstRect.width < dstDesc.Width || desc.dstRect.height < dstDesc.Height)) {
+            D3D11_BOX srcBox = {
+                desc.dstRect.x,
+                desc.dstRect.y,
+                0,
+                desc.dstRect.x + desc.dstRect.width,
+                desc.dstRect.y + desc.dstRect.height,
+                1
+            };
+            ctx->CopySubresourceRegion(dst, dstSub, desc.dstRect.x, desc.dstRect.y, 0, g_fallback.dstTex.Get(), 0, &srcBox);
+        } else {
+            ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_fallback.dstTex.Get(), 0, nullptr);
+        }
     }
 
     return true;

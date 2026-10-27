@@ -208,7 +208,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     EnsureInit();
     if (!createInfo || !swapchain) return XR_ERROR_VALIDATION_FAILURE;
 
-    // Regla 1: Si no hay dispositivo D3D11 (sesión DX12) o proceso en lista negra, jamás alterar dimensiones
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
     }
@@ -259,7 +258,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     XrSwapchain real = XR_NULL_HANDLE;
     XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);
     if (XR_FAILED(r)) {
-        // Fallback si el runtime rechaza UNORDERED_ACCESS directo
         realDesc.usageFlags = createInfo->usageFlags;
         r = g_nextCreateSwapchain(session, &realDesc, &real);
     }
@@ -340,6 +338,7 @@ XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.erase(swapchain);
     g_chainDims.erase(swapchain);
+    g_upscaler.ClearCache();
     return g_nextDestroySwapchain(swapchain);
 }
 
@@ -469,6 +468,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_heavyWaitStreak = 0;
 
     if (s_qpcFreq == 0) {
         LARGE_INTEGER f{};
@@ -512,8 +512,17 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;
                     g_hzTracker.PushHz(measuredHz);
-                } else if (waitMs > 2.5) {
-                    g_hzTracker.PushHz(measuredHz);
+                } else {
+                    if (waitMs > 5.0) {
+                        s_heavyWaitStreak++;
+                        if (s_heavyWaitStreak >= 45) {
+                            s_heavyWaitStreak = 0;
+                            s_calibrationFrames = 0;
+                            g_hzTracker.Reset();
+                        }
+                    } else {
+                        s_heavyWaitStreak = 0;
+                    }
                 }
             }
         }
