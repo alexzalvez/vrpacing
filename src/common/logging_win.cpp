@@ -57,12 +57,19 @@ void InitLogging(const std::wstring& customPath) {
     }
     const DWORD pid = GetCurrentProcessId();
 
+    char exeA[MAX_PATH]{};
+    size_t converted = 0;
+    wcstombs_s(&converted, exeA, exeStr.c_str(), sizeof(exeA) - 1);
+
     std::ofstream ofs(g_logFilePath, std::ios::app);
     if (ofs.is_open()) {
         ofs << "=== VRPacing " << kAppVersionAnsi << " | Proceso: "
-            << std::string(exeStr.begin(), exeStr.end())
-            << " [PID " << pid << "] ===" << std::endl;
+            << exeA << " [PID " << pid << "] ===" << std::endl;
     }
+}
+
+void InitLogging() {
+    InitLogging(L"");
 }
 
 std::wstring GetLogFilePath() {
@@ -76,7 +83,7 @@ std::wstring GetLogFilePath() {
 void LogMessage(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (!g_initialized) {
-        InitLogging();
+        InitLogging(L"");
     }
 
     const auto now = std::chrono::system_clock::now();
