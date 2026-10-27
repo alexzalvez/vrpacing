@@ -56,6 +56,7 @@ public:
         if (newlyCreated || shared_->version != 6) {
             *shared_ = {};
             shared_->version = 6;
+            // Máscara desactivada por defecto
             shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled | kFlagTelemetryActive;
             shared_->frameGenDivisor = 1.0;
             shared_->offsetFps = 0.10;
@@ -102,15 +103,19 @@ public:
             cfg.enabled = true;
             cfg.upscaling.enabled = true;
             cfg.pacing.enabled = true;
+            cfg.mask.enabled = false;
             return;
         }
 
         const uint32_t flags = shared_->flags;
         cfg.enabled = (flags & kFlagEnabled) != 0;
-        cfg.pacing.enabled = cfg.enabled; // Motor core de Frame Pacing siempre activo
+        cfg.pacing.enabled = cfg.enabled;
         shared_->flags |= kFlagPacingEnabled;
         cfg.upscaling.enabled = cfg.enabled && ((flags & kFlagUpscalingEnabled) != 0);
-        cfg.mask.enabled = false;
+
+        cfg.mask.enabled = cfg.enabled && ((flags & kFlagMaskEnabled) != 0);
+        cfg.mask.radius = 1.00f;
+        cfg.mask.segments = 256;
 
         if (shared_->frameGenDivisor > 0.0) {
             cfg.pacing.frameGenDivisor = shared_->frameGenDivisor;
@@ -158,7 +163,6 @@ public:
             }
         }
 
-        // Si la telemetría en vivo está pausada (bandeja), costo de cómputo nulo
         if (!IsTelemetryActive()) {
             return;
         }

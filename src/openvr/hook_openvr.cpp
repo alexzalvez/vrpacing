@@ -93,6 +93,19 @@ bool IsOpenXrLayerHandlingD3D11() {
     return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
 }
 
+double QueryOpenVRHardwareHz() {
+    if (!g_origGetGenericInterface) return 0.0;
+    int err = 0;
+    auto* sys = reinterpret_cast<vr::IVRSystem*>(g_origGetGenericInterface(vr::IVRSystem_Version, &err));
+    if (!sys) return 0.0;
+    vr::ETrackedPropertyError propErr = vr::TrackedProp_Success;
+    const float freq = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &propErr);
+    if (propErr == vr::TrackedProp_Success && freq >= 30.0f && freq <= 200.0f) {
+        return HzTracker::SnapToCommonHz(static_cast<double>(freq)).value_or(std::round(static_cast<double>(freq)));
+    }
+    return 0.0;
+}
+
 void EnsureInit() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -139,7 +152,10 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_sswHalfRateHits = 0;
     static uint32_t s_heavyWaitStreak = 0;
+    static double s_panelHz = 90.0;
+    static bool s_sswHalfRateActive = false;
 
     if (s_qpcFreq == 0) {
         LARGE_INTEGER f{};
@@ -147,7 +163,15 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         s_qpcFreq = f.QuadPart;
     }
 
-    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
+    if (s_calibrationFrames == 0) {
+        const double hwHz = QueryOpenVRHardwareHz();
+        if (hwHz > 0.0) {
+            s_panelHz = hwHz;
+        }
+    }
+
+    const double effectiveHz = s_sswHalfRateActive ? (s_panelHz * 0.5) : s_panelHz;
+    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
     if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
@@ -178,18 +202,25 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.005 && dt < 0.040) {
+            if (dt > 0.004 && dt < 0.050) {
                 const double measuredHz = 1.0 / dt;
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;
-                    g_hzTracker.PushHz(measuredHz);
+                    const double halfPanel = s_panelHz * 0.5;
+                    if (waitMs > 2.0 && std::abs(measuredHz - halfPanel) <= (halfPanel * 0.04)) {
+                        s_sswHalfRateHits++;
+                    }
+                    if (s_calibrationFrames == 45) {
+                        s_sswHalfRateActive = (s_sswHalfRateHits >= 20);
+                    }
                 } else {
                     if (waitMs > 5.0) {
                         s_heavyWaitStreak++;
                         if (s_heavyWaitStreak >= 45) {
                             s_heavyWaitStreak = 0;
                             s_calibrationFrames = 0;
-                            g_hzTracker.Reset();
+                            s_sswHalfRateHits = 0;
+                            s_sswHalfRateActive = false;
                         }
                     } else {
                         s_heavyWaitStreak = 0;

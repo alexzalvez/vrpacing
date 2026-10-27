@@ -8,9 +8,10 @@ namespace vrpacing {
 
 std::optional<double> HzTracker::SnapToCommonHz(double hz) {
     static constexpr double kCommonRates[] = {
-        30.0, 36.0, 40.0, 45.0, 60.0, 72.0, 80.0, 90.0, 120.0, 144.0
+        24.0, 30.0, 32.0, 33.333333, 36.0, 40.0, 45.0, 48.0, 50.0,
+        60.0, 72.0, 80.0, 90.0, 96.0, 100.0, 120.0, 144.0
     };
-    constexpr double kTolerance = 0.08; // 8% de tolerancia
+    constexpr double kTolerance = 0.03; // 3% de tolerancia para distinguir 90, 96 y 100 Hz
 
     double bestDiff = 1e9;
     std::optional<double> bestRate = std::nullopt;
@@ -35,7 +36,7 @@ bool HzTracker::PushPeriodNs(int64_t periodNs) {
 }
 
 void HzTracker::PushHz(double hz) {
-    if (hz < 25.0 || hz > 200.0) return;
+    if (hz < 20.0 || hz > 200.0) return;
 
     samples_.push_back(hz);
     if (samples_.size() > 60) {
@@ -55,7 +56,6 @@ std::optional<double> HzTracker::GetEffectiveHz() const {
         return snapped;
     }
 
-    // Si la mediana se desvió por un tirón, buscar la última muestra canónica
     for (auto it = samples_.rbegin(); it != samples_.rend(); ++it) {
         auto s = SnapToCommonHz(*it);
         if (s) {
@@ -63,7 +63,6 @@ std::optional<double> HzTracker::GetEffectiveHz() const {
         }
     }
 
-    // Jamás retornar frecuencias erráticas (e.g. 56.2 Hz)
     return 90.0;
 }
 
@@ -79,7 +78,7 @@ bool HzTracker::IsLikelyRuntimeHalfRate() const {
     const auto eff = GetEffectiveHz();
     if (!eff) return false;
     const double h = *eff;
-    return (std::abs(h - 45.0) < 1.0 || std::abs(h - 36.0) < 1.0 || std::abs(h - 40.0) < 1.0 || std::abs(h - 60.0) < 1.0);
+    return (std::abs(h - 45.0) < 1.0 || std::abs(h - 36.0) < 1.0 || std::abs(h - 40.0) < 1.0 || std::abs(h - 60.0) < 1.0 || std::abs(h - 48.0) < 1.0);
 }
 
 void HzTracker::Reset() {

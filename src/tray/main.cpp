@@ -40,6 +40,7 @@ constexpr UINT ID_CHECK_TELEMETRY = 2008;
 constexpr UINT ID_BTN_MINIMIZE = 2009;
 constexpr UINT ID_BTN_OPEN_LOG = 2010;
 constexpr UINT ID_BTN_EXIT = 2011;
+constexpr UINT ID_CHECK_MASK = 2012;
 
 // Tray Menu IDs
 constexpr UINT ID_TRAY_OPEN = 3001;
@@ -53,6 +54,7 @@ constexpr UINT ID_TRAY_OFFSET_005 = 3008;
 constexpr UINT ID_TRAY_TELEMETRY = 3009;
 constexpr UINT ID_TRAY_OPEN_LOG = 3010;
 constexpr UINT ID_TRAY_EXIT = 3011;
+constexpr UINT ID_TRAY_MASK = 3012;
 
 NOTIFYICONDATAW g_nid{};
 vrpacing::RuntimeConfig g_cfg;
@@ -75,6 +77,7 @@ HWND g_hLblRes = nullptr;
 HWND g_hLblPipeline = nullptr;
 
 HWND g_hChkNis = nullptr;
+HWND g_hChkMask = nullptr;
 HWND g_hChkPacing = nullptr;
 HWND g_hChkTelemetry = nullptr;
 HWND g_hRadio1x = nullptr;
@@ -128,7 +131,7 @@ void UpdateSharedStateFlags() {
     if (g_cfg.enabled) flags |= vrpacing::kFlagEnabled;
     if (g_cfg.upscaling.enabled) flags |= vrpacing::kFlagUpscalingEnabled;
     if (g_cfg.mask.enabled) flags |= vrpacing::kFlagMaskEnabled;
-    flags |= vrpacing::kFlagPacingEnabled; // Frame Pacing siempre presente
+    flags |= vrpacing::kFlagPacingEnabled;
     if (g_telemetryEnabled && IsWindowVisible(g_hMainWnd)) {
         flags |= vrpacing::kFlagTelemetryActive;
     }
@@ -141,6 +144,9 @@ void UpdateSharedStateFlags() {
 void SyncUiWithConfig() {
     if (g_hChkNis) {
         SendMessageW(g_hChkNis, BM_SETCHECK, g_cfg.upscaling.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (g_hChkMask) {
+        SendMessageW(g_hChkMask, BM_SETCHECK, g_cfg.mask.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     if (g_hChkPacing) {
         SendMessageW(g_hChkPacing, BM_SETCHECK, BST_CHECKED, 0);
@@ -167,8 +173,9 @@ void SaveAndPropagate() {
     g_cfg.upscaling.scale = 2.0f;
     g_cfg.upscaling.radius = 0.60f;
     g_cfg.upscaling.sharpness = 0.0f;
-    g_cfg.mask.enabled = false;
-    g_cfg.pacing.enabled = true; // Forzado como motor core
+    g_cfg.mask.radius = 1.00f;
+    g_cfg.mask.segments = 256;
+    g_cfg.pacing.enabled = true;
 
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
         g_cfg.pacing.offsetFps = 0.10;
@@ -318,6 +325,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     AppendMenuW(hMenu, MF_STRING | (g_cfg.upscaling.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_NIS, L"NIS 2.0x Upscaling");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"Pre-Render Circular Mask (100% Edge)");
     AppendMenuW(hMenu, MF_STRING | MF_CHECKED | MF_GRAYED, ID_TRAY_PACING, L"Frame Pacing (Core - Always Active)");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -406,9 +414,9 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                       30, 138, 400, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_TELEMETRY), hInst, nullptr);
     SetFont(g_hChkTelemetry, g_hFontNormal);
 
-    HWND hGrpUpscale = CreateWindowExW(0, L"BUTTON", L" Spatial Upscaling (NVIDIA Image Scaling) ",
+    HWND hGrpUpscale = CreateWindowExW(0, L"BUTTON", L" Spatial Upscaling & Geometry Culling ",
                                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                       15, 180, 434, 75, hwnd, nullptr, hInst, nullptr);
+                                       15, 180, 434, 99, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpUpscale, g_hFontBold);
 
     g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Upscaling",
@@ -421,70 +429,75 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                      30, 226, 400, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblFixed, g_hFontNormal);
 
+    g_hChkMask = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Render Circular Mask (100% Edge - 256 Segments)",
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 30, 248, 400, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_MASK), hInst, nullptr);
+    SetFont(g_hChkMask, g_hFontNormal);
+
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Deterministic Frame Pacing ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 262, 434, 255, hwnd, nullptr, hInst, nullptr);
+                                      15, 286, 434, 255, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
     g_hChkPacing = CreateWindowExW(0, L"BUTTON", L"Enable Deterministic Frame Pacing (Core Engine - Always Active)",
                                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_DISABLED,
-                                   30, 284, 400, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_PACING), hInst, nullptr);
+                                   30, 308, 400, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_PACING), hInst, nullptr);
     SetFont(g_hChkPacing, g_hFontNormal);
 
     HWND hLblRate = CreateWindowExW(0, L"STATIC", L"Target Rate Mode:",
                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 307, 400, 16, hwnd, nullptr, hInst, nullptr);
+                                    30, 331, 400, 16, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblRate, g_hFontBold);
 
     g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"1x - Native Hz & Virtual Desktop SSW (59.9 / 71.9 / 89.9 FPS)",
                                  WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                 42, 325, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_1X), hInst, nullptr);
+                                 42, 349, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_1X), hInst, nullptr);
     SetFont(g_hRadio1x, g_hFontNormal);
 
     g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"1/2x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                   42, 345, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_HALF), hInst, nullptr);
+                                   42, 369, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_HALF), hInst, nullptr);
     SetFont(g_hRadioHalf, g_hFontNormal);
 
     g_hRadioThird = CreateWindowExW(0, L"BUTTON", L"1/3x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
                                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                    42, 365, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_THIRD), hInst, nullptr);
+                                    42, 389, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_THIRD), hInst, nullptr);
     SetFont(g_hRadioThird, g_hFontNormal);
 
     HWND hLblOffset = CreateWindowExW(0, L"STATIC", L"Low-Latency Headroom Offset:",
                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      30, 391, 400, 16, hwnd, nullptr, hInst, nullptr);
+                                      30, 415, 400, 16, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblOffset, g_hFontBold);
 
     g_hRadioOffset010 = CreateWindowExW(0, L"BUTTON", L"-0.10 FPS (Recommended - Drains Driver Queue Completely)",
                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                        42, 409, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_OFFSET_010), hInst, nullptr);
+                                        42, 433, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_OFFSET_010), hInst, nullptr);
     SetFont(g_hRadioOffset010, g_hFontNormal);
 
     g_hRadioOffset005 = CreateWindowExW(0, L"BUTTON", L"-0.05 FPS (Tight Margin - Ultra Low Latency)",
                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                        42, 429, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_OFFSET_005), hInst, nullptr);
+                                        42, 453, 390, 20, hwnd, reinterpret_cast<HMENU>(ID_RADIO_OFFSET_005), hInst, nullptr);
     SetFont(g_hRadioOffset005, g_hFontNormal);
 
     HWND hLblNote = CreateWindowExW(0, L"STATIC",
                                     L"Note: Always use 1x for Native Hz and Virtual Desktop SSW. Use 1/2x or 1/3x only with external tools like VectorXR or OFXR-Bridge.",
                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 456, 404, 32, hwnd, nullptr, hInst, nullptr);
+                                    30, 480, 404, 32, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblNote, g_hFontNormal);
 
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                        15, 526, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_MINIMIZE), hInst, nullptr);
+                                        15, 550, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_MINIMIZE), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   163, 526, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_OPEN_LOG), hInst, nullptr);
+                                   163, 550, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_OPEN_LOG), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
     HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit Application",
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    311, 526, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXIT), hInst, nullptr);
+                                    311, 550, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXIT), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -519,6 +532,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             switch (id) {
                 case ID_CHECK_NIS:
                     g_cfg.upscaling.enabled = (SendMessageW(g_hChkNis, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    SaveAndPropagate();
+                    break;
+
+                case ID_CHECK_MASK:
+                    g_cfg.mask.enabled = (SendMessageW(g_hChkMask, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
                     break;
 
@@ -580,6 +598,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 case ID_TRAY_NIS:
                     g_cfg.upscaling.enabled = !g_cfg.upscaling.enabled;
+                    SaveAndPropagate();
+                    break;
+
+                case ID_TRAY_MASK:
+                    g_cfg.mask.enabled = !g_cfg.mask.enabled;
                     SaveAndPropagate();
                     break;
 
@@ -649,8 +672,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_cfg.upscaling.scale = 2.0f;
     g_cfg.upscaling.radius = 0.60f;
     g_cfg.upscaling.sharpness = 0.0f;
-    g_cfg.mask.enabled = false;
-    g_cfg.pacing.enabled = true; // Forzado como motor core
+    g_cfg.mask.enabled = false; // Desmarcada por defecto
+    g_cfg.mask.radius = 1.00f;
+    g_cfg.mask.segments = 256;
+    g_cfg.pacing.enabled = true;
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
         g_cfg.pacing.offsetFps = 0.10;
     }
@@ -674,7 +699,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 612;
+    const int winH = 636;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 

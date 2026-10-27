@@ -57,6 +57,7 @@ PFN_xrEndFrame g_nextEndFrame = nullptr;
 PFN_xrWaitFrame g_nextWaitFrame = nullptr;
 PFN_xrGetSystemProperties g_nextGetSystemProperties = nullptr;
 PFN_xrEnumerateInstanceExtensionProperties g_nextEnumerateInstanceExtensionProperties = nullptr;
+PFN_xrGetVisibilityMaskKHR g_nextGetVisibilityMaskKHR = nullptr;
 
 struct ProxySwapchain {
     XrSwapchain realSwapchain = XR_NULL_HANDLE;
@@ -120,6 +121,135 @@ void EnsureInit() {
         g_limiter.Initialize();
         LogMessage(LogLevel::Info, "OpenXR Layer inicializada.");
     });
+}
+
+XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
+    XrSession session,
+    XrViewConfigurationType viewConfigurationType,
+    uint32_t viewIndex,
+    XrVisibilityMaskTypeKHR visibilityMaskType,
+    XrVisibilityMaskKHR* visibilityMask) {
+    EnsureInit();
+    if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
+
+    g_shm.SyncConfig(g_cfg);
+    if (!g_cfg.mask.enabled || IsCurrentProcessBlacklisted()) {
+        if (g_nextGetVisibilityMaskKHR) {
+            return g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
+        }
+        visibilityMask->vertexCountOutput = 0;
+        visibilityMask->indexCountOutput = 0;
+        return XR_SUCCESS;
+    }
+
+    constexpr uint32_t kSeg = 256;
+    uint32_t reqVerts = 0;
+    uint32_t reqIndices = 0;
+
+    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
+        reqVerts = kSeg + 1;
+        reqIndices = kSeg * 3;
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
+        reqVerts = kSeg * 2;
+        reqIndices = kSeg * 6;
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
+        reqVerts = kSeg;
+        reqIndices = kSeg;
+    } else {
+        visibilityMask->vertexCountOutput = 0;
+        visibilityMask->indexCountOutput = 0;
+        return XR_SUCCESS;
+    }
+
+    visibilityMask->vertexCountOutput = reqVerts;
+    visibilityMask->indexCountOutput = reqIndices;
+
+    if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
+        !visibilityMask->vertices || !visibilityMask->indices) {
+        return XR_SUCCESS;
+    }
+
+    if (visibilityMask->vertexCapacityInput < reqVerts || visibilityMask->indexCapacityInput < reqIndices) {
+        return XR_ERROR_SIZE_INSUFFICIENT;
+    }
+
+    float minX = -1.0f, maxX = 1.0f, minY = -1.0f, maxY = 1.0f;
+    if (g_nextGetVisibilityMaskKHR) {
+        XrVisibilityMaskKHR origMask{ XR_TYPE_VISIBILITY_MASK_KHR };
+        if (XR_SUCCEEDED(g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, &origMask)) &&
+            origMask.vertexCountOutput > 0 && origMask.indexCountOutput > 0) {
+            std::vector<XrVector2f> tmpV(origMask.vertexCountOutput);
+            std::vector<uint32_t> tmpI(origMask.indexCountOutput);
+            origMask.vertexCapacityInput = origMask.vertexCountOutput;
+            origMask.indexCapacityInput = origMask.indexCountOutput;
+            origMask.vertices = tmpV.data();
+            origMask.indices = tmpI.data();
+            if (XR_SUCCEEDED(g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, &origMask))) {
+                minX = tmpV[0].x; maxX = tmpV[0].x;
+                minY = tmpV[0].y; maxY = tmpV[0].y;
+                for (const auto& v : tmpV) {
+                    if (v.x < minX) minX = v.x;
+                    if (v.x > maxX) maxX = v.x;
+                    if (v.y < minY) minY = v.y;
+                    if (v.y > maxY) maxY = v.y;
+                }
+            }
+        }
+    }
+
+    const float cx = 0.5f * (minX + maxX);
+    const float cy = 0.5f * (minY + maxY);
+    const float rx = 0.5f * (maxX - minX);
+    const float ry = 0.5f * (maxY - minY);
+    constexpr float kTwoPi = 6.283185307179586f;
+
+    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
+        visibilityMask->vertices[0] = { cx, cy };
+        for (uint32_t i = 0; i < kSeg; ++i) {
+            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
+            visibilityMask->vertices[i + 1] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
+            const uint32_t next = ((i + 1) % kSeg) + 1;
+            visibilityMask->indices[i * 3 + 0] = 0;
+            visibilityMask->indices[i * 3 + 1] = i + 1;
+            visibilityMask->indices[i * 3 + 2] = next;
+        }
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
+        for (uint32_t i = 0; i < kSeg; ++i) {
+            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
+            const float ca = std::cos(a);
+            const float sa = std::sin(a);
+            const float maxComp = (std::max)(std::abs(ca), std::abs(sa));
+            const float outerScale = (maxComp > 0.0001f) ? (1.05f / maxComp) : 1.5f;
+
+            visibilityMask->vertices[i * 2 + 0] = { cx + rx * ca, cy + ry * sa };
+            visibilityMask->vertices[i * 2 + 1] = { cx + rx * outerScale * ca, cy + ry * outerScale * sa };
+
+            const uint32_t next = (i + 1) % kSeg;
+            const uint32_t i0 = i * 2;
+            const uint32_t i1 = i * 2 + 1;
+            const uint32_t n0 = next * 2;
+            const uint32_t n1 = next * 2 + 1;
+
+            visibilityMask->indices[i * 6 + 0] = i0;
+            visibilityMask->indices[i * 6 + 1] = i1;
+            visibilityMask->indices[i * 6 + 2] = n0;
+            visibilityMask->indices[i * 6 + 3] = n0;
+            visibilityMask->indices[i * 6 + 4] = i1;
+            visibilityMask->indices[i * 6 + 5] = n1;
+        }
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
+        for (uint32_t i = 0; i < kSeg; ++i) {
+            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
+            visibilityMask->vertices[i] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
+            visibilityMask->indices[i] = i;
+        }
+    }
+
+    static std::atomic<bool> s_maskLogged{ false };
+    if (!s_maskLogged.exchange(true)) {
+        LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 segmentos) aplicada al motor.");
+    }
+    return XR_SUCCESS;
 }
 
 XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
@@ -201,7 +331,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     EnsureInit();
     if (!createInfo || !swapchain) return XR_ERROR_VALIDATION_FAILURE;
 
-    // Si no hay D3D11 nativo (sesión DX12) o proceso en lista negra, no intervenir
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
     }
@@ -455,7 +584,10 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_sswHalfRateHits = 0;
     static uint32_t s_heavyWaitStreak = 0;
+    static double s_panelHz = 90.0;
+    static bool s_sswHalfRateActive = false;
 
     if (s_qpcFreq == 0) {
         LARGE_INTEGER f{};
@@ -463,7 +595,8 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         s_qpcFreq = f.QuadPart;
     }
 
-    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
+    const double effectiveHz = s_sswHalfRateActive ? (s_panelHz * 0.5) : s_panelHz;
+    const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
     if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
@@ -489,23 +622,43 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     LARGE_INTEGER afterWaitQpc{};
     QueryPerformanceCounter(&afterWaitQpc);
 
+    if (XR_SUCCEEDED(res) && state && state->predictedDisplayPeriod > 0) {
+        const double rawDisplayHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
+        if (rawDisplayHz > 20.0 && rawDisplayHz < 200.0) {
+            const double snappedPanel = HzTracker::SnapToCommonHz(rawDisplayHz).value_or(std::round(rawDisplayHz));
+            if (std::abs(snappedPanel - s_panelHz) > 0.5) {
+                s_panelHz = snappedPanel;
+                s_calibrationFrames = 0;
+                s_sswHalfRateHits = 0;
+                s_sswHalfRateActive = false;
+            }
+        }
+    }
+
     if (s_qpcFreq > 0) {
         const double waitMs = static_cast<double>(afterWaitQpc.QuadPart - beforeWaitQpc.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq);
 
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.005 && dt < 0.040) {
+            if (dt > 0.004 && dt < 0.050) {
                 const double measuredHz = 1.0 / dt;
                 if (s_calibrationFrames < 45) {
                     s_calibrationFrames++;
-                    g_hzTracker.PushHz(measuredHz);
+                    const double halfPanel = s_panelHz * 0.5;
+                    if (waitMs > 2.0 && std::abs(measuredHz - halfPanel) <= (halfPanel * 0.04)) {
+                        s_sswHalfRateHits++;
+                    }
+                    if (s_calibrationFrames == 45) {
+                        s_sswHalfRateActive = (s_sswHalfRateHits >= 20);
+                    }
                 } else {
                     if (waitMs > 5.0) {
                         s_heavyWaitStreak++;
                         if (s_heavyWaitStreak >= 45) {
                             s_heavyWaitStreak = 0;
                             s_calibrationFrames = 0;
-                            g_hzTracker.Reset();
+                            s_sswHalfRateHits = 0;
+                            s_sswHalfRateActive = false;
                         }
                     } else {
                         s_heavyWaitStreak = 0;
@@ -515,13 +668,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         }
     }
     s_lastWaitExitQpc = afterWaitQpc.QuadPart;
-
-    if (XR_SUCCEEDED(res) && state && state->predictedDisplayPeriod > 0) {
-        const double displayHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
-        if (displayHz > 30.0 && displayHz < 200.0 && s_calibrationFrames < 45) {
-            g_hzTracker.PushHz(std::round(displayHz));
-        }
-    }
     return res;
 }
 
@@ -604,6 +750,8 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrGetSystemProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetSystemProperties));
     g_nextEnumerateInstanceExtensionProperties = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));
+    g_nextGetVisibilityMaskKHR = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetVisibilityMaskKHR));
 }
 
 } // namespace
@@ -625,6 +773,7 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, 
     else if (strcmp(name, "xrWaitFrame") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitFrame);
     else if (strcmp(name, "xrGetSystemProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetSystemProperties);
     else if (strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateInstanceExtensionProperties);
+    else if (strcmp(name, "xrGetVisibilityMaskKHR") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetVisibilityMaskKHR);
     else return g_nextGetInstanceProcAddr(instance, name, function);
 
     return XR_SUCCESS;
@@ -663,6 +812,12 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
     if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
         loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
         loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo)) {
+        return XR_ERROR_INITIALIZATION_FAILED;
+    }
+
+    if (apiLayerRequest->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST ||
+        apiLayerRequest->structVersion != XR_API_LAYER_INFO_STRUCT_VERSION ||
+        apiLayerRequest->structSize != sizeof(XrNegotiateApiLayerRequest)) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
