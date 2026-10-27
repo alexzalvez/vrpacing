@@ -66,6 +66,7 @@ ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
 uint32_t g_oculusVersion = 0;
+std::atomic<bool> g_oculusNonD3D11Passthrough{ false };
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
@@ -97,6 +98,18 @@ struct OculusSessionContext {
 };
 
 std::unique_ptr<OculusSessionContext> g_oculusCtx;
+
+bool IsOpenXrLayerHandlingD3D11() {
+    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    if (hLayer) {
+        using IsActiveFn = bool(__cdecl*)();
+        auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
+        if (fn && fn()) {
+            return true;
+        }
+    }
+    return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
+}
 
 void EnsureInit() {
     static std::once_flag flag;
@@ -196,17 +209,24 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         g_lastInH = desc.Height;
 
         if (!ctx.device) {
-            ComPtr<ID3D11Texture2D> inTex0;
-            if (g_ovrGetTextureSwapChainBufferDX(session, curIn, 0, IID_PPV_ARGS(inTex0.GetAddressOf())) >= 0 && inTex0) {
-                inTex0->GetDevice(ctx.device.ReleaseAndGetAddressOf());
-                if (ctx.device) {
-                    ctx.device->GetImmediateContext(ctx.context.ReleaseAndGetAddressOf());
-                    if (!g_upscaler.IsInitialized()) {
-                        if (!g_upscaler.Initialize(ctx.device.Get())) {
-                            g_upscaleStatus = -2;
-                            LogMessage(LogLevel::Error, "Oculus Hook: Error al inicializar NisUpscalerD3D11.");
+            ComPtr<IUnknown> unk0;
+            if (g_ovrGetTextureSwapChainBufferDX(session, curIn, 0, IID_PPV_ARGS(unk0.GetAddressOf())) >= 0 && unk0) {
+                ComPtr<ID3D11Texture2D> inTex0;
+                if (SUCCEEDED(unk0->QueryInterface(IID_PPV_ARGS(inTex0.GetAddressOf()))) && inTex0) {
+                    inTex0->GetDevice(ctx.device.ReleaseAndGetAddressOf());
+                    if (ctx.device) {
+                        ctx.device->GetImmediateContext(ctx.context.ReleaseAndGetAddressOf());
+                        if (!g_upscaler.IsInitialized()) {
+                            if (!g_upscaler.Initialize(ctx.device.Get())) {
+                                g_upscaleStatus = -2;
+                                LogMessage(LogLevel::Error, "Oculus Hook: Error al inicializar NisUpscalerD3D11.");
+                            }
                         }
                     }
+                } else {
+                    g_oculusNonD3D11Passthrough.store(true, std::memory_order_relaxed);
+                    LogMessage(LogLevel::Warn, "Oculus Hook: El Swapchain recibido no es D3D11 (juego D3D12/Vulkan detectado). Escalado en passthrough para evitar crash; Frame Pacing activo.");
+                    return false;
                 }
             }
         }
@@ -237,12 +257,13 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         outDesc.SampleCount = 1;
         outDesc.MipLevels = 1;
         outDesc.BindFlags = ovrTextureBind_DX_RenderTarget | ovrTextureBind_DX_UnorderedAccess;
-        outDesc.MiscFlags = 0;
+        outDesc.MiscFlags = desc.MiscFlags | ovrTextureMisc_DX_Typeless;
 
         ovrTextureSwapChain outChain = nullptr;
         ovrResult createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
         if (createRes < 0 || !outChain) {
             outDesc.BindFlags = ovrTextureBind_DX_RenderTarget;
+            outDesc.MiscFlags = desc.MiscFlags;
             createRes = g_ovrCreateTextureSwapChainDX(session, ctx.device.Get(), &outDesc, &outChain);
         }
 
@@ -313,8 +334,13 @@ void ProcessAndUpscaleLayer(ovrSession session,
         g_ovrGetTextureSwapChainCurrentIndex(session, curIn, &inIdx);
         inIdx = (inIdx - 1 + inLen) % inLen;
 
+        ComPtr<IUnknown> unk;
+        if (g_ovrGetTextureSwapChainBufferDX(session, curIn, inIdx, IID_PPV_ARGS(unk.GetAddressOf())) < 0 || !unk) {
+            continue;
+        }
+
         ComPtr<ID3D11Texture2D> inTex;
-        if (g_ovrGetTextureSwapChainBufferDX(session, curIn, inIdx, IID_PPV_ARGS(inTex.GetAddressOf())) < 0 || !inTex) {
+        if (FAILED(unk->QueryInterface(IID_PPV_ARGS(inTex.GetAddressOf()))) || !inTex) {
             continue;
         }
 
@@ -359,6 +385,8 @@ void ProcessAndUpscaleLayer(ovrSession session,
         UpscaleDispatchDesc desc{};
         desc.srcRect = srcR;
         desc.dstRect = dstR;
+        desc.srcArrayIndex = (inDesc.ArraySize > 1) ? eye : 0;
+        desc.dstArrayIndex = (inDesc.ArraySize > 1) ? eye : 0;
         desc.projCenterX = projX;
         desc.projCenterY = projY;
         desc.radius = g_cfg.upscaling.radius;
@@ -400,7 +428,7 @@ ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
 ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frameIndex) {
     if (!g_origWaitToBeginFrame) return 0;
 
-    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+    if (IsOpenXrLayerHandlingD3D11() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return g_origWaitToBeginFrame(session, frameIndex);
     }
 
@@ -449,7 +477,11 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
                               unsigned int layerCount) {
     if (!origFn) return 0;
 
-    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+    if (g_oculusNonD3D11Passthrough.load(std::memory_order_relaxed)) {
+        return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
+    }
+
+    if (IsOpenXrLayerHandlingD3D11() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
     }
 
@@ -591,16 +623,6 @@ ovrResult __cdecl Hooked_ovrEndFrame(ovrSession session,
 } // namespace
 
 void InstallOculusHooks() {
-    static std::mutex s_installMutex;
-    std::lock_guard<std::mutex> lock(s_installMutex);
-
-    static std::atomic<bool> s_installed{ false };
-    if (s_installed.exchange(true)) return;
-
-    InitLogging();
-    g_cfg = LoadConfig();
-    g_limiter.Initialize();
-
     HMODULE mod = nullptr;
     const wchar_t* dllNames[] = {
         L"LibOVRRT64_1.dll",
@@ -614,9 +636,18 @@ void InstallOculusHooks() {
     }
 
     if (!mod) {
-        s_installed.store(false);
         return;
     }
+
+    static std::mutex s_installMutex;
+    std::lock_guard<std::mutex> lock(s_installMutex);
+
+    static std::atomic<bool> s_installed{ false };
+    if (s_installed.exchange(true)) return;
+
+    InitLogging();
+    g_cfg = LoadConfig();
+    g_limiter.Initialize();
 
     g_ovrCreateTextureSwapChainDX = reinterpret_cast<ovrCreateTextureSwapChainDXFn>(GetProcAddress(mod, "ovr_CreateTextureSwapChainDX"));
     g_ovrGetTextureSwapChainLength = reinterpret_cast<ovrGetTextureSwapChainLengthFn>(GetProcAddress(mod, "ovr_GetTextureSwapChainLength"));

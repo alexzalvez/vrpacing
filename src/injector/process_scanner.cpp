@@ -17,6 +17,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -25,6 +26,7 @@
 namespace vrpacing {
 namespace {
 
+std::unordered_map<DWORD, int> s_inspectedPids;
 std::unordered_set<DWORD> s_hookedPids;
 
 bool IsBlacklistedProcess(const wchar_t* exeName) {
@@ -174,8 +176,20 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
             if (pid == 0 || pid == GetCurrentProcessId()) continue;
             if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
 
-            if (IsBlacklistedProcess(pe.szExeFile)) {
+            // Evitar escanear repetidamente procesos de Windows ya inspeccionados (0% CPU)
+            auto itInsp = s_inspectedPids.find(pid);
+            if (itInsp != s_inspectedPids.end() && itInsp->second >= 3) {
                 continue;
+            }
+
+            if (IsBlacklistedProcess(pe.szExeFile)) {
+                s_inspectedPids[pid] = 999;
+                continue;
+            }
+
+            s_inspectedPids[pid]++;
+            if (s_inspectedPids.size() > 4096) {
+                s_inspectedPids.clear();
             }
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
@@ -188,9 +202,11 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
             if (isOpenVR || isOculus) {
                 if (InjectDllByPid(pid, dllPath)) {
                     s_hookedPids.insert(pid);
+                    char exeA[MAX_PATH]{};
+                    size_t converted = 0;
+                    wcstombs_s(&converted, exeA, pe.szExeFile, sizeof(exeA) - 1);
                     LogMessage(LogLevel::Info, "Inyeccion automatica aplicada a juego VR: " +
-                               std::string(pe.szExeFile, pe.szExeFile + wcslen(pe.szExeFile)) +
-                               " [PID " + std::to_string(pid) + "]");
+                               std::string(exeA) + " [PID " + std::to_string(pid) + "]");
                 }
             }
 

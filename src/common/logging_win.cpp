@@ -29,14 +29,22 @@ std::wstring g_logFilePath;
 bool g_initialized = false;
 
 std::wstring GetDefaultLogPath() {
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring p(path);
-    const auto pos = p.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) {
-        p.resize(pos);
+    wchar_t buf[MAX_PATH]{};
+    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+    std::wstring dir;
+    if (len > 0 && len < MAX_PATH) {
+        dir = std::wstring(buf) + L"\\VRPacing\\logs";
+    } else {
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        std::wstring p(path);
+        const auto pos = p.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) p.resize(pos);
+        dir = p;
     }
-    return p + L"\\vrpacing.log";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir + L"\\vrpacing.log";
 }
 
 } // namespace

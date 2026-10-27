@@ -37,6 +37,9 @@
 using Microsoft::WRL::ComPtr;
 
 namespace vrpacing {
+
+std::atomic<bool> g_openXrD3D11Active{ false };
+
 namespace {
 
 PFN_xrGetInstanceProcAddr g_nextGetInstanceProcAddr = nullptr;
@@ -142,6 +145,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
                 LogMessage(LogLevel::Info, "OpenXR Layer: ID3D11Device capturado en xrCreateSession.");
 
                 if (!IsCurrentProcessBlacklisted()) {
+                    g_openXrD3D11Active.store(true, std::memory_order_relaxed);
                     g_shm.OpenOrCreate();
                     g_shm.SetOpenXrD3D11Pid(GetCurrentProcessId());
                 }
@@ -152,6 +156,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     }
 
     if (!g_d3d11Device) {
+        g_openXrD3D11Active.store(false, std::memory_order_relaxed);
         LogMessage(LogLevel::Info, "OpenXR Layer: Sesion no-D3D11 detectada (DX12/Vulkan). Passthrough activo.");
     }
 
@@ -162,6 +167,7 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.clear();
     g_chainDims.clear();
+    g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
     }
@@ -248,9 +254,16 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     XrSwapchainCreateInfo realDesc = *createInfo;
     realDesc.width = realW;
     realDesc.height = realH;
+    realDesc.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
 
     XrSwapchain real = XR_NULL_HANDLE;
     XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);
+    if (XR_FAILED(r)) {
+        // Fallback si el runtime rechaza UNORDERED_ACCESS directo
+        realDesc.usageFlags = createInfo->usageFlags;
+        r = g_nextCreateSwapchain(session, &realDesc, &real);
+    }
+
     if (XR_FAILED(r)) {
         g_upscaleStatus = -1;
         g_lastHResult = r;
@@ -355,6 +368,10 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
 }
 
 XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageAcquireInfo* acquireInfo, uint32_t* index) {
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+        return g_nextAcquireSwapchainImage(swapchain, acquireInfo, index);
+    }
+
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
@@ -371,6 +388,10 @@ XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const Xr
 }
 
 XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageWaitInfo* waitInfo) {
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+        return g_nextWaitSwapchainImage(swapchain, waitInfo);
+    }
+
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
@@ -380,6 +401,10 @@ XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwa
 }
 
 XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageReleaseInfo* releaseInfo) {
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+        return g_nextReleaseSwapchainImage(swapchain, releaseInfo);
+    }
+
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
@@ -505,7 +530,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 }
 
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
-    if (!frameEndInfo || frameEndInfo->layerCount == 0 || !frameEndInfo->layers) {
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted() || !frameEndInfo || frameEndInfo->layerCount == 0 || !frameEndInfo->layers) {
         return g_nextEndFrame(session, frameEndInfo);
     }
 
@@ -563,17 +588,25 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySession));
     g_nextGetInstanceProcAddr(instance, "xrEnumerateViewConfigurationViews", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateViewConfigurationViews));
     g_nextGetInstanceProcAddr(instance, "xrCreateSwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSwapchain));
+    g_nextDestroySwapchain = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySwapchain));
+    g_nextEnumerateSwapchainFormats = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateSwapchainFormats", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateSwapchainFormats));
+    g_nextEnumerateSwapchainImages = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateSwapchainImages", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateSwapchainImages));
+    g_nextAcquireSwapchainImage = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrAcquireSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextAcquireSwapchainImage));
+    g_nextWaitSwapchainImage = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrWaitSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitSwapchainImage));
+    g_nextReleaseSwapchainImage = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextReleaseSwapchainImage));
     g_nextEndFrame = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEndFrame));
     g_nextWaitFrame = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrWaitFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitFrame));
+    g_nextGetSystemProperties = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrGetSystemProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetSystemProperties));
+    g_nextEnumerateInstanceExtensionProperties = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));
 }
 
@@ -618,6 +651,10 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCr
 }
 
 } // namespace vrpacing
+
+extern "C" __declspec(dllexport) bool __cdecl VRPacingLayer_IsActiveD3D11() {
+    return vrpacing::g_openXrD3D11Active.load(std::memory_order_relaxed);
+}
 
 extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(
     const XrNegotiateLoaderInfo* loaderInfo,

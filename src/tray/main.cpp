@@ -179,7 +179,48 @@ void SaveAndPropagate() {
     SyncUiWithConfig();
 }
 
+void CheckActiveProcessLiveness() {
+    if (!g_shared || g_shared->activePid == 0) return;
+
+    HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, g_shared->activePid);
+    if (hProc) {
+        DWORD waitRes = WaitForSingleObject(hProc, 0);
+        CloseHandle(hProc);
+        if (waitRes == WAIT_OBJECT_0) {
+            const DWORD deadPid = g_shared->activePid;
+            g_shared->activePid = 0;
+            if (g_shared->openXrD3D11Pid == deadPid) {
+                g_shared->openXrD3D11Pid = 0;
+            }
+            wcscpy_s(g_shared->activeApi, L"Idle");
+            wcscpy_s(g_shared->hookedProcess, L"None");
+            g_shared->inputWidth = 0;
+            g_shared->inputHeight = 0;
+            g_shared->outputWidth = 0;
+            g_shared->outputHeight = 0;
+            g_shared->dxgiFormat = 0;
+            g_shared->upscaleStatus = 0;
+            g_shared->lastHResult = 0;
+            g_shared->appliedCap = 0.0;
+            g_shared->avgFps = 0.0;
+            g_shared->onePercentLowFps = 0.0;
+            vrpacing::LogMessage(vrpacing::LogLevel::Info, "Juego VR cerrado. Telemetria e IPC restablecidos a Idle.");
+        }
+    } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
+        const DWORD deadPid = g_shared->activePid;
+        g_shared->activePid = 0;
+        if (g_shared->openXrD3D11Pid == deadPid) {
+            g_shared->openXrD3D11Pid = 0;
+        }
+        wcscpy_s(g_shared->activeApi, L"Idle");
+        wcscpy_s(g_shared->hookedProcess, L"None");
+        g_shared->appliedCap = 0.0;
+    }
+}
+
 void UpdateTelemetryDisplay() {
+    CheckActiveProcessLiveness();
+
     if (!IsWindowVisible(g_hMainWnd)) return;
 
     wchar_t txtApi[64]{};
@@ -192,37 +233,6 @@ void UpdateTelemetryDisplay() {
     wchar_t txtPipe[128]{};
 
     if (g_shared) {
-        if (g_shared->activePid != 0) {
-            HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, g_shared->activePid);
-            if (hProc) {
-                DWORD waitRes = WaitForSingleObject(hProc, 0);
-                CloseHandle(hProc);
-                if (waitRes == WAIT_OBJECT_0) {
-                    g_shared->activePid = 0;
-                    g_shared->openXrD3D11Pid = 0;
-                    wcscpy_s(g_shared->activeApi, L"Idle");
-                    wcscpy_s(g_shared->hookedProcess, L"None");
-                    g_shared->inputWidth = 0;
-                    g_shared->inputHeight = 0;
-                    g_shared->outputWidth = 0;
-                    g_shared->outputHeight = 0;
-                    g_shared->dxgiFormat = 0;
-                    g_shared->upscaleStatus = 0;
-                    g_shared->lastHResult = 0;
-                    g_shared->appliedCap = 0.0;
-                    g_shared->avgFps = 0.0;
-                    g_shared->onePercentLowFps = 0.0;
-                    vrpacing::LogMessage(vrpacing::LogLevel::Info, "Juego VR cerrado. Telemetria e IPC restablecidos a Idle.");
-                }
-            } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
-                g_shared->activePid = 0;
-                g_shared->openXrD3D11Pid = 0;
-                wcscpy_s(g_shared->activeApi, L"Idle");
-                wcscpy_s(g_shared->hookedProcess, L"None");
-                g_shared->appliedCap = 0.0;
-            }
-        }
-
         const bool hasApi = (g_shared->activeApi[0] != L'\0' &&
                              wcscmp(g_shared->activeApi, L"Idle") != 0 &&
                              wcscmp(g_shared->activeApi, L"none") != 0);
@@ -504,13 +514,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateUiElements(hwnd, cs->hInstance);
             SyncUiWithConfig();
             RegisterOpenXrImplicitLayer();
-            SetTimer(hwnd, IDT_SCANNER_TIMER, 1500, nullptr);
+            SetTimer(hwnd, IDT_SCANNER_TIMER, 2000, nullptr);
             return 0;
         }
 
         case WM_TIMER:
             if (wParam == IDT_SCANNER_TIMER) {
-                g_scanner.PollAndInject(g_hookPath);
+                if (g_shared == nullptr || g_shared->activePid == 0) {
+                    g_scanner.PollAndInject(g_hookPath);
+                }
                 UpdateTelemetryDisplay();
             }
             return 0;

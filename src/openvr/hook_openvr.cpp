@@ -81,6 +81,18 @@ struct OpenVRContext {
 
 OpenVRContext g_ovrCtx;
 
+bool IsOpenXrLayerHandlingD3D11() {
+    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    if (hLayer) {
+        using IsActiveFn = bool(__cdecl*)();
+        auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
+        if (fn && fn()) {
+            return true;
+        }
+    }
+    return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
+}
+
 void EnsureInit() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -111,7 +123,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
     if (!origFn) return vr::VRCompositorError_None;
 
-    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
+    if (IsOpenXrLayerHandlingD3D11()) {
         return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
 
@@ -196,7 +208,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (!origFn) return vr::VRCompositorError_None;
 
-    if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
+    if (IsOpenXrLayerHandlingD3D11()) {
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
