@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cwchar>
 #include <string>
-#include <vector>
 
 #include "vrpacing/config.h"
 #include "vrpacing/shared_state.h"
@@ -108,7 +107,8 @@ public:
 
         const uint32_t flags = shared_->flags;
         cfg.enabled = (flags & kFlagEnabled) != 0;
-        cfg.pacing.enabled = cfg.enabled && ((flags & kFlagPacingEnabled) != 0);
+        cfg.pacing.enabled = cfg.enabled; // Motor core de Frame Pacing siempre activo
+        shared_->flags |= kFlagPacingEnabled;
         cfg.upscaling.enabled = cfg.enabled && ((flags & kFlagUpscalingEnabled) != 0);
         cfg.mask.enabled = false;
 
@@ -127,12 +127,15 @@ public:
                          int32_t hresult = 0) {
         if (!OpenOrCreate() || !shared_) return;
 
-        shared_->activePid = GetCurrentProcessId();
+        const DWORD currentPid = GetCurrentProcessId();
+        const bool pidChanged = (shared_->activePid != currentPid);
+
+        shared_->activePid = currentPid;
         shared_->effectiveHz = effectiveHz;
         shared_->appliedCap = appliedCap;
         shared_->frameCounter++;
 
-        if (apiName && apiName[0] != L'\0') {
+        if (apiName && apiName[0] != L'\0' && wcscmp(shared_->activeApi, apiName) != 0) {
             wcscpy_s(shared_->activeApi, apiName);
         }
         if (inW > 0) shared_->inputWidth = inW;
@@ -143,7 +146,7 @@ public:
         if (status != 0) shared_->upscaleStatus = status;
         if (hresult != 0) shared_->lastHResult = hresult;
 
-        if (shared_->hookedProcess[0] == L'\0' || wcscmp(shared_->hookedProcess, L"None") == 0) {
+        if (pidChanged || shared_->hookedProcess[0] == L'\0' || wcscmp(shared_->hookedProcess, L"None") == 0) {
             wchar_t modPath[MAX_PATH]{};
             if (GetModuleFileNameW(nullptr, modPath, MAX_PATH)) {
                 std::wstring p(modPath);
@@ -155,7 +158,7 @@ public:
             }
         }
 
-        // Si telemetría está pausada, omitir cálculo estadístico por frame (0% CPU)
+        // Si la telemetría en vivo está pausada (bandeja), costo de cómputo nulo
         if (!IsTelemetryActive()) {
             return;
         }
@@ -187,19 +190,18 @@ public:
                 if (s_calcCounter >= 30 && s_sampleCount >= 30) {
                     s_calcCounter = 0;
                     double sumDt = 0.0;
-                    std::vector<double> sorted;
-                    sorted.reserve(s_sampleCount);
+                    double sorted[180]{};
 
                     for (size_t i = 0; i < s_sampleCount; ++i) {
                         sumDt += s_samples[i];
-                        sorted.push_back(s_samples[i]);
+                        sorted[i] = s_samples[i];
                     }
 
                     if (sumDt > 0.0) {
                         shared_->avgFps = static_cast<double>(s_sampleCount) / sumDt;
                     }
 
-                    std::sort(sorted.begin(), sorted.end());
+                    std::sort(sorted, sorted + s_sampleCount);
                     const size_t p99Idx = (std::min)(s_sampleCount - 1, static_cast<size_t>(std::floor(s_sampleCount * 0.99)));
                     const double p99Dt = sorted[p99Idx];
                     if (p99Dt > 0.0) {

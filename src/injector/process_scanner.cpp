@@ -35,6 +35,8 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
     static const wchar_t* const kBlacklist[] = {
         L"cemu.exe",
         L"bettervr_launcher.exe",
+        L"ofxrbridgetray.exe",
+        L"ofxrbridge.exe",
         L"vrserver.exe",
         L"vrcompositor.exe",
         L"vrmonitor.exe",

@@ -4,8 +4,8 @@
 
 namespace vrpacing {
 
-constexpr const wchar_t* kAppVersionString = L"v0.5.2-beta";
-constexpr const char* kAppVersionAnsi = "v0.5.2-beta";
+constexpr const wchar_t* kAppVersionString = L"v0.6.0-beta";
+constexpr const char* kAppVersionAnsi = "v0.6.0-beta";
 constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared_v6";
 
 #pragma pack(push, 1)

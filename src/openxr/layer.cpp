@@ -58,11 +58,6 @@ PFN_xrWaitFrame g_nextWaitFrame = nullptr;
 PFN_xrGetSystemProperties g_nextGetSystemProperties = nullptr;
 PFN_xrEnumerateInstanceExtensionProperties g_nextEnumerateInstanceExtensionProperties = nullptr;
 
-struct SwapchainDimensions {
-    uint32_t width = 0;
-    uint32_t height = 0;
-};
-
 struct ProxySwapchain {
     XrSwapchain realSwapchain = XR_NULL_HANDLE;
     std::vector<ComPtr<ID3D11Texture2D>> appTextures;
@@ -78,7 +73,6 @@ struct ProxySwapchain {
 
 std::mutex g_layerMutex;
 std::unordered_map<XrSwapchain, ProxySwapchain> g_swapchains;
-std::unordered_map<XrSwapchain, SwapchainDimensions> g_chainDims;
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -110,7 +104,7 @@ bool IsCurrentProcessBlacklisted() {
     if (pos != std::wstring::npos) p = p.substr(pos + 1);
     std::transform(p.begin(), p.end(), p.begin(), ::towlower);
 
-    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe") {
+    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe") {
         s_cached = 1;
         return true;
     }
@@ -166,7 +160,6 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.clear();
-    g_chainDims.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
@@ -208,6 +201,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     EnsureInit();
     if (!createInfo || !swapchain) return XR_ERROR_VALIDATION_FAILURE;
 
+    // Si no hay D3D11 nativo (sesión DX12) o proceso en lista negra, no intervenir
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
     }
@@ -222,12 +216,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
                                  (createInfo->width >= 1200 && createInfo->height >= 1200);
 
     if (!isColor || !isEyeResolution || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
-        XrResult r = g_nextCreateSwapchain(session, createInfo, swapchain);
-        if (XR_SUCCEEDED(r)) {
-            std::lock_guard<std::mutex> lock(g_layerMutex);
-            g_chainDims[*swapchain] = { createInfo->width, createInfo->height };
-        }
-        return r;
+        return g_nextCreateSwapchain(session, createInfo, swapchain);
     }
 
     const uint32_t appW = createInfo->width;
@@ -323,7 +312,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains[real] = std::move(proxy);
-    g_chainDims[real] = { appW, appH };
     *swapchain = real;
 
     LogMessage(LogLevel::Info, "OpenXR Proxy Swapchain creado: " +
@@ -337,7 +325,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.erase(swapchain);
-    g_chainDims.erase(swapchain);
     g_upscaler.ClearCache();
     return g_nextDestroySwapchain(swapchain);
 }
@@ -676,12 +663,6 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
     if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
         loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
         loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo)) {
-        return XR_ERROR_INITIALIZATION_FAILED;
-    }
-
-    if (apiLayerRequest->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST ||
-        apiLayerRequest->structVersion != XR_API_LAYER_INFO_STRUCT_VERSION ||
-        apiLayerRequest->structSize != sizeof(XrNegotiateApiLayerRequest)) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
