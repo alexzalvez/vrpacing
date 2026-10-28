@@ -131,6 +131,10 @@ bool IsCurrentProcessBlacklisted() {
     return false;
 }
 
+bool IsOpenCompositeActive() {
+    return GetModuleHandleW(L"openvr_api.dll") != nullptr;
+}
+
 void EnsureInit() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -203,7 +207,13 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
 
     g_shm.SyncConfig(g_cfg);
 
-    if (IsCurrentProcessBlacklisted()) {
+    if (IsCurrentProcessBlacklisted() || IsOpenCompositeActive()) {
+        if (IsOpenCompositeActive() && g_cfg.mask.enabled) {
+            static std::atomic<bool> s_ocMaskLogged{ false };
+            if (!s_ocMaskLogged.exchange(true)) {
+                LogMessage(LogLevel::Info, "OpenXR Layer: OpenComposite detectado (openvr_api.dll). Mascara circular excluida automaticamente; NIS y Pacing activos.");
+            }
+        }
         if (g_nextGetVisibilityMaskKHR) {
             return g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
         }
@@ -375,7 +385,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
     uint32_t* viewCountOutput,
     XrView* views) {
     XrResult res = g_nextLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
-    if (XR_SUCCEEDED(res) && views && viewCountOutput) {
+    if (XR_SUCCEEDED(res) && views && viewCountOutput && !IsOpenCompositeActive()) {
         const uint32_t count = (std::min)(*viewCountOutput, 2u);
         for (uint32_t i = 0; i < count; ++i) {
             const float l = std::tan(views[i].fov.angleLeft);
@@ -405,7 +415,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
 }
 
 XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eventData) {
-    if (eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted()) {
+    if (eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
         for (uint32_t eye = 0; eye < 2; ++eye) {
             if (g_pendingMaskEvent[eye].exchange(false, std::memory_order_relaxed)) {
                 auto* ev = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(eventData);
@@ -759,12 +769,12 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         return g_nextWaitFrame(session, info, state);
     }
 
-    // Sincronizar configuración y detectar cambios de máscara en vivo (incluso en juegos DX12 como Metro Awakening)
+    // Sincronizar configuración y detectar cambios de máscara en vivo (salvo en OpenComposite)
     g_shm.SyncConfig(g_cfg);
 
     static int s_lastMaskState = -1;
     const int curMaskState = g_cfg.mask.enabled ? 1 : 0;
-    if (s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
+    if (!IsOpenCompositeActive() && s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
         g_pendingMaskEvent[0].store(true, std::memory_order_relaxed);
         g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
     }
