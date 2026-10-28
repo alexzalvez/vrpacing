@@ -64,7 +64,6 @@ ovrGetTextureSwapChainBufferDXFn g_ovrGetTextureSwapChainBufferDX = nullptr;
 ovrGetTextureSwapChainDescFn g_ovrGetTextureSwapChainDesc = nullptr;
 ovrGetTextureSwapChainCurrentIndexFn g_ovrGetTextureSwapChainCurrentIndex = nullptr;
 ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
-ovrDestroyTextureSwapChainFn = void(__cdecl*)(ovrSession, ovrTextureSwapChain);
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
 uint32_t g_oculusVersion = 0;
