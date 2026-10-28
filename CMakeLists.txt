@@ -61,8 +61,9 @@ if(WIN32)
     src/openxr/layer.cpp
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
+    src/gfx/vrs_foveated_d3d11.cpp
   )
-  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)
+  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)
   target_compile_definitions(VRPacingLayer PRIVATE XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11)
   set_target_properties(VRPacingLayer PROPERTIES OUTPUT_NAME "VRPacingLayer")
 
@@ -72,6 +73,7 @@ if(WIN32)
     src/oculus/hook_oculus.cpp
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
+    src/gfx/vrs_foveated_d3d11.cpp
     src/injector/process_scanner.cpp
   )
   target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)

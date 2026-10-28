@@ -26,6 +26,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 #include "openvr/hook_openvr.h"
@@ -66,6 +67,9 @@ uint32_t g_lastFormat = 0;
 int32_t g_upscaleStatus = 0;
 int32_t g_lastHResult = 0;
 
+float g_projCenters[2][2] = { { 0.5f, 0.5f }, { 0.5f, 0.5f } };
+bool g_projCentersCalculated = false;
+
 struct OpenVROutputTexture {
     ComPtr<ID3D11Texture2D> texture;
     uint32_t width = 0;
@@ -104,6 +108,31 @@ double QueryOpenVRHardwareHz() {
         return HzTracker::SnapToCommonHz(static_cast<double>(freq)).value_or(std::round(static_cast<double>(freq)));
     }
     return 0.0;
+}
+
+void CalculateOpenVRProjectionCenters() {
+    if (g_projCentersCalculated || !g_origGetGenericInterface) return;
+    int err = 0;
+    auto* sys = reinterpret_cast<vr::IVRSystem*>(g_origGetGenericInterface(vr::IVRSystem_Version, &err));
+    if (!sys) return;
+
+    for (int eye = 0; eye < 2; ++eye) {
+        float left = -1.0f, right = 1.0f, top = -1.0f, bottom = 1.0f;
+        sys->GetProjectionRaw(static_cast<vr::EVREye>(eye), &left, &right, &top, &bottom);
+
+        auto ml = sys->GetEyeToHeadTransform(vr::Eye_Left);
+        auto mr = sys->GetEyeToHeadTransform(vr::Eye_Right);
+        const float dotForward = ml.m[2][0] * mr.m[2][0] + ml.m[2][1] * mr.m[2][1] + ml.m[2][2] * mr.m[2][2];
+        const float clampedDot = (std::max)(-1.0f, (std::min)(1.0f, dotForward));
+        const float cantedAngle = std::abs(std::acos(clampedDot) * 0.5f) * (eye == vr::Eye_Right ? -1.0f : 1.0f);
+        const float canted = std::tan(cantedAngle);
+
+        if (std::abs(left - right) > 0.001f && std::abs(top - bottom) > 0.001f) {
+            g_projCenters[eye][0] = 0.5f * (1.0f + (right + left - 2.0f * canted) / (left - right));
+            g_projCenters[eye][1] = 0.5f * (1.0f + (bottom + top) / (top - bottom));
+        }
+    }
+    g_projCentersCalculated = true;
 }
 
 void EnsureInit() {
@@ -148,6 +177,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
+    VrsFoveatedD3D11::Instance().EndFrame();
 
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
@@ -261,10 +291,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
-    if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
-    }
-
     inSubmit = true;
     auto* inTex = reinterpret_cast<ID3D11Texture2D*>(pTexture->handle);
 
@@ -314,6 +340,28 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     g_lastInW = cropW;
     g_lastInH = cropH;
+
+    CalculateOpenVRProjectionCenters();
+    VrsTextureMode vrsMode = VrsTextureMode::SingleEye;
+    if (inDesc.ArraySize >= 2) {
+        vrsMode = VrsTextureMode::TextureArray;
+    } else if (cropW < inDesc.Width * 3 / 4) {
+        vrsMode = VrsTextureMode::CombinedSideBySide;
+    }
+    VrsFoveatedD3D11::Instance().UpdateTarget(
+        g_ovrCtx.device.Get(),
+        g_ovrCtx.context.Get(),
+        g_cfg.ffr.enabled,
+        cropW,
+        cropH,
+        vrsMode,
+        g_projCenters[0][0], g_projCenters[0][1],
+        g_projCenters[1][0], g_projCenters[1][1]);
+
+    if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
+        inSubmit = false;
+        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+    }
 
     const double s = g_cfg.upscaling.scale;
     uint32_t outW = static_cast<uint32_t>((std::max)(1.0, std::floor(cropW * s)));

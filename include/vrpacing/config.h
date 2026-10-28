@@ -23,6 +23,12 @@ struct MaskConfig {
     bool flipWinding = false;
 };
 
+struct FfrConfig {
+    bool enabled = false;
+    float innerRadius = 0.60f;
+    float outerRadius = 1.00f;
+};
+
 struct PacingConfig {
     bool enabled = true;
     double offsetFps = 0.1;
@@ -39,6 +45,7 @@ struct RuntimeConfig {
     bool enabled = true;
     UpscalingConfig upscaling;
     MaskConfig mask;
+    FfrConfig ffr;
     PacingConfig pacing;
     LoggingConfig logging;
 };

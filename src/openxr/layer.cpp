@@ -31,6 +31,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -225,9 +226,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
     PopulateTangentsIfNeeded(session, viewConfigurationType, viewIndex, minX, maxX, minY, maxY);
 
-    // Si la máscara está desactivada
     if (!g_cfg.mask.enabled) {
-        // Si nunca se activó en la sesión, delegar al runtime original
         if (!g_maskWasActiveInSession.load(std::memory_order_relaxed)) {
             if (g_nextGetVisibilityMaskKHR) {
                 return g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
@@ -237,7 +236,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             return XR_SUCCESS;
         }
 
-        // Si estaba activa y el usuario la desactivó en tiempo real, entregar un rectángulo completo para limpiar el Stencil Buffer
         if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
             visibilityMask->vertexCountOutput = 4;
             visibilityMask->indexCountOutput = 6;
@@ -269,7 +267,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             if (visibilityMask->vertexCapacityInput < 3 || visibilityMask->indexCapacityInput < 3) {
                 return XR_ERROR_SIZE_INSUFFICIENT;
             }
-            // Triángulo degenerado de área cero fuera de vista para vaciar el buffer de ocultación del motor
             visibilityMask->vertices[0] = { minX * 2.0f, minY * 2.0f };
             visibilityMask->vertices[1] = { minX * 2.0f, minY * 2.0f };
             visibilityMask->vertices[2] = { minX * 2.0f, minY * 2.0f };
@@ -478,6 +475,7 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
+    VrsFoveatedD3D11::Instance().Shutdown();
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
     }
@@ -727,6 +725,18 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
     if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
         const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
 
+        if (IsOpenCompositeActive()) {
+            const VrsTextureMode vrsMode = (numSlices >= 2) ? VrsTextureMode::TextureArray : VrsTextureMode::SingleEye;
+            VrsFoveatedD3D11::Instance().UpdateTarget(
+                g_d3d11Device.Get(),
+                g_d3d11Context.Get(),
+                g_cfg.ffr.enabled,
+                proxy.appWidth,
+                proxy.appHeight,
+                vrsMode,
+                0.5f, 0.5f, 0.5f, 0.5f);
+        }
+
         static std::atomic<bool> s_firstFrameLogged{ false };
         if (!s_firstFrameLogged.exchange(true)) {
             LogMessage(LogLevel::Info, "OpenXR [Release] Primer frame: App=" +
@@ -769,8 +779,10 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         return g_nextWaitFrame(session, info, state);
     }
 
-    // Sincronizar configuración y detectar cambios de máscara en vivo (salvo en OpenComposite)
     g_shm.SyncConfig(g_cfg);
+    if (IsOpenCompositeActive()) {
+        VrsFoveatedD3D11::Instance().EndFrame();
+    }
 
     static int s_lastMaskState = -1;
     const int curMaskState = g_cfg.mask.enabled ? 1 : 0;

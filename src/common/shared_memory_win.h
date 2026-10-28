@@ -56,7 +56,7 @@ public:
         if (newlyCreated || shared_->version != 6) {
             *shared_ = {};
             shared_->version = 6;
-            // Máscara desactivada por defecto
+            // Opciones experimentales (Mask y FFR) desactivadas por defecto
             shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled | kFlagTelemetryActive;
             shared_->frameGenDivisor = 1.0;
             shared_->offsetFps = 0.10;
@@ -104,6 +104,7 @@ public:
             cfg.upscaling.enabled = true;
             cfg.pacing.enabled = true;
             cfg.mask.enabled = false;
+            cfg.ffr.enabled = false;
             return;
         }
 
@@ -117,6 +118,10 @@ public:
         cfg.mask.radiusX = 1.00f;
         cfg.mask.radiusY = 1.00f;
         cfg.mask.segments = 256;
+
+        cfg.ffr.enabled = cfg.enabled && ((flags & kFlagFfrEnabled) != 0);
+        cfg.ffr.innerRadius = 0.60f;
+        cfg.ffr.midRadius = 1.00f;
 
         if (shared_->frameGenDivisor > 0.0) {
             cfg.pacing.frameGenDivisor = shared_->frameGenDivisor;

@@ -25,6 +25,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/vrs_foveated_d3d11.h"
 #include "openvr/hook_openvr.h"
 #include "third_party/oculus/ovr_minimal.h"
 #include "vrpacing/frame_limiter_math.h"
@@ -147,7 +148,6 @@ bool IsLegacyOculusLayer(const ovrLayerHeader* header) {
 }
 
 void CleanupOutputChains(OculusSessionContext& ctx) {
-    // Corrección crítica del bug de Double-Free cuando ambos ojos comparten Swapchain
     if (ctx.outputChains[1].chain == ctx.outputChains[0].chain) {
         ctx.outputChains[1].chain = nullptr;
     }
@@ -324,7 +324,6 @@ void ProcessAndUpscaleLayer(ovrSession session,
                             const ovrFovPort inFov[ovrEye_Count],
                             ovrTextureSwapChain outColor[ovrEye_Count],
                             ovrRecti outViewport[ovrEye_Count]) {
-    // Si las dimensiones de entrada cambiaron respecto al swapchain anterior (ej. transición pantalla carga -> 3D)
     if (inLeft && g_oculusCtx && g_ovrGetTextureSwapChainDesc) {
         ovrTextureSwapChainDesc curDesc{};
         if (g_ovrGetTextureSwapChainDesc(session, inLeft, &curDesc) >= 0) {
@@ -349,6 +348,62 @@ void ProcessAndUpscaleLayer(ovrSession session,
     auto& ctx = *g_oculusCtx;
     const bool singleTexture = (inRight == nullptr || inRight == inLeft);
     bool anySuccess = false;
+
+    float leftProjX = 0.5f, leftProjY = 0.5f;
+    float rightProjX = 0.5f, rightProjY = 0.5f;
+    if (inFov) {
+        const float denomX0 = inFov[0].RightTan + inFov[0].LeftTan;
+        if (std::abs(denomX0) > 0.0001f) {
+            leftProjX = 0.5f * (1.0f + (inFov[0].RightTan - inFov[0].LeftTan) / denomX0);
+        }
+        const float denomY0 = inFov[0].DownTan + inFov[0].UpTan;
+        if (std::abs(denomY0) > 0.0001f) {
+            leftProjY = 0.5f * (1.0f + (inFov[0].DownTan - inFov[0].UpTan) / denomY0);
+        }
+
+        const float denomX1 = inFov[1].RightTan + inFov[1].LeftTan;
+        if (std::abs(denomX1) > 0.0001f) {
+            rightProjX = 0.5f * (1.0f + (inFov[1].RightTan - inFov[1].LeftTan) / denomX1);
+        }
+        const float denomY1 = inFov[1].DownTan + inFov[1].UpTan;
+        if (std::abs(denomY1) > 0.0001f) {
+            rightProjY = 0.5f * (1.0f + (inFov[1].DownTan - inFov[1].UpTan) / denomY1);
+        }
+    }
+
+    ovrTextureSwapChainDesc inDesc0{};
+    g_ovrGetTextureSwapChainDesc(session, inLeft, &inDesc0);
+
+    VrsTextureMode vrsMode = VrsTextureMode::SingleEye;
+    if (inDesc0.ArraySize >= 2) {
+        vrsMode = VrsTextureMode::TextureArray;
+    } else if (singleTexture) {
+        vrsMode = VrsTextureMode::CombinedSideBySide;
+    }
+
+    const uint32_t eyeW = static_cast<uint32_t>(inViewport[0].Size.w);
+    const uint32_t eyeH = static_cast<uint32_t>(inViewport[0].Size.h);
+
+    if (ctx.device && ctx.context) {
+        VrsFoveatedD3D11::Instance().UpdateTarget(
+            ctx.device.Get(),
+            ctx.context.Get(),
+            g_cfg.ffr.enabled,
+            eyeW,
+            eyeH,
+            vrsMode,
+            leftProjX, leftProjY,
+            rightProjX, rightProjY
+        );
+    }
+
+    if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
+        outColor[0] = inLeft;
+        outColor[1] = inRight;
+        outViewport[0] = inViewport[0];
+        outViewport[1] = inViewport[1];
+        return;
+    }
 
     if (ctx.context) {
         ID3D11RenderTargetView* nullRTV[1] = { nullptr };
@@ -402,18 +457,8 @@ void ProcessAndUpscaleLayer(ovrSession session,
         dstR.width = static_cast<uint32_t>(std::lround(srcR.width * sx));
         dstR.height = static_cast<uint32_t>(std::lround(srcR.height * sy));
 
-        float projX = 0.5f;
-        float projY = 0.5f;
-        if (inFov) {
-            const float denomX = inFov[eye].RightTan + inFov[eye].LeftTan;
-            if (std::abs(denomX) > 0.0001f) {
-                projX = 0.5f * (1.0f + (inFov[eye].RightTan - inFov[eye].LeftTan) / denomX);
-            }
-            const float denomY = inFov[eye].DownTan + inFov[eye].UpTan;
-            if (std::abs(denomY) > 0.0001f) {
-                projY = 0.5f * (1.0f + (inFov[eye].DownTan - inFov[eye].UpTan) / denomY);
-            }
-        }
+        float projX = (eye == 0) ? leftProjX : rightProjX;
+        float projY = (eye == 0) ? leftProjY : rightProjY;
 
         UpscaleDispatchDesc desc{};
         desc.srcRect = srcR;
@@ -467,6 +512,7 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
 
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
+    VrsFoveatedD3D11::Instance().EndFrame();
 
     if (g_ovrGetPredictedDisplayTime) {
         const double t0 = g_ovrGetPredictedDisplayTime(session, frameIndex);
@@ -527,7 +573,8 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
-    if (!layerPtrList || layerCount == 0 || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
+    const bool doUpscale = g_cfg.upscaling.enabled && (g_cfg.upscaling.scale > 1.0f);
+    if (!layerPtrList || layerCount == 0 || (!doUpscale && !g_cfg.ffr.enabled)) {
         ovrResult res = origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
         inOculusSubmit = false;
         return res;

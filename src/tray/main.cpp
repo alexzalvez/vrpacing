@@ -41,6 +41,7 @@ constexpr UINT ID_BTN_MINIMIZE = 2009;
 constexpr UINT ID_BTN_OPEN_LOG = 2010;
 constexpr UINT ID_BTN_EXIT = 2011;
 constexpr UINT ID_CHECK_MASK = 2012;
+constexpr UINT ID_CHECK_FFR = 2013;
 
 // Tray Menu IDs
 constexpr UINT ID_TRAY_OPEN = 3001;
@@ -55,6 +56,7 @@ constexpr UINT ID_TRAY_TELEMETRY = 3009;
 constexpr UINT ID_TRAY_OPEN_LOG = 3010;
 constexpr UINT ID_TRAY_EXIT = 3011;
 constexpr UINT ID_TRAY_MASK = 3012;
+constexpr UINT ID_TRAY_FFR = 3013;
 
 NOTIFYICONDATAW g_nid{};
 vrpacing::RuntimeConfig g_cfg;
@@ -78,6 +80,7 @@ HWND g_hLblPipeline = nullptr;
 
 HWND g_hChkNis = nullptr;
 HWND g_hChkMask = nullptr;
+HWND g_hChkFfr = nullptr;
 HWND g_hChkPacing = nullptr;
 HWND g_hChkTelemetry = nullptr;
 HWND g_hRadio1x = nullptr;
@@ -131,6 +134,7 @@ void UpdateSharedStateFlags() {
     if (g_cfg.enabled) flags |= vrpacing::kFlagEnabled;
     if (g_cfg.upscaling.enabled) flags |= vrpacing::kFlagUpscalingEnabled;
     if (g_cfg.mask.enabled) flags |= vrpacing::kFlagMaskEnabled;
+    if (g_cfg.ffr.enabled) flags |= vrpacing::kFlagFfrEnabled;
     flags |= vrpacing::kFlagPacingEnabled;
     if (g_telemetryEnabled && IsWindowVisible(g_hMainWnd)) {
         flags |= vrpacing::kFlagTelemetryActive;
@@ -147,6 +151,9 @@ void SyncUiWithConfig() {
     }
     if (g_hChkMask) {
         SendMessageW(g_hChkMask, BM_SETCHECK, g_cfg.mask.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (g_hChkFfr) {
+        SendMessageW(g_hChkFfr, BM_SETCHECK, g_cfg.ffr.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     if (g_hChkPacing) {
         SendMessageW(g_hChkPacing, BM_SETCHECK, BST_CHECKED, 0);
@@ -176,6 +183,8 @@ void SaveAndPropagate() {
     g_cfg.mask.radiusX = 1.00f;
     g_cfg.mask.radiusY = 1.00f;
     g_cfg.mask.segments = 256;
+    g_cfg.ffr.innerRadius = 0.60f;
+    g_cfg.ffr.midRadius = 1.00f;
     g_cfg.pacing.enabled = true;
 
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
@@ -345,6 +354,7 @@ void ShowTrayMenu(HWND hwnd) {
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR)");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR/Oculus/OC)");
     AppendMenuW(hMenu, MF_STRING | (g_telemetryEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_TELEMETRY, L"Live Telemetry (0% CPU on tray)");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_LOG, L"Open Log File");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -483,7 +493,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
 
     HWND hGrpExp = CreateWindowExW(0, L"BUTTON", L" Experimental Options ",
                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                   15, 512, 434, 50, hwnd, nullptr, hInst, nullptr);
+                                   15, 512, 434, 74, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpExp, g_hFontBold);
 
     g_hChkMask = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR Only - 100% Edge)",
@@ -491,19 +501,24 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                  30, 532, 404, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_MASK), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
 
+    g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR / Oculus / OpenComposite)",
+                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                30, 556, 404, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_FFR), hInst, nullptr);
+    SetFont(g_hChkFfr, g_hFontNormal);
+
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                        15, 572, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_MINIMIZE), hInst, nullptr);
+                                        15, 596, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_MINIMIZE), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   163, 572, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_OPEN_LOG), hInst, nullptr);
+                                   163, 596, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_OPEN_LOG), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
     HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit Application",
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    311, 572, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXIT), hInst, nullptr);
+                                    311, 596, 138, 32, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXIT), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -543,6 +558,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 case ID_CHECK_MASK:
                     g_cfg.mask.enabled = (SendMessageW(g_hChkMask, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    SaveAndPropagate();
+                    break;
+
+                case ID_CHECK_FFR:
+                    g_cfg.ffr.enabled = (SendMessageW(g_hChkFfr, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
                     break;
 
@@ -612,6 +632,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SaveAndPropagate();
                     break;
 
+                case ID_TRAY_FFR:
+                    g_cfg.ffr.enabled = !g_cfg.ffr.enabled;
+                    SaveAndPropagate();
+                    break;
+
                 case ID_TRAY_RATE_1X:
                     g_cfg.pacing.frameGenDivisor = 1.0;
                     SaveAndPropagate();
@@ -678,10 +703,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_cfg.upscaling.scale = 2.0f;
     g_cfg.upscaling.radius = 0.60f;
     g_cfg.upscaling.sharpness = 0.0f;
-    g_cfg.mask.enabled = false; // Siempre desactivada por defecto al iniciar
+    g_cfg.mask.enabled = false;
     g_cfg.mask.radiusX = 1.00f;
     g_cfg.mask.radiusY = 1.00f;
     g_cfg.mask.segments = 256;
+    g_cfg.ffr.enabled = false;
+    g_cfg.ffr.innerRadius = 0.60f;
+    g_cfg.ffr.midRadius = 1.00f;
     g_cfg.pacing.enabled = true;
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
         g_cfg.pacing.offsetFps = 0.10;
@@ -706,7 +734,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 656;
+    const int winH = 680;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 

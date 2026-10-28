@@ -4,8 +4,8 @@
 
 namespace vrpacing {
 
-constexpr const wchar_t* kAppVersionString = L"v0.7.2-beta";
-constexpr const char* kAppVersionAnsi = "v0.7.2-beta";
+constexpr const wchar_t* kAppVersionString = L"v0.8.0-beta";
+constexpr const char* kAppVersionAnsi = "v0.8.0-beta";
 constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared_v6";
 
 #pragma pack(push, 1)
@@ -41,6 +41,7 @@ enum SharedFlags : uint32_t {
     kFlagMaskEnabled = 1 << 2,
     kFlagPacingEnabled = 1 << 3,
     kFlagTelemetryActive = 1 << 4,
+    kFlagFfrEnabled = 1 << 5,
 };
 
 } // namespace vrpacing
