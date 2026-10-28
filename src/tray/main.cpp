@@ -104,27 +104,40 @@ void RegisterOpenXrImplicitLayer() {
         return;
     }
 
-    HKEY hKey = nullptr;
     const wchar_t* subKey = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
-    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr);
-    if (status == ERROR_SUCCESS) {
-        DWORD val = 0;
-        RegSetValueExW(hKey, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
-        RegCloseKey(hKey);
+    DWORD val = 0;
+
+    HKEY hKeyCu = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyCu, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(hKeyCu, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKeyCu);
         vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registrada en HKCU.");
+    }
+
+    HKEY hKeyLm = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyLm, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(hKeyLm, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKeyLm);
+        vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registrada en HKLM (soporte procesos elevados).");
     }
 }
 
 void UnregisterOpenXrImplicitLayer() {
     const std::wstring jsonPath = ExeDir() + L"\\VRPacingLayer.json";
-    HKEY hKey = nullptr;
     const wchar_t* subKey = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
-    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hKey);
-    if (status == ERROR_SUCCESS) {
-        DWORD val = 1; // 1 = Deshabilitada
-        RegSetValueExW(hKey, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
-        RegCloseKey(hKey);
+    DWORD val = 1; // 1 = Deshabilitada
+
+    HKEY hKeyCu = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hKeyCu) == ERROR_SUCCESS) {
+        RegSetValueExW(hKeyCu, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKeyCu);
         vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer deshabilitada en HKCU (aplicacion cerrada).");
+    }
+
+    HKEY hKeyLm = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, KEY_SET_VALUE, &hKeyLm) == ERROR_SUCCESS) {
+        RegSetValueExW(hKeyLm, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKeyLm);
     }
 }
 

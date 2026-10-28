@@ -67,7 +67,6 @@ ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
 uint32_t g_oculusVersion = 0;
-std::atomic<bool> g_oculusNonD3D11Passthrough{ false };
 std::atomic<bool> g_waitToBeginCalled{ false };
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
@@ -98,6 +97,7 @@ struct OculusSessionContext {
     ovrTextureSwapChain lastInputChains[ovrEye_Count] = { nullptr, nullptr };
     int lastInputWidth[ovrEye_Count] = { 0, 0 };
     int lastInputHeight[ovrEye_Count] = { 0, 0 };
+    int lastInputFormat[ovrEye_Count] = { 0, 0 };
     OculusOutputSwapchain outputChains[ovrEye_Count];
 };
 
@@ -125,6 +125,25 @@ bool IsOpenXrLayerSessionActive() {
         }
     }
     return IsOpenXrLayerHandlingD3D11();
+}
+
+bool GetSwapChainBufferD3D11(ovrSession session, ovrTextureSwapChain chain, int index, ComPtr<ID3D11Texture2D>& outTex) {
+    outTex.Reset();
+    if (!g_ovrGetTextureSwapChainBufferDX || !chain) return false;
+
+    // 1. Petición directa con __uuidof(ID3D11Texture2D), idéntico a vrperfkit para VirtualDesktop.LibOVRRT64_1.dll
+    if (g_ovrGetTextureSwapChainBufferDX(session, chain, index, IID_PPV_ARGS(outTex.GetAddressOf())) >= 0 && outTex) {
+        return true;
+    }
+
+    // 2. Fallback por IUnknown + QueryInterface
+    ComPtr<IUnknown> unk;
+    if (g_ovrGetTextureSwapChainBufferDX(session, chain, index, IID_PPV_ARGS(unk.GetAddressOf())) >= 0 && unk) {
+        if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(outTex.GetAddressOf()))) && outTex) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void EnsureInit() {
@@ -177,6 +196,7 @@ void CleanupOutputChains(OculusSessionContext& ctx) {
         ctx.lastInputChains[eye] = nullptr;
         ctx.lastInputWidth[eye] = 0;
         ctx.lastInputHeight[eye] = 0;
+        ctx.lastInputFormat[eye] = 0;
     }
     g_upscaler.ClearCache();
 }
@@ -195,14 +215,17 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
     ovrTextureSwapChain inChains[ovrEye_Count] = { leftInput, rightInput };
 
     ovrTextureSwapChainDesc leftDesc{};
-    bool dimChanged = false;
+    bool dimOrFmtChanged = false;
     if (leftInput && g_ovrGetTextureSwapChainDesc && g_ovrGetTextureSwapChainDesc(session, leftInput, &leftDesc) >= 0) {
-        if (ctx.lastInputWidth[0] > 0 && (leftDesc.Width != ctx.lastInputWidth[0] || leftDesc.Height != ctx.lastInputHeight[0])) {
-            dimChanged = true;
+        if (ctx.lastInputWidth[0] > 0 &&
+            (leftDesc.Width != ctx.lastInputWidth[0] ||
+             leftDesc.Height != ctx.lastInputHeight[0] ||
+             static_cast<int>(leftDesc.Format) != ctx.lastInputFormat[0])) {
+            dimOrFmtChanged = true;
         }
     }
 
-    const bool chainsChanged = (leftInput != ctx.lastInputChains[0]) || (rightInput != ctx.lastInputChains[1]) || dimChanged;
+    const bool chainsChanged = (leftInput != ctx.lastInputChains[0]) || (rightInput != ctx.lastInputChains[1]) || dimOrFmtChanged;
     if (!chainsChanged && ctx.outputChains[0].chain != nullptr) {
         return true;
     }
@@ -219,6 +242,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
             ctx.outputChains[1] = ctx.outputChains[0];
             ctx.lastInputWidth[1] = ctx.lastInputWidth[0];
             ctx.lastInputHeight[1] = ctx.lastInputHeight[0];
+            ctx.lastInputFormat[1] = ctx.lastInputFormat[0];
             break;
         }
 
@@ -236,30 +260,30 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
 
         ctx.lastInputWidth[eye] = desc.Width;
         ctx.lastInputHeight[eye] = desc.Height;
+        ctx.lastInputFormat[eye] = static_cast<int>(desc.Format);
         g_lastFormat = static_cast<uint32_t>(desc.Format);
         g_lastInW = desc.Width;
         g_lastInH = desc.Height;
 
         if (!ctx.device) {
-            ComPtr<IUnknown> unk0;
-            if (g_ovrGetTextureSwapChainBufferDX(session, curIn, 0, IID_PPV_ARGS(unk0.GetAddressOf())) >= 0 && unk0) {
-                ComPtr<ID3D11Texture2D> inTex0;
-                if (SUCCEEDED(unk0->QueryInterface(IID_PPV_ARGS(inTex0.GetAddressOf()))) && inTex0) {
-                    inTex0->GetDevice(ctx.device.ReleaseAndGetAddressOf());
-                    if (ctx.device) {
-                        ctx.device->GetImmediateContext(ctx.context.ReleaseAndGetAddressOf());
-                        if (!g_upscaler.IsInitialized()) {
-                            if (!g_upscaler.Initialize(ctx.device.Get())) {
-                                g_upscaleStatus = -2;
-                                LogMessage(LogLevel::Error, "Oculus Hook: Error al inicializar NisUpscalerD3D11.");
-                            }
+            ComPtr<ID3D11Texture2D> inTex0;
+            if (GetSwapChainBufferD3D11(session, curIn, 0, inTex0) && inTex0) {
+                inTex0->GetDevice(ctx.device.ReleaseAndGetAddressOf());
+                if (ctx.device) {
+                    ctx.device->GetImmediateContext(ctx.context.ReleaseAndGetAddressOf());
+                    if (!g_upscaler.IsInitialized()) {
+                        if (!g_upscaler.Initialize(ctx.device.Get())) {
+                            g_upscaleStatus = -2;
+                            LogMessage(LogLevel::Error, "Oculus Hook: Error al inicializar NisUpscalerD3D11.");
                         }
                     }
-                } else {
-                    g_oculusNonD3D11Passthrough.store(true, std::memory_order_relaxed);
-                    LogMessage(LogLevel::Warn, "Oculus Hook: El Swapchain recibido no es D3D11 (juego D3D12/Vulkan detectado). Escalado en passthrough para evitar crash; Frame Pacing activo.");
-                    return false;
                 }
+            } else {
+                static std::atomic<bool> s_warnedNonD3D11{ false };
+                if (!s_warnedNonD3D11.exchange(true)) {
+                    LogMessage(LogLevel::Warn, "Oculus Hook: No se pudo obtener ID3D11Texture2D del Swapchain actual.");
+                }
+                return false;
             }
         }
 
@@ -317,7 +341,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
 
         for (int i = 0; i < len; ++i) {
             ComPtr<ID3D11Texture2D> tex;
-            g_ovrGetTextureSwapChainBufferDX(session, outChain, i, IID_PPV_ARGS(tex.GetAddressOf()));
+            GetSwapChainBufferD3D11(session, outChain, i, tex);
             ctx.outputChains[eye].textures.push_back(tex);
         }
 
@@ -341,10 +365,14 @@ void ProcessAndUpscaleLayer(ovrSession session,
         ovrTextureSwapChainDesc curDesc{};
         if (g_ovrGetTextureSwapChainDesc(session, inLeft, &curDesc) >= 0) {
             if (g_oculusCtx->lastInputWidth[0] > 0 &&
-                (curDesc.Width != g_oculusCtx->lastInputWidth[0] || curDesc.Height != g_oculusCtx->lastInputHeight[0])) {
-                LogMessage(LogLevel::Info, "Oculus Hook: Cambio en resolucion de Swapchain (" +
+                (curDesc.Width != g_oculusCtx->lastInputWidth[0] ||
+                 curDesc.Height != g_oculusCtx->lastInputHeight[0] ||
+                 static_cast<int>(curDesc.Format) != g_oculusCtx->lastInputFormat[0])) {
+                LogMessage(LogLevel::Info, "Oculus Hook: Cambio en resolucion/formato de Swapchain (" +
                            std::to_string(g_oculusCtx->lastInputWidth[0]) + "x" + std::to_string(g_oculusCtx->lastInputHeight[0]) +
-                           " -> " + std::to_string(curDesc.Width) + "x" + std::to_string(curDesc.Height) + "). Recreando salida...");
+                           " FMT=" + std::to_string(g_oculusCtx->lastInputFormat[0]) +
+                           " -> " + std::to_string(curDesc.Width) + "x" + std::to_string(curDesc.Height) +
+                           " FMT=" + std::to_string(curDesc.Format) + "). Recreando salida...");
                 CleanupOutputChains(*g_oculusCtx);
             }
         }
@@ -435,13 +463,8 @@ void ProcessAndUpscaleLayer(ovrSession session,
         g_ovrGetTextureSwapChainCurrentIndex(session, curIn, &inIdx);
         inIdx = (inIdx - 1 + inLen) % inLen;
 
-        ComPtr<IUnknown> unk;
-        if (g_ovrGetTextureSwapChainBufferDX(session, curIn, inIdx, IID_PPV_ARGS(unk.GetAddressOf())) < 0 || !unk) {
-            continue;
-        }
-
         ComPtr<ID3D11Texture2D> inTex;
-        if (FAILED(unk->QueryInterface(IID_PPV_ARGS(inTex.GetAddressOf()))) || !inTex) {
+        if (!GetSwapChainBufferD3D11(session, curIn, inIdx, inTex) || !inTex) {
             continue;
         }
 
@@ -570,10 +593,6 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
                               unsigned int layerCount) {
     if (!origFn) return 0;
 
-    if (g_oculusNonD3D11Passthrough.load(std::memory_order_relaxed)) {
-        return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
-    }
-
     if (IsOpenXrLayerHandlingD3D11() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
     }
@@ -589,10 +608,35 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
 
     if (!g_waitToBeginCalled.load(std::memory_order_relaxed)) {
         VrsFoveatedD3D11::Instance().EndFrame();
+        if (g_ovrGetPredictedDisplayTime) {
+            const double t0 = g_ovrGetPredictedDisplayTime(session, frameIndex);
+            const double t1 = g_ovrGetPredictedDisplayTime(session, frameIndex + 1);
+            const double dt = t1 - t0;
+            if (dt > 0.004 && dt < 0.025) {
+                g_hzTracker.PushHz(std::round(1.0 / dt));
+            }
+        }
     }
 
     const bool doUpscale = g_cfg.upscaling.enabled && (g_cfg.upscaling.scale > 1.0f);
     if (!layerPtrList || layerCount == 0 || (!doUpscale && !g_cfg.ffr.enabled)) {
+        if (!IsOpenXrLayerSessionActive() && !g_waitToBeginCalled.load(std::memory_order_relaxed)) {
+            const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
+            double targetFps = 0.0;
+            if (g_cfg.pacing.enabled) {
+                LimitInputs lim{};
+                lim.hz = hz;
+                lim.offsetFps = g_cfg.pacing.offsetFps;
+                lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
+                lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
+                targetFps = ComputeTargetFps(lim);
+                g_limiter.SetTargetFps(targetFps);
+                g_limiter.WaitBeforeRuntime();
+            }
+            g_shm.UpdateTelemetry(L"LibOVR (VDXR)", hz, targetFps,
+                                  g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                  g_lastFormat, g_upscaleStatus, g_lastHResult);
+        }
         ovrResult res = origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
         inOculusSubmit = false;
         return res;

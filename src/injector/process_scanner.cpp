@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,11 +24,33 @@
 
 #include "common/logging_win.h"
 
+#pragma comment(lib, "advapi32.lib")
+
 namespace vrpacing {
 namespace {
 
 std::unordered_set<DWORD> s_systemIgnoredPids;
 std::unordered_set<DWORD> s_hookedPids;
+std::unordered_set<DWORD> s_accessDeniedLoggedPids;
+
+void EnableDebugPrivilegeOnce() {
+    static std::once_flag s_privFlag;
+    std::call_once(s_privFlag, []() {
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            return;
+        }
+        LUID luid{};
+        if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        }
+        CloseHandle(hToken);
+    });
+}
 
 bool IsBlacklistedProcess(const wchar_t* exeName) {
     if (!exeName) return true;
@@ -66,7 +89,16 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"sihost.exe",
         L"ctfmon.exe",
         L"searchhost.exe",
-        L"devenv.exe"
+        L"devenv.exe",
+        L"csrss.exe",
+        L"smss.exe",
+        L"services.exe",
+        L"lsass.exe",
+        L"wininit.exe",
+        L"winlogon.exe",
+        L"fontdrvhost.exe",
+        L"spoolsv.exe",
+        L"audiodg.exe"
     };
 
     std::wstring lower(exeName);
@@ -89,24 +121,37 @@ bool IsSystemWindowsProcess(HANDLE hProc) {
     return (lower.find(L"\\windows\\") != std::wstring::npos);
 }
 
-bool IsModuleLoadedInProcess(HANDLE hProc, const wchar_t* targetDllName) {
+bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
+    alreadyHooked = false;
     HMODULE hMods[1024];
     DWORD cbNeeded = 0;
-    if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
-        return false;
+    if (!EnumProcessModulesEx(hProc, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_64BIT)) {
+        if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
+            return false;
+        }
     }
 
-    const DWORD count = cbNeeded / sizeof(HMODULE);
-    wchar_t modName[MAX_PATH];
+    const DWORD count = (std::min)(static_cast<DWORD>(1024), static_cast<DWORD>(cbNeeded / sizeof(HMODULE)));
+    wchar_t modName[MAX_PATH]{};
+    bool foundVrMod = false;
 
     for (DWORD i = 0; i < count; ++i) {
         if (GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH)) {
-            if (_wcsicmp(modName, targetDllName) == 0) {
-                return true;
+            if (_wcsicmp(modName, L"VRPacingHook.dll") == 0) {
+                alreadyHooked = true;
+                return false;
+            }
+            if (_wcsicmp(modName, L"openvr_api.dll") == 0 ||
+                _wcsicmp(modName, L"LibOVRRT64_1.dll") == 0 ||
+                _wcsicmp(modName, L"VirtualDesktop.LibOVRRT64_1.dll") == 0 ||
+                _wcsicmp(modName, L"LibPVRRT64_1_X.dll") == 0 ||
+                _wcsicmp(modName, L"openxr_loader.dll") == 0 ||
+                _wcsicmp(modName, L"VirtualDesktop.OpenXR.dll") == 0) {
+                foundVrMod = true;
             }
         }
     }
-    return false;
+    return foundVrMod;
 }
 
 bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
@@ -155,6 +200,8 @@ bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
 } // namespace
 
 bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
+    EnableDebugPrivilegeOnce();
+
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return false;
 
@@ -177,6 +224,8 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
 }
 
 void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
+    EnableDebugPrivilegeOnce();
+
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
 
@@ -190,7 +239,7 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
     if (Process32FirstW(hSnap, &pe)) {
         do {
             const DWORD pid = pe.th32ProcessID;
-            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            if (pid <= 4 || pid == GetCurrentProcessId()) continue;
             if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
             if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
 
@@ -199,26 +248,41 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                 continue;
             }
 
+            HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (hCheck) {
+                const bool isWinSys = IsSystemWindowsProcess(hCheck);
+                CloseHandle(hCheck);
+                if (isWinSys) {
+                    s_systemIgnoredPids.insert(pid);
+                    continue;
+                }
+            }
+
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-            if (!hProc) continue;
-
-            if (IsSystemWindowsProcess(hProc)) {
-                s_systemIgnoredPids.insert(pid);
-                CloseHandle(hProc);
+            if (!hProc) {
+                const DWORD err = GetLastError();
+                if (err == ERROR_ACCESS_DENIED && s_accessDeniedLoggedPids.find(pid) == s_accessDeniedLoggedPids.end()) {
+                    s_accessDeniedLoggedPids.insert(pid);
+                    char exeA[MAX_PATH]{};
+                    size_t converted = 0;
+                    wcstombs_s(&converted, exeA, pe.szExeFile, sizeof(exeA) - 1);
+                    LogMessage(LogLevel::Warn, "ProcessScanner: Acceso denegado al inspeccionar " +
+                               std::string(exeA) + " [PID " + std::to_string(pid) +
+                               "]. Si es un juego VR elevado, ejecuta VRPacingTray.exe como Administrador.");
+                }
                 continue;
             }
 
-            if (IsModuleLoadedInProcess(hProc, L"VRPacingHook.dll")) {
+            bool alreadyHooked = false;
+            const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
+            CloseHandle(hProc);
+
+            if (alreadyHooked) {
                 s_hookedPids.insert(pid);
-                CloseHandle(hProc);
                 continue;
             }
 
-            const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
-            const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||
-                                  IsModuleLoadedInProcess(hProc, L"VirtualDesktop.LibOVRRT64_1.dll");
-
-            if (isOpenVR || isOculus) {
+            if (isVrTarget) {
                 if (InjectDllByPid(pid, dllPath)) {
                     s_hookedPids.insert(pid);
                     char exeA[MAX_PATH]{};
@@ -228,8 +292,6 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                                std::string(exeA) + " [PID " + std::to_string(pid) + "]");
                 }
             }
-
-            CloseHandle(hProc);
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);

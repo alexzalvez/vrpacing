@@ -1,8 +1,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
-#include <chrono>
-#include <thread>
+#include <atomic>
 
 #include "common/logging_win.h"
 #include "openvr/hook_openvr.h"
@@ -10,12 +9,13 @@
 
 namespace {
 
+std::atomic<bool> g_stopWatcher{ false };
+
 DWORD WINAPI HookWatcherThread(LPVOID) {
-    const auto startTime = std::chrono::steady_clock::now();
     bool openvrDone = false;
     bool oculusDone = false;
 
-    while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime).count() < 60) {
+    while (!g_stopWatcher.load(std::memory_order_relaxed)) {
         if (!openvrDone && GetModuleHandleW(L"openvr_api.dll")) {
             vrpacing::InstallOpenVRHooks();
             openvrDone = true;
@@ -32,7 +32,7 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
             break;
         }
 
-        Sleep(200);
+        Sleep(150);
     }
     return 0;
 }
@@ -61,6 +61,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             break;
         }
         case DLL_PROCESS_DETACH:
+            g_stopWatcher.store(true, std::memory_order_relaxed);
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook descargado.");
             break;
         default:
