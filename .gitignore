@@ -23,3 +23,5 @@ vrpacing-logs.zip
 # OS
 .DS_Store
 Thumbs.db
+
+!third_party/nvapi/amd64/nvapi64.lib
