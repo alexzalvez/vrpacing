@@ -26,7 +26,7 @@
 namespace vrpacing {
 namespace {
 
-std::unordered_map<DWORD, int> s_inspectedPids;
+std::unordered_set<DWORD> s_systemIgnoredPids;
 std::unordered_set<DWORD> s_hookedPids;
 
 bool IsBlacklistedProcess(const wchar_t* exeName) {
@@ -76,6 +76,17 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         if (lower == b) return true;
     }
     return false;
+}
+
+bool IsSystemWindowsProcess(HANDLE hProc) {
+    wchar_t fullPath[MAX_PATH]{};
+    DWORD sz = MAX_PATH;
+    if (!QueryFullProcessImageNameW(hProc, 0, fullPath, &sz)) {
+        return false;
+    }
+    std::wstring lower(fullPath);
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    return (lower.find(L"\\windows\\") != std::wstring::npos);
 }
 
 bool IsModuleLoadedInProcess(HANDLE hProc, const wchar_t* targetDllName) {
@@ -169,6 +180,10 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
 
+    if (s_systemIgnoredPids.size() > 4096) {
+        s_systemIgnoredPids.clear();
+    }
+
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
 
@@ -177,25 +192,27 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
             const DWORD pid = pe.th32ProcessID;
             if (pid == 0 || pid == GetCurrentProcessId()) continue;
             if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
-
-            // Evitar escanear repetidamente procesos de Windows ya inspeccionados (0% CPU)
-            auto itInsp = s_inspectedPids.find(pid);
-            if (itInsp != s_inspectedPids.end() && itInsp->second >= 3) {
-                continue;
-            }
+            if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
 
             if (IsBlacklistedProcess(pe.szExeFile)) {
-                s_inspectedPids[pid] = 999;
+                s_systemIgnoredPids.insert(pid);
                 continue;
-            }
-
-            s_inspectedPids[pid]++;
-            if (s_inspectedPids.size() > 4096) {
-                s_inspectedPids.clear();
             }
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProc) continue;
+
+            if (IsSystemWindowsProcess(hProc)) {
+                s_systemIgnoredPids.insert(pid);
+                CloseHandle(hProc);
+                continue;
+            }
+
+            if (IsModuleLoadedInProcess(hProc, L"VRPacingHook.dll")) {
+                s_hookedPids.insert(pid);
+                CloseHandle(hProc);
+                continue;
+            }
 
             const bool isOpenVR = IsModuleLoadedInProcess(hProc, L"openvr_api.dll");
             const bool isOculus = IsModuleLoadedInProcess(hProc, L"LibOVRRT64_1.dll") ||

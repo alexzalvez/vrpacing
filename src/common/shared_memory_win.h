@@ -129,6 +129,20 @@ public:
         }
     }
 
+    void UpdateResolutionAndStatus(uint32_t inW, uint32_t inH,
+                                   uint32_t outW, uint32_t outH,
+                                   uint32_t dxgiFmt, int32_t status,
+                                   int32_t hresult = 0) {
+        if (!OpenOrCreate() || !shared_) return;
+        if (inW > 0) shared_->inputWidth = inW;
+        if (inH > 0) shared_->inputHeight = inH;
+        if (outW > 0) shared_->outputWidth = outW;
+        if (outH > 0) shared_->outputHeight = outH;
+        if (dxgiFmt > 0) shared_->dxgiFormat = dxgiFmt;
+        if (status != 0) shared_->upscaleStatus = status;
+        if (hresult != 0) shared_->lastHResult = hresult;
+    }
+
     void UpdateTelemetry(const wchar_t* apiName, double effectiveHz, double appliedCap,
                          uint32_t inW = 0, uint32_t inH = 0,
                          uint32_t outW = 0, uint32_t outH = 0,

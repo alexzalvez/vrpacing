@@ -353,7 +353,7 @@ void ShowTrayMenu(HWND hwnd) {
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR)");
-    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR/Oculus/OC)");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR/Oculus)");
     AppendMenuW(hMenu, MF_STRING | (g_telemetryEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_TELEMETRY, L"Live Telemetry (0% CPU on tray)");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_LOG, L"Open Log File");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -500,7 +500,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                  30, 532, 404, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_MASK), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
 
-    g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR / Oculus / OpenComposite)",
+    g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Hardware VRS Foveated (OpenVR & Oculus Only - 60%/100%)",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                                 30, 556, 404, 20, hwnd, reinterpret_cast<HMENU>(ID_CHECK_FFR), hInst, nullptr);
     SetFont(g_hChkFfr, g_hFontNormal);
@@ -534,9 +534,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_TIMER:
             if (wParam == IDT_SCANNER_TIMER) {
-                if (g_shared == nullptr || g_shared->activePid == 0) {
-                    g_scanner.PollAndInject(g_hookPath);
-                }
+                g_scanner.PollAndInject(g_hookPath);
                 UpdateTelemetryDisplay();
             }
             return 0;

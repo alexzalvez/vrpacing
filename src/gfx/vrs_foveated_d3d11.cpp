@@ -72,15 +72,12 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargetsAndUAVs(
 }
 
 uint8_t DistanceToVRSLevel(float distance) {
-    // Anillo 1 (0% a 60%): 1x1 Nativo (coincide con el radio de NIS 0.60)
     if (distance < 0.60f) {
         return 0;
     }
-    // Anillo 2 (60% a 100%): 1/2x hasta tocar los 4 bordes del cuadro
     if (distance < 1.00f) {
         return 1;
     }
-    // Anillo 3 (> 100%, las 4 esquinas exteriores): 1/16x (4x4)
     return 2;
 }
 
@@ -224,6 +221,11 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
         return;
     }
 
+    // Ignorar resoluciones transitorias de carga o mini-buffers (< 1000px)
+    if (eyeWidth < 1000 || eyeHeight < 1000) {
+        return;
+    }
+
     if (!EnsureInitializedLocked(device, context)) {
         return;
     }
@@ -289,7 +291,7 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(ID3D11DeviceContext* ctx,
         return;
     }
 
-    if (!enabled_ || numViews == 0 || !renderTargetViews || !renderTargetViews[0] || targetEyeWidth_ <= 0 || targetEyeHeight_ <= 0) {
+    if (!enabled_ || numViews == 0 || !renderTargetViews || !renderTargetViews[0] || targetEyeWidth_ < 1000 || targetEyeHeight_ < 1000) {
         DisableVRS(ctx);
         return;
     }
@@ -315,7 +317,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(ID3D11DeviceContext* ctx,
     D3D11_TEXTURE2D_DESC td{};
     tex->GetDesc(&td);
 
-    // Ignorar shadow maps cuadrados
     if (td.Width == td.Height) {
         DisableVRS(ctx);
         return;

@@ -31,7 +31,6 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
-#include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -40,6 +39,7 @@ using Microsoft::WRL::ComPtr;
 namespace vrpacing {
 
 std::atomic<bool> g_openXrD3D11Active{ false };
+std::atomic<bool> g_openXrSessionActive{ false };
 
 namespace {
 
@@ -134,6 +134,36 @@ bool IsCurrentProcessBlacklisted() {
 
 bool IsOpenCompositeActive() {
     return GetModuleHandleW(L"openvr_api.dll") != nullptr;
+}
+
+void EnsureHookDllLoadedForVdxrBridge() {
+    HMODULE hSelf = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&EnsureHookDllLoadedForVdxrBridge), &hSelf)) {
+        return;
+    }
+
+    wchar_t layerPath[MAX_PATH]{};
+    if (!GetModuleFileNameW(hSelf, layerPath, MAX_PATH)) {
+        return;
+    }
+
+    std::wstring dir(layerPath);
+    const auto pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) {
+        dir.resize(pos);
+    }
+
+    const std::wstring hookPath = dir + L"\\VRPacingHook.dll";
+    HMODULE hHook = LoadLibraryW(hookPath.c_str());
+    if (hHook) {
+        using RefreshFn = void(__cdecl*)();
+        auto fn = reinterpret_cast<RefreshFn>(GetProcAddress(hHook, "VRPacingHook_RefreshHooks"));
+        if (fn) {
+            fn();
+        }
+        LogMessage(LogLevel::Info, "OpenXR Layer (DX12/Vulkan): VRPacingHook.dll enlazado para puente VDXR D3D11 (LibOVR).");
+    }
 }
 
 void EnsureInit() {
@@ -457,16 +487,24 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
     if (!g_d3d11Device) {
         g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-        LogMessage(LogLevel::Info, "OpenXR Layer: Sesion no-D3D11 detectada (DX12/Vulkan). Passthrough activo.");
+        LogMessage(LogLevel::Info, "OpenXR Layer: Sesion DX12/Vulkan detectada. Pacing OpenXR activo; delegando escalado a puente LibOVR D3D11 si usa VDXR.");
     }
 
     XrResult res = g_nextCreateSession(instance, createInfo, session);
     if (XR_SUCCEEDED(res) && session) {
-        std::lock_guard<std::mutex> lock(g_layerMutex);
-        g_activeSession = *session;
-        g_eyeTangents[0].valid = false;
-        g_eyeTangents[1].valid = false;
-        g_maskWasActiveInSession.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_layerMutex);
+            g_activeSession = *session;
+            g_eyeTangents[0].valid = false;
+            g_eyeTangents[1].valid = false;
+            g_maskWasActiveInSession.store(false, std::memory_order_relaxed);
+        }
+        if (!IsCurrentProcessBlacklisted()) {
+            g_openXrSessionActive.store(true, std::memory_order_relaxed);
+            if (!g_d3d11Device) {
+                EnsureHookDllLoadedForVdxrBridge();
+            }
+        }
     }
     return res;
 }
@@ -475,7 +513,7 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-    VrsFoveatedD3D11::Instance().Shutdown();
+    g_openXrSessionActive.store(false, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
     }
@@ -725,18 +763,6 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
     if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
         const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
 
-        if (IsOpenCompositeActive()) {
-            const VrsTextureMode vrsMode = (numSlices >= 2) ? VrsTextureMode::TextureArray : VrsTextureMode::SingleEye;
-            VrsFoveatedD3D11::Instance().UpdateTarget(
-                g_d3d11Device.Get(),
-                g_d3d11Context.Get(),
-                g_cfg.ffr.enabled,
-                proxy.appWidth,
-                proxy.appHeight,
-                vrsMode,
-                0.5f, 0.5f, 0.5f, 0.5f);
-        }
-
         static std::atomic<bool> s_firstFrameLogged{ false };
         if (!s_firstFrameLogged.exchange(true)) {
             LogMessage(LogLevel::Info, "OpenXR [Release] Primer frame: App=" +
@@ -780,9 +806,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     }
 
     g_shm.SyncConfig(g_cfg);
-    if (IsOpenCompositeActive()) {
-        VrsFoveatedD3D11::Instance().EndFrame();
-    }
 
     static int s_lastMaskState = -1;
     const int curMaskState = g_cfg.mask.enabled ? 1 : 0;
@@ -791,14 +814,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
     }
     s_lastMaskState = curMaskState;
-
-    if (!g_d3d11Device) {
-        XrResult res = g_nextWaitFrame(session, info, state);
-        if (XR_SUCCEEDED(res) && state && state->predictedDisplayTime > 0) {
-            g_lastPredictedDisplayTime.store(state->predictedDisplayTime, std::memory_order_relaxed);
-        }
-        return res;
-    }
 
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
@@ -829,7 +844,8 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_limiter.WaitBeforeRuntime();
     }
 
-    g_shm.UpdateTelemetry(L"OpenXR (VDXR)", hz, targetFps,
+    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (DX12/VDXR)";
+    g_shm.UpdateTelemetry(apiLabel, hz, targetFps,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
@@ -1033,6 +1049,10 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCr
 
 extern "C" __declspec(dllexport) bool __cdecl VRPacingLayer_IsActiveD3D11() {
     return vrpacing::g_openXrD3D11Active.load(std::memory_order_relaxed);
+}
+
+extern "C" __declspec(dllexport) bool __cdecl VRPacingLayer_IsActiveSession() {
+    return vrpacing::g_openXrSessionActive.load(std::memory_order_relaxed);
 }
 
 extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(

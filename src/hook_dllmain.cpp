@@ -15,7 +15,7 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
     bool openvrDone = false;
     bool oculusDone = false;
 
-    while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime).count() < 25) {
+    while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime).count() < 60) {
         if (!openvrDone && GetModuleHandleW(L"openvr_api.dll")) {
             vrpacing::InstallOpenVRHooks();
             openvrDone = true;
@@ -39,6 +39,11 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
 
 } // namespace
 
+extern "C" __declspec(dllexport) void __cdecl VRPacingHook_RefreshHooks() {
+    vrpacing::InstallOpenVRHooks();
+    vrpacing::InstallOculusHooks();
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH: {
@@ -46,11 +51,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             vrpacing::InitLogging();
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook cargado en proceso.");
 
-            // Intento inmediato sincronizado
             vrpacing::InstallOpenVRHooks();
             vrpacing::InstallOculusHooks();
 
-            // Vigilante en segundo plano para DLLs cargadas tardiamente por el motor (UE4 / Unity)
             HANDLE hThread = CreateThread(nullptr, 0, HookWatcherThread, nullptr, 0, nullptr);
             if (hThread) {
                 CloseHandle(hThread);

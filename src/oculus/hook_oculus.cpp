@@ -64,10 +64,12 @@ ovrGetTextureSwapChainBufferDXFn g_ovrGetTextureSwapChainBufferDX = nullptr;
 ovrGetTextureSwapChainDescFn g_ovrGetTextureSwapChainDesc = nullptr;
 ovrGetTextureSwapChainCurrentIndexFn g_ovrGetTextureSwapChainCurrentIndex = nullptr;
 ovrCommitTextureSwapChainFn g_ovrCommitTextureSwapChain = nullptr;
+ovrDestroyTextureSwapChainFn = void(__cdecl*)(ovrSession, ovrTextureSwapChain);
 ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
 uint32_t g_oculusVersion = 0;
 std::atomic<bool> g_oculusNonD3D11Passthrough{ false };
+std::atomic<bool> g_waitToBeginCalled{ false };
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
@@ -112,6 +114,18 @@ bool IsOpenXrLayerHandlingD3D11() {
         }
     }
     return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
+}
+
+bool IsOpenXrLayerSessionActive() {
+    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    if (hLayer) {
+        using IsSessionFn = bool(__cdecl*)();
+        auto fn = reinterpret_cast<IsSessionFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveSession"));
+        if (fn && fn()) {
+            return true;
+        }
+    }
+    return IsOpenXrLayerHandlingD3D11();
 }
 
 void EnsureInit() {
@@ -506,10 +520,11 @@ ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
 ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frameIndex) {
     if (!g_origWaitToBeginFrame) return 0;
 
-    if (IsOpenXrLayerHandlingD3D11() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
+    if (IsOpenXrLayerSessionActive() || g_openVrHandlingFrames.load(std::memory_order_relaxed)) {
         return g_origWaitToBeginFrame(session, frameIndex);
     }
 
+    g_waitToBeginCalled.store(true, std::memory_order_relaxed);
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
     VrsFoveatedD3D11::Instance().EndFrame();
@@ -572,6 +587,10 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
 
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
+
+    if (!g_waitToBeginCalled.load(std::memory_order_relaxed)) {
+        VrsFoveatedD3D11::Instance().EndFrame();
+    }
 
     const bool doUpscale = g_cfg.upscaling.enabled && (g_cfg.upscaling.scale > 1.0f);
     if (!layerPtrList || layerCount == 0 || (!doUpscale && !g_cfg.ffr.enabled)) {
@@ -670,6 +689,26 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
         }
     }
 
+    g_shm.UpdateResolutionAndStatus(g_lastInW, g_lastInH, g_lastOutW, g_lastOutH, g_lastFormat, g_upscaleStatus, g_lastHResult);
+
+    if (!IsOpenXrLayerSessionActive() && !g_waitToBeginCalled.load(std::memory_order_relaxed)) {
+        const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
+        double targetFps = 0.0;
+        if (g_cfg.pacing.enabled) {
+            LimitInputs lim{};
+            lim.hz = hz;
+            lim.offsetFps = g_cfg.pacing.offsetFps;
+            lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
+            lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
+            targetFps = ComputeTargetFps(lim);
+            g_limiter.SetTargetFps(targetFps);
+            g_limiter.WaitBeforeRuntime();
+        }
+        g_shm.UpdateTelemetry(L"LibOVR (VDXR)", hz, targetFps,
+                              g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                              g_lastFormat, g_upscaleStatus, g_lastHResult);
+    }
+
     ovrResult res = origFn(session, frameIndex, viewScaleDesc, modifiedLayers.data(), layerCount);
     inOculusSubmit = false;
     return res;
@@ -757,12 +796,12 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(submit));
     }
 
-    if (submit2) {
+    if (submit2 && submit2 != submit) {
         MH_CreateHook(reinterpret_cast<void*>(submit2), reinterpret_cast<void*>(&Hooked_ovrSubmitFrame2), reinterpret_cast<void**>(&g_origSubmit2));
         MH_EnableHook(reinterpret_cast<void*>(submit2));
     }
 
-    if (endFrame) {
+    if (endFrame && endFrame != submit && endFrame != submit2) {
         MH_CreateHook(reinterpret_cast<void*>(endFrame), reinterpret_cast<void*>(&Hooked_ovrEndFrame), reinterpret_cast<void**>(&g_origEndFrame));
         MH_EnableHook(reinterpret_cast<void*>(endFrame));
     }
