@@ -184,7 +184,6 @@ void SaveAndPropagate() {
     g_cfg.mask.radiusY = 1.00f;
     g_cfg.mask.segments = 256;
     g_cfg.ffr.innerRadius = 0.60f;
-    g_cfg.ffr.midRadius = 1.00f;
     g_cfg.pacing.enabled = true;
 
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
@@ -709,7 +708,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_cfg.mask.segments = 256;
     g_cfg.ffr.enabled = false;
     g_cfg.ffr.innerRadius = 0.60f;
-    g_cfg.ffr.midRadius = 1.00f;
     g_cfg.pacing.enabled = true;
     if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
         g_cfg.pacing.offsetFps = 0.10;

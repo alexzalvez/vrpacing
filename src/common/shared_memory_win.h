@@ -56,7 +56,6 @@ public:
         if (newlyCreated || shared_->version != 6) {
             *shared_ = {};
             shared_->version = 6;
-            // Opciones experimentales (Mask y FFR) desactivadas por defecto
             shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled | kFlagTelemetryActive;
             shared_->frameGenDivisor = 1.0;
             shared_->offsetFps = 0.10;
@@ -121,7 +120,6 @@ public:
 
         cfg.ffr.enabled = cfg.enabled && ((flags & kFlagFfrEnabled) != 0);
         cfg.ffr.innerRadius = 0.60f;
-        cfg.ffr.midRadius = 1.00f;
 
         if (shared_->frameGenDivisor > 0.0) {
             cfg.pacing.frameGenDivisor = shared_->frameGenDivisor;
