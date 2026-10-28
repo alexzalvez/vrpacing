@@ -58,6 +58,10 @@ PFN_xrWaitFrame g_nextWaitFrame = nullptr;
 PFN_xrGetSystemProperties g_nextGetSystemProperties = nullptr;
 PFN_xrEnumerateInstanceExtensionProperties g_nextEnumerateInstanceExtensionProperties = nullptr;
 PFN_xrGetVisibilityMaskKHR g_nextGetVisibilityMaskKHR = nullptr;
+PFN_xrLocateViews g_nextLocateViews = nullptr;
+PFN_xrPollEvent g_nextPollEvent = nullptr;
+PFN_xrCreateReferenceSpace g_nextCreateReferenceSpace = nullptr;
+PFN_xrDestroySpace g_nextDestroySpace = nullptr;
 
 struct ProxySwapchain {
     XrSwapchain realSwapchain = XR_NULL_HANDLE;
@@ -74,6 +78,19 @@ struct ProxySwapchain {
 
 std::mutex g_layerMutex;
 std::unordered_map<XrSwapchain, ProxySwapchain> g_swapchains;
+
+struct EyeTangents {
+    float minX = -0.85f;
+    float maxX = 0.85f;
+    float minY = -0.85f;
+    float maxY = 0.85f;
+    bool valid = false;
+};
+
+XrSession g_activeSession = XR_NULL_HANDLE;
+EyeTangents g_eyeTangents[2];
+std::atomic<bool> g_pendingMaskEvent[2]{ false, false };
+std::atomic<XrTime> g_lastPredictedDisplayTime{ 1 };
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -148,10 +165,10 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
 
     if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
         reqVerts = kSeg + 1;
-        reqIndices = kSeg * 3;
+        reqIndices = kSeg * 6; // Doble cara (CCW + CW)
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
         reqVerts = kSeg * 2;
-        reqIndices = kSeg * 6;
+        reqIndices = kSeg * 12; // Doble cara (CCW + CW)
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
         reqVerts = kSeg;
         reqIndices = kSeg;
@@ -173,26 +190,50 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
-    float minX = -1.0f, maxX = 1.0f, minY = -1.0f, maxY = 1.0f;
-    if (g_nextGetVisibilityMaskKHR) {
-        XrVisibilityMaskKHR origMask{ XR_TYPE_VISIBILITY_MASK_KHR };
-        if (XR_SUCCEEDED(g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, &origMask)) &&
-            origMask.vertexCountOutput > 0 && origMask.indexCountOutput > 0) {
-            std::vector<XrVector2f> tmpV(origMask.vertexCountOutput);
-            std::vector<uint32_t> tmpI(origMask.indexCountOutput);
-            origMask.vertexCapacityInput = origMask.vertexCountOutput;
-            origMask.indexCapacityInput = origMask.indexCountOutput;
-            origMask.vertices = tmpV.data();
-            origMask.indices = tmpI.data();
-            if (XR_SUCCEEDED(g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, &origMask))) {
-                minX = tmpV[0].x; maxX = tmpV[0].x;
-                minY = tmpV[0].y; maxY = tmpV[0].y;
-                for (const auto& v : tmpV) {
-                    if (v.x < minX) minX = v.x;
-                    if (v.x > maxX) maxX = v.x;
-                    if (v.y < minY) minY = v.y;
-                    if (v.y > maxY) maxY = v.y;
+    float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
+    {
+        std::lock_guard<std::mutex> lock(g_layerMutex);
+        if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
+            minX = g_eyeTangents[viewIndex].minX;
+            maxX = g_eyeTangents[viewIndex].maxX;
+            minY = g_eyeTangents[viewIndex].minY;
+            maxY = g_eyeTangents[viewIndex].maxY;
+        } else if (session != XR_NULL_HANDLE && g_nextCreateReferenceSpace && g_nextLocateViews && g_nextDestroySpace) {
+            XrReferenceSpaceCreateInfo spaceInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+            spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+            spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+            XrSpace viewSpace = XR_NULL_HANDLE;
+            if (XR_SUCCEEDED(g_nextCreateReferenceSpace(session, &spaceInfo, &viewSpace)) && viewSpace != XR_NULL_HANDLE) {
+                XrViewLocateInfo locateInfo{ XR_TYPE_VIEW_LOCATE_INFO };
+                locateInfo.viewConfigurationType = viewConfigurationType;
+                locateInfo.displayTime = g_lastPredictedDisplayTime.load(std::memory_order_relaxed);
+                locateInfo.space = viewSpace;
+
+                XrViewState viewState{ XR_TYPE_VIEW_STATE };
+                uint32_t viewCount = 0;
+                XrView tmpViews[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+                if (XR_SUCCEEDED(g_nextLocateViews(session, &locateInfo, &viewState, 2, &viewCount, tmpViews))) {
+                    for (uint32_t v = 0; v < (std::min)(viewCount, 2u); ++v) {
+                        const float l = std::tan(tmpViews[v].fov.angleLeft);
+                        const float r = std::tan(tmpViews[v].fov.angleRight);
+                        const float d = std::tan(tmpViews[v].fov.angleDown);
+                        const float u = std::tan(tmpViews[v].fov.angleUp);
+                        if ((r - l) > 0.1f && (u - d) > 0.1f) {
+                            g_eyeTangents[v].minX = l;
+                            g_eyeTangents[v].maxX = r;
+                            g_eyeTangents[v].minY = d;
+                            g_eyeTangents[v].maxY = u;
+                            g_eyeTangents[v].valid = true;
+                        }
+                    }
+                    if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
+                        minX = g_eyeTangents[viewIndex].minX;
+                        maxX = g_eyeTangents[viewIndex].maxX;
+                        minY = g_eyeTangents[viewIndex].minY;
+                        maxY = g_eyeTangents[viewIndex].maxY;
+                    }
                 }
+                g_nextDestroySpace(viewSpace);
             }
         }
     }
@@ -209,9 +250,15 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
             visibilityMask->vertices[i + 1] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
             const uint32_t next = ((i + 1) % kSeg) + 1;
-            visibilityMask->indices[i * 3 + 0] = 0;
-            visibilityMask->indices[i * 3 + 1] = i + 1;
-            visibilityMask->indices[i * 3 + 2] = next;
+            const uint32_t base = i * 6;
+            // CCW
+            visibilityMask->indices[base + 0] = 0;
+            visibilityMask->indices[base + 1] = i + 1;
+            visibilityMask->indices[base + 2] = next;
+            // CW
+            visibilityMask->indices[base + 3] = 0;
+            visibilityMask->indices[base + 4] = next;
+            visibilityMask->indices[base + 5] = i + 1;
         }
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
         for (uint32_t i = 0; i < kSeg; ++i) {
@@ -219,7 +266,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const float ca = std::cos(a);
             const float sa = std::sin(a);
             const float maxComp = (std::max)(std::abs(ca), std::abs(sa));
-            const float outerScale = (maxComp > 0.0001f) ? (1.05f / maxComp) : 1.5f;
+            const float outerScale = (maxComp > 0.0001f) ? (2.0f / maxComp) : 2.5f;
 
             visibilityMask->vertices[i * 2 + 0] = { cx + rx * ca, cy + ry * sa };
             visibilityMask->vertices[i * 2 + 1] = { cx + rx * outerScale * ca, cy + ry * outerScale * sa };
@@ -229,13 +276,22 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const uint32_t i1 = i * 2 + 1;
             const uint32_t n0 = next * 2;
             const uint32_t n1 = next * 2 + 1;
+            const uint32_t base = i * 12;
 
-            visibilityMask->indices[i * 6 + 0] = i0;
-            visibilityMask->indices[i * 6 + 1] = i1;
-            visibilityMask->indices[i * 6 + 2] = n0;
-            visibilityMask->indices[i * 6 + 3] = n0;
-            visibilityMask->indices[i * 6 + 4] = i1;
-            visibilityMask->indices[i * 6 + 5] = n1;
+            // CCW
+            visibilityMask->indices[base + 0] = i0;
+            visibilityMask->indices[base + 1] = i1;
+            visibilityMask->indices[base + 2] = n0;
+            visibilityMask->indices[base + 3] = n0;
+            visibilityMask->indices[base + 4] = i1;
+            visibilityMask->indices[base + 5] = n1;
+            // CW
+            visibilityMask->indices[base + 6] = i0;
+            visibilityMask->indices[base + 7] = n0;
+            visibilityMask->indices[base + 8] = i1;
+            visibilityMask->indices[base + 9] = n0;
+            visibilityMask->indices[base + 10] = n1;
+            visibilityMask->indices[base + 11] = i1;
         }
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
         for (uint32_t i = 0; i < kSeg; ++i) {
@@ -245,11 +301,66 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         }
     }
 
-    static std::atomic<bool> s_maskLogged{ false };
-    if (!s_maskLogged.exchange(true)) {
-        LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 segmentos) aplicada al motor.");
-    }
+    LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 seg, CW+CCW) aplicada al ojo " +
+               std::to_string(viewIndex) + " Type=" + std::to_string(visibilityMaskType) +
+               " Tangents=[" + std::to_string(minX) + ", " + std::to_string(maxX) + ", " +
+               std::to_string(minY) + ", " + std::to_string(maxY) + "]");
+
     return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL Impl_xrLocateViews(
+    XrSession session,
+    const XrViewLocateInfo* viewLocateInfo,
+    XrViewState* viewState,
+    uint32_t viewCapacityInput,
+    uint32_t* viewCountOutput,
+    XrView* views) {
+    XrResult res = g_nextLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+    if (XR_SUCCEEDED(res) && views && viewCountOutput) {
+        const uint32_t count = (std::min)(*viewCountOutput, 2u);
+        for (uint32_t i = 0; i < count; ++i) {
+            const float l = std::tan(views[i].fov.angleLeft);
+            const float r = std::tan(views[i].fov.angleRight);
+            const float d = std::tan(views[i].fov.angleDown);
+            const float u = std::tan(views[i].fov.angleUp);
+            if ((r - l) > 0.1f && (u - d) > 0.1f) {
+                std::lock_guard<std::mutex> lock(g_layerMutex);
+                const bool changed = !g_eyeTangents[i].valid ||
+                                     std::abs(g_eyeTangents[i].minX - l) > 0.002f ||
+                                     std::abs(g_eyeTangents[i].maxX - r) > 0.002f ||
+                                     std::abs(g_eyeTangents[i].minY - d) > 0.002f ||
+                                     std::abs(g_eyeTangents[i].maxY - u) > 0.002f;
+                g_eyeTangents[i].minX = l;
+                g_eyeTangents[i].maxX = r;
+                g_eyeTangents[i].minY = d;
+                g_eyeTangents[i].maxY = u;
+                g_eyeTangents[i].valid = true;
+                if (changed && g_cfg.mask.enabled) {
+                    g_pendingMaskEvent[i].store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    return res;
+}
+
+XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eventData) {
+    if (eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted()) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            if (g_pendingMaskEvent[eye].exchange(false, std::memory_order_relaxed)) {
+                auto* ev = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(eventData);
+                ev->type = XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR;
+                ev->next = nullptr;
+                ev->session = g_activeSession;
+                ev->viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                ev->viewIndex = eye;
+                LogMessage(LogLevel::Info, "OpenXR Layer: Evento XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR enviado para ojo " + std::to_string(eye));
+                return XR_SUCCESS;
+            }
+        }
+    }
+    return g_nextPollEvent ? g_nextPollEvent(instance, eventData) : XR_EVENT_UNAVAILABLE;
 }
 
 XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
@@ -284,7 +395,14 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         LogMessage(LogLevel::Info, "OpenXR Layer: Sesion no-D3D11 detectada (DX12/Vulkan). Passthrough activo.");
     }
 
-    return g_nextCreateSession(instance, createInfo, session);
+    XrResult res = g_nextCreateSession(instance, createInfo, session);
+    if (XR_SUCCEEDED(res) && session) {
+        std::lock_guard<std::mutex> lock(g_layerMutex);
+        g_activeSession = *session;
+        g_eyeTangents[0].valid = false;
+        g_eyeTangents[1].valid = false;
+    }
+    return res;
 }
 
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
@@ -293,6 +411,9 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
+    }
+    if (g_activeSession == session) {
+        g_activeSession = XR_NULL_HANDLE;
     }
     return g_nextDestroySession(session);
 }
@@ -581,6 +702,14 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
     g_shm.SyncConfig(g_cfg);
 
+    static int s_lastMaskState = -1;
+    const int curMaskState = g_cfg.mask.enabled ? 1 : 0;
+    if (s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
+        g_pendingMaskEvent[0].store(true, std::memory_order_relaxed);
+        g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
+    }
+    s_lastMaskState = curMaskState;
+
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
@@ -622,15 +751,20 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     LARGE_INTEGER afterWaitQpc{};
     QueryPerformanceCounter(&afterWaitQpc);
 
-    if (XR_SUCCEEDED(res) && state && state->predictedDisplayPeriod > 0) {
-        const double rawDisplayHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
-        if (rawDisplayHz > 20.0 && rawDisplayHz < 200.0) {
-            const double snappedPanel = HzTracker::SnapToCommonHz(rawDisplayHz).value_or(std::round(rawDisplayHz));
-            if (std::abs(snappedPanel - s_panelHz) > 0.5) {
-                s_panelHz = snappedPanel;
-                s_calibrationFrames = 0;
-                s_sswHalfRateHits = 0;
-                s_sswHalfRateActive = false;
+    if (XR_SUCCEEDED(res) && state) {
+        if (state->predictedDisplayTime > 0) {
+            g_lastPredictedDisplayTime.store(state->predictedDisplayTime, std::memory_order_relaxed);
+        }
+        if (state->predictedDisplayPeriod > 0) {
+            const double rawDisplayHz = 1e9 / static_cast<double>(state->predictedDisplayPeriod);
+            if (rawDisplayHz > 20.0 && rawDisplayHz < 200.0) {
+                const double snappedPanel = HzTracker::SnapToCommonHz(rawDisplayHz).value_or(std::round(rawDisplayHz));
+                if (std::abs(snappedPanel - s_panelHz) > 0.5) {
+                    s_panelHz = snappedPanel;
+                    s_calibrationFrames = 0;
+                    s_sswHalfRateHits = 0;
+                    s_sswHalfRateActive = false;
+                }
             }
         }
     }
@@ -752,6 +886,14 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));
     g_nextGetVisibilityMaskKHR = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetVisibilityMaskKHR));
+    g_nextLocateViews = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrLocateViews", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextLocateViews));
+    g_nextPollEvent = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrPollEvent", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextPollEvent));
+    g_nextCreateReferenceSpace = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrCreateReferenceSpace", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateReferenceSpace));
+    g_nextDestroySpace = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrDestroySpace", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySpace));
 }
 
 } // namespace
@@ -774,6 +916,8 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, 
     else if (strcmp(name, "xrGetSystemProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetSystemProperties);
     else if (strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateInstanceExtensionProperties);
     else if (strcmp(name, "xrGetVisibilityMaskKHR") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetVisibilityMaskKHR);
+    else if (strcmp(name, "xrLocateViews") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrLocateViews);
+    else if (strcmp(name, "xrPollEvent") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrPollEvent);
     else return g_nextGetInstanceProcAddr(instance, name, function);
 
     return XR_SUCCESS;
