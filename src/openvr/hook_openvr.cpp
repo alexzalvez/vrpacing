@@ -19,7 +19,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 #include "minhook/include/MinHook.h"
 #include "common/config_json.h"
@@ -44,7 +43,6 @@ VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
-using GetHiddenAreaMeshFn = vr::HiddenAreaMesh_t* (*)(void*, void*, vr::EVREye, vr::EHiddenAreaMeshType);
 
 std::mutex g_mutex;
 std::unordered_map<void*, WaitGetPosesFn> g_origWaitGetPosesMap;
@@ -53,7 +51,6 @@ std::unordered_set<std::string> g_hookedInterfaces;
 
 WaitGetPosesFn g_activeOrigWaitGetPoses = nullptr;
 SubmitFn g_activeOrigSubmit = nullptr;
-GetHiddenAreaMeshFn g_origGetHiddenAreaMesh = nullptr;
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -107,118 +104,6 @@ double QueryOpenVRHardwareHz() {
         return HzTracker::SnapToCommonHz(static_cast<double>(freq)).value_or(std::round(static_cast<double>(freq)));
     }
     return 0.0;
-}
-
-int GetHiddenAreaMeshVtblIndex() {
-    auto memberPtr = &vr::IVRSystem::GetHiddenAreaMesh;
-    const uint8_t* p = *reinterpret_cast<const uint8_t**>(&memberPtr);
-    if (!p) return -1;
-    if (p[0] == 0xE9) {
-        int32_t rel = *reinterpret_cast<const int32_t*>(p + 1);
-        p = p + 5 + rel;
-    }
-    if (p[0] == 0x48 && p[1] == 0x8B && (p[2] == 0x01 || p[2] == 0x02)) {
-        if (p[3] == 0xFF && p[4] == 0x20) return 0;
-        if (p[3] == 0xFF && p[4] == 0x60) return static_cast<int>(p[5]) / 8;
-        if (p[3] == 0xFF && p[4] == 0xA0) {
-            uint32_t disp = *reinterpret_cast<const uint32_t*>(p + 5);
-            return static_cast<int>(disp / 8);
-        }
-    }
-    return -1;
-}
-
-vr::HiddenAreaMesh_t* HookedGetHiddenAreaMesh(void* rcxParam, void* rdxParam, vr::EVREye eEye, vr::EHiddenAreaMeshType type) {
-    if (!rcxParam) return nullptr;
-
-    if (IsOpenXrLayerHandlingD3D11() || !g_cfg.mask.enabled) {
-        return g_origGetHiddenAreaMesh ? g_origGetHiddenAreaMesh(rcxParam, rdxParam, eEye, type) : reinterpret_cast<vr::HiddenAreaMesh_t*>(rcxParam);
-    }
-
-    constexpr uint32_t kSeg = 256;
-    constexpr float kTwoPi = 6.283185307179586f;
-
-    static std::vector<vr::HmdVector2_t> s_standardVerts;
-    static std::vector<vr::HmdVector2_t> s_inverseVerts;
-    static std::vector<vr::HmdVector2_t> s_lineLoopVerts;
-    static std::once_flag s_meshOnce;
-
-    std::call_once(s_meshOnce, []() {
-        s_standardVerts.reserve(kSeg * 12);
-        s_inverseVerts.reserve(kSeg * 6);
-        s_lineLoopVerts.reserve(kSeg);
-
-        for (uint32_t i = 0; i < kSeg; ++i) {
-            const float a0 = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
-            const float a1 = (static_cast<float>((i + 1) % kSeg) / static_cast<float>(kSeg)) * kTwoPi;
-
-            const float ca0 = std::cos(a0);
-            const float sa0 = std::sin(a0);
-            const float ca1 = std::cos(a1);
-            const float sa1 = std::sin(a1);
-
-            const float maxComp0 = (std::max)(std::abs(ca0), std::abs(sa0));
-            const float outerScale0 = (maxComp0 > 0.0001f) ? (1.05f / maxComp0) : 1.5f;
-
-            const float maxComp1 = (std::max)(std::abs(ca1), std::abs(sa1));
-            const float outerScale1 = (maxComp1 > 0.0001f) ? (1.05f / maxComp1) : 1.5f;
-
-            vr::HmdVector2_t in0 = { 0.5f + 0.5f * ca0, 0.5f + 0.5f * sa0 };
-            vr::HmdVector2_t out0 = { 0.5f + 0.5f * outerScale0 * ca0, 0.5f + 0.5f * outerScale0 * sa0 };
-            vr::HmdVector2_t in1 = { 0.5f + 0.5f * ca1, 0.5f + 0.5f * sa1 };
-            vr::HmdVector2_t out1 = { 0.5f + 0.5f * outerScale1 * ca1, 0.5f + 0.5f * outerScale1 * sa1 };
-
-            // CCW
-            s_standardVerts.push_back(in0);
-            s_standardVerts.push_back(out0);
-            s_standardVerts.push_back(in1);
-
-            s_standardVerts.push_back(in1);
-            s_standardVerts.push_back(out0);
-            s_standardVerts.push_back(out1);
-
-            // CW
-            s_standardVerts.push_back(in0);
-            s_standardVerts.push_back(in1);
-            s_standardVerts.push_back(out0);
-
-            s_standardVerts.push_back(in1);
-            s_standardVerts.push_back(out1);
-            s_standardVerts.push_back(out0);
-
-            // Inverse
-            vr::HmdVector2_t center = { 0.5f, 0.5f };
-            s_inverseVerts.push_back(center);
-            s_inverseVerts.push_back(in0);
-            s_inverseVerts.push_back(in1);
-
-            s_inverseVerts.push_back(center);
-            s_inverseVerts.push_back(in1);
-            s_inverseVerts.push_back(in0);
-
-            // Line loop
-            s_lineLoopVerts.push_back(in0);
-        }
-    });
-
-    auto* retOut = reinterpret_cast<vr::HiddenAreaMesh_t*>(rcxParam);
-    if (type == vr::k_eHiddenAreaMesh_Standard) {
-        retOut->pVertexData = s_standardVerts.data();
-        retOut->unTriangleCount = static_cast<uint32_t>(s_standardVerts.size() / 3);
-    } else if (type == vr::k_eHiddenAreaMesh_Inverse) {
-        retOut->pVertexData = s_inverseVerts.data();
-        retOut->unTriangleCount = static_cast<uint32_t>(s_inverseVerts.size() / 3);
-    } else {
-        retOut->pVertexData = s_lineLoopVerts.data();
-        retOut->unTriangleCount = static_cast<uint32_t>(s_lineLoopVerts.size());
-    }
-
-    static std::atomic<bool> s_openvrMaskLogged{ false };
-    if (!s_openvrMaskLogged.exchange(true)) {
-        LogMessage(LogLevel::Info, "OpenVR: Pre-Render Circular HiddenAreaMesh (r=1.00, 256 segmentos, CW+CCW) aplicada al motor.");
-    }
-
-    return retOut;
 }
 
 void EnsureInit() {
@@ -530,31 +415,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     return res;
 }
 
-void HookSystemInstance(const char* name, void* iface) {
-    if (!iface || !name) return;
-
-    static std::atomic<bool> s_systemHooked{ false };
-    if (s_systemHooked.load(std::memory_order_relaxed)) return;
-
-    int idx = GetHiddenAreaMeshVtblIndex();
-    if (idx < 0) {
-        idx = 34;
-    }
-
-    void** vtbl = *reinterpret_cast<void***>(iface);
-    if (!vtbl || !vtbl[idx]) return;
-
-    MH_Initialize();
-    GetHiddenAreaMeshFn orig = nullptr;
-    if (MH_CreateHook(vtbl[idx], reinterpret_cast<void*>(&HookedGetHiddenAreaMesh), reinterpret_cast<void**>(&orig)) == MH_OK) {
-        if (MH_EnableHook(vtbl[idx]) == MH_OK) {
-            g_origGetHiddenAreaMesh = orig;
-            s_systemHooked.store(true, std::memory_order_relaxed);
-            LogMessage(LogLevel::Info, "OpenVR: Hook GetHiddenAreaMesh instalado en " + std::string(name) + " (vtbl[" + std::to_string(idx) + "])");
-        }
-    }
-}
-
 void HookCompositorInstance(const char* name, void* iface) {
     if (!iface || !name) return;
 
@@ -616,15 +476,6 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
         if (cppIface) {
             HookCompositorInstance(cppName, cppIface);
         }
-    } else if (sName.rfind("IVRSystem_", 0) == 0) {
-        HookSystemInstance(name, iface);
-    } else if (sName.rfind("FnTable:IVRSystem_", 0) == 0) {
-        const char* cppName = name + 8;
-        int dummyErr = 0;
-        void* cppIface = g_origGetGenericInterface(cppName, &dummyErr);
-        if (cppIface) {
-            HookSystemInstance(cppName, cppIface);
-        }
     }
     return iface;
 }
@@ -646,12 +497,6 @@ void InstallOpenVRHooks() {
         MH_EnableHook(reinterpret_cast<void*>(fn));
         s_installed.store(true);
         LogMessage(LogLevel::Info, "Hook OpenVR VR_GetGenericInterface instalado.");
-
-        int err = 0;
-        void* sys = fn(vr::IVRSystem_Version, &err);
-        if (sys) {
-            HookSystemInstance(vr::IVRSystem_Version, sys);
-        }
     }
 }
 

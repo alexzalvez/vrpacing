@@ -91,6 +91,7 @@ XrSession g_activeSession = XR_NULL_HANDLE;
 EyeTangents g_eyeTangents[2];
 std::atomic<bool> g_pendingMaskEvent[2]{ false, false };
 std::atomic<XrTime> g_lastPredictedDisplayTime{ 1 };
+std::atomic<bool> g_maskWasActiveInSession{ false };
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -140,6 +141,57 @@ void EnsureInit() {
     });
 }
 
+void PopulateTangentsIfNeeded(XrSession session, XrViewConfigurationType viewConfigurationType, uint32_t viewIndex,
+                              float& minX, float& maxX, float& minY, float& maxY) {
+    std::lock_guard<std::mutex> lock(g_layerMutex);
+    if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
+        minX = g_eyeTangents[viewIndex].minX;
+        maxX = g_eyeTangents[viewIndex].maxX;
+        minY = g_eyeTangents[viewIndex].minY;
+        maxY = g_eyeTangents[viewIndex].maxY;
+        return;
+    }
+
+    if (session != XR_NULL_HANDLE && g_nextCreateReferenceSpace && g_nextLocateViews && g_nextDestroySpace) {
+        XrReferenceSpaceCreateInfo spaceInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+        XrSpace viewSpace = XR_NULL_HANDLE;
+        if (XR_SUCCEEDED(g_nextCreateReferenceSpace(session, &spaceInfo, &viewSpace)) && viewSpace != XR_NULL_HANDLE) {
+            XrViewLocateInfo locateInfo{ XR_TYPE_VIEW_LOCATE_INFO };
+            locateInfo.viewConfigurationType = viewConfigurationType;
+            locateInfo.displayTime = g_lastPredictedDisplayTime.load(std::memory_order_relaxed);
+            locateInfo.space = viewSpace;
+
+            XrViewState viewState{ XR_TYPE_VIEW_STATE };
+            uint32_t viewCount = 0;
+            XrView tmpViews[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+            if (XR_SUCCEEDED(g_nextLocateViews(session, &locateInfo, &viewState, 2, &viewCount, tmpViews))) {
+                for (uint32_t v = 0; v < (std::min)(viewCount, 2u); ++v) {
+                    const float l = std::tan(tmpViews[v].fov.angleLeft);
+                    const float r = std::tan(tmpViews[v].fov.angleRight);
+                    const float d = std::tan(tmpViews[v].fov.angleDown);
+                    const float u = std::tan(tmpViews[v].fov.angleUp);
+                    if ((r - l) > 0.1f && (u - d) > 0.1f) {
+                        g_eyeTangents[v].minX = l;
+                        g_eyeTangents[v].maxX = r;
+                        g_eyeTangents[v].minY = d;
+                        g_eyeTangents[v].maxY = u;
+                        g_eyeTangents[v].valid = true;
+                    }
+                }
+                if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
+                    minX = g_eyeTangents[viewIndex].minX;
+                    maxX = g_eyeTangents[viewIndex].maxX;
+                    minY = g_eyeTangents[viewIndex].minY;
+                    maxY = g_eyeTangents[viewIndex].maxY;
+                }
+            }
+            g_nextDestroySpace(viewSpace);
+        }
+    }
+}
+
 XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     XrSession session,
     XrViewConfigurationType viewConfigurationType,
@@ -150,7 +202,8 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
 
     g_shm.SyncConfig(g_cfg);
-    if (!g_cfg.mask.enabled || IsCurrentProcessBlacklisted()) {
+
+    if (IsCurrentProcessBlacklisted()) {
         if (g_nextGetVisibilityMaskKHR) {
             return g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
         }
@@ -159,16 +212,80 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         return XR_SUCCESS;
     }
 
+    float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
+    PopulateTangentsIfNeeded(session, viewConfigurationType, viewIndex, minX, maxX, minY, maxY);
+
+    // Si la máscara está desactivada
+    if (!g_cfg.mask.enabled) {
+        // Si nunca se activó en la sesión, delegar al runtime original
+        if (!g_maskWasActiveInSession.load(std::memory_order_relaxed)) {
+            if (g_nextGetVisibilityMaskKHR) {
+                return g_nextGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
+            }
+            visibilityMask->vertexCountOutput = 0;
+            visibilityMask->indexCountOutput = 0;
+            return XR_SUCCESS;
+        }
+
+        // Si estaba activa y el usuario la desactivó en tiempo real, entregar un rectángulo completo para limpiar el Stencil Buffer
+        if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
+            visibilityMask->vertexCountOutput = 4;
+            visibilityMask->indexCountOutput = 6;
+            if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
+                !visibilityMask->vertices || !visibilityMask->indices) {
+                return XR_SUCCESS;
+            }
+            if (visibilityMask->vertexCapacityInput < 4 || visibilityMask->indexCapacityInput < 6) {
+                return XR_ERROR_SIZE_INSUFFICIENT;
+            }
+            visibilityMask->vertices[0] = { minX * 1.2f, minY * 1.2f };
+            visibilityMask->vertices[1] = { maxX * 1.2f, minY * 1.2f };
+            visibilityMask->vertices[2] = { maxX * 1.2f, maxY * 1.2f };
+            visibilityMask->vertices[3] = { minX * 1.2f, maxY * 1.2f };
+            visibilityMask->indices[0] = 0;
+            visibilityMask->indices[1] = 1;
+            visibilityMask->indices[2] = 2;
+            visibilityMask->indices[3] = 0;
+            visibilityMask->indices[4] = 2;
+            visibilityMask->indices[5] = 3;
+            return XR_SUCCESS;
+        } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
+            visibilityMask->vertexCountOutput = 3;
+            visibilityMask->indexCountOutput = 3;
+            if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
+                !visibilityMask->vertices || !visibilityMask->indices) {
+                return XR_SUCCESS;
+            }
+            if (visibilityMask->vertexCapacityInput < 3 || visibilityMask->indexCapacityInput < 3) {
+                return XR_ERROR_SIZE_INSUFFICIENT;
+            }
+            // Triángulo degenerado de área cero fuera de vista para vaciar el buffer de ocultación del motor
+            visibilityMask->vertices[0] = { minX * 2.0f, minY * 2.0f };
+            visibilityMask->vertices[1] = { minX * 2.0f, minY * 2.0f };
+            visibilityMask->vertices[2] = { minX * 2.0f, minY * 2.0f };
+            visibilityMask->indices[0] = 0;
+            visibilityMask->indices[1] = 1;
+            visibilityMask->indices[2] = 2;
+            return XR_SUCCESS;
+        } else {
+            visibilityMask->vertexCountOutput = 0;
+            visibilityMask->indexCountOutput = 0;
+            return XR_SUCCESS;
+        }
+    }
+
+    g_maskWasActiveInSession.store(true, std::memory_order_relaxed);
+
     constexpr uint32_t kSeg = 256;
     uint32_t reqVerts = 0;
     uint32_t reqIndices = 0;
 
     if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
         reqVerts = kSeg + 1;
-        reqIndices = kSeg * 6; // Doble cara (CCW + CW)
+        reqIndices = kSeg * 3;
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
         reqVerts = kSeg * 2;
-        reqIndices = kSeg * 12; // Doble cara (CCW + CW)
+        reqIndices = kSeg * 6;
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
         reqVerts = kSeg;
         reqIndices = kSeg;
@@ -190,54 +307,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
-    float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
-    {
-        std::lock_guard<std::mutex> lock(g_layerMutex);
-        if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
-            minX = g_eyeTangents[viewIndex].minX;
-            maxX = g_eyeTangents[viewIndex].maxX;
-            minY = g_eyeTangents[viewIndex].minY;
-            maxY = g_eyeTangents[viewIndex].maxY;
-        } else if (session != XR_NULL_HANDLE && g_nextCreateReferenceSpace && g_nextLocateViews && g_nextDestroySpace) {
-            XrReferenceSpaceCreateInfo spaceInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
-            spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-            spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
-            XrSpace viewSpace = XR_NULL_HANDLE;
-            if (XR_SUCCEEDED(g_nextCreateReferenceSpace(session, &spaceInfo, &viewSpace)) && viewSpace != XR_NULL_HANDLE) {
-                XrViewLocateInfo locateInfo{ XR_TYPE_VIEW_LOCATE_INFO };
-                locateInfo.viewConfigurationType = viewConfigurationType;
-                locateInfo.displayTime = g_lastPredictedDisplayTime.load(std::memory_order_relaxed);
-                locateInfo.space = viewSpace;
-
-                XrViewState viewState{ XR_TYPE_VIEW_STATE };
-                uint32_t viewCount = 0;
-                XrView tmpViews[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-                if (XR_SUCCEEDED(g_nextLocateViews(session, &locateInfo, &viewState, 2, &viewCount, tmpViews))) {
-                    for (uint32_t v = 0; v < (std::min)(viewCount, 2u); ++v) {
-                        const float l = std::tan(tmpViews[v].fov.angleLeft);
-                        const float r = std::tan(tmpViews[v].fov.angleRight);
-                        const float d = std::tan(tmpViews[v].fov.angleDown);
-                        const float u = std::tan(tmpViews[v].fov.angleUp);
-                        if ((r - l) > 0.1f && (u - d) > 0.1f) {
-                            g_eyeTangents[v].minX = l;
-                            g_eyeTangents[v].maxX = r;
-                            g_eyeTangents[v].minY = d;
-                            g_eyeTangents[v].maxY = u;
-                            g_eyeTangents[v].valid = true;
-                        }
-                    }
-                    if (viewIndex < 2 && g_eyeTangents[viewIndex].valid) {
-                        minX = g_eyeTangents[viewIndex].minX;
-                        maxX = g_eyeTangents[viewIndex].maxX;
-                        minY = g_eyeTangents[viewIndex].minY;
-                        maxY = g_eyeTangents[viewIndex].maxY;
-                    }
-                }
-                g_nextDestroySpace(viewSpace);
-            }
-        }
-    }
-
     const float cx = 0.5f * (minX + maxX);
     const float cy = 0.5f * (minY + maxY);
     const float rx = 0.5f * (maxX - minX);
@@ -250,15 +319,10 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
             visibilityMask->vertices[i + 1] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
             const uint32_t next = ((i + 1) % kSeg) + 1;
-            const uint32_t base = i * 6;
-            // CCW
+            const uint32_t base = i * 3;
             visibilityMask->indices[base + 0] = 0;
             visibilityMask->indices[base + 1] = i + 1;
             visibilityMask->indices[base + 2] = next;
-            // CW
-            visibilityMask->indices[base + 3] = 0;
-            visibilityMask->indices[base + 4] = next;
-            visibilityMask->indices[base + 5] = i + 1;
         }
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
         for (uint32_t i = 0; i < kSeg; ++i) {
@@ -266,7 +330,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const float ca = std::cos(a);
             const float sa = std::sin(a);
             const float maxComp = (std::max)(std::abs(ca), std::abs(sa));
-            const float outerScale = (maxComp > 0.0001f) ? (2.0f / maxComp) : 2.5f;
+            const float outerScale = (maxComp > 0.0001f) ? (1.5f / maxComp) : 2.0f;
 
             visibilityMask->vertices[i * 2 + 0] = { cx + rx * ca, cy + ry * sa };
             visibilityMask->vertices[i * 2 + 1] = { cx + rx * outerScale * ca, cy + ry * outerScale * sa };
@@ -276,22 +340,14 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             const uint32_t i1 = i * 2 + 1;
             const uint32_t n0 = next * 2;
             const uint32_t n1 = next * 2 + 1;
-            const uint32_t base = i * 12;
+            const uint32_t base = i * 6;
 
-            // CCW
             visibilityMask->indices[base + 0] = i0;
             visibilityMask->indices[base + 1] = i1;
             visibilityMask->indices[base + 2] = n0;
             visibilityMask->indices[base + 3] = n0;
             visibilityMask->indices[base + 4] = i1;
             visibilityMask->indices[base + 5] = n1;
-            // CW
-            visibilityMask->indices[base + 6] = i0;
-            visibilityMask->indices[base + 7] = n0;
-            visibilityMask->indices[base + 8] = i1;
-            visibilityMask->indices[base + 9] = n0;
-            visibilityMask->indices[base + 10] = n1;
-            visibilityMask->indices[base + 11] = i1;
         }
     } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
         for (uint32_t i = 0; i < kSeg; ++i) {
@@ -301,10 +357,12 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         }
     }
 
-    LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 seg, CW+CCW) aplicada al ojo " +
-               std::to_string(viewIndex) + " Type=" + std::to_string(visibilityMaskType) +
-               " Tangents=[" + std::to_string(minX) + ", " + std::to_string(maxX) + ", " +
-               std::to_string(minY) + ", " + std::to_string(maxY) + "]");
+    static std::atomic<bool> s_loggedEye[2]{ false, false };
+    if (viewIndex < 2 && !s_loggedEye[viewIndex].exchange(true)) {
+        LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 seg) aplicada al ojo " +
+                   std::to_string(viewIndex) + " Tangents=[" + std::to_string(minX) + ", " + std::to_string(maxX) +
+                   ", " + std::to_string(minY) + ", " + std::to_string(maxY) + "]");
+    }
 
     return XR_SUCCESS;
 }
@@ -326,11 +384,12 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
             const float u = std::tan(views[i].fov.angleUp);
             if ((r - l) > 0.1f && (u - d) > 0.1f) {
                 std::lock_guard<std::mutex> lock(g_layerMutex);
-                const bool changed = !g_eyeTangents[i].valid ||
-                                     std::abs(g_eyeTangents[i].minX - l) > 0.002f ||
-                                     std::abs(g_eyeTangents[i].maxX - r) > 0.002f ||
-                                     std::abs(g_eyeTangents[i].minY - d) > 0.002f ||
-                                     std::abs(g_eyeTangents[i].maxY - u) > 0.002f;
+                const bool wasValid = g_eyeTangents[i].valid;
+                const bool changed = wasValid && (
+                                     std::abs(g_eyeTangents[i].minX - l) > 0.005f ||
+                                     std::abs(g_eyeTangents[i].maxX - r) > 0.005f ||
+                                     std::abs(g_eyeTangents[i].minY - d) > 0.005f ||
+                                     std::abs(g_eyeTangents[i].maxY - u) > 0.005f);
                 g_eyeTangents[i].minX = l;
                 g_eyeTangents[i].maxX = r;
                 g_eyeTangents[i].minY = d;
@@ -355,7 +414,6 @@ XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eve
                 ev->session = g_activeSession;
                 ev->viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 ev->viewIndex = eye;
-                LogMessage(LogLevel::Info, "OpenXR Layer: Evento XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR enviado para ojo " + std::to_string(eye));
                 return XR_SUCCESS;
             }
         }
@@ -401,6 +459,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         g_activeSession = *session;
         g_eyeTangents[0].valid = false;
         g_eyeTangents[1].valid = false;
+        g_maskWasActiveInSession.store(false, std::memory_order_relaxed);
     }
     return res;
 }
@@ -696,10 +755,11 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* info, XrFrameState* state) {
     EnsureInit();
 
-    if (IsCurrentProcessBlacklisted() || !g_d3d11Device) {
+    if (IsCurrentProcessBlacklisted()) {
         return g_nextWaitFrame(session, info, state);
     }
 
+    // Sincronizar configuración y detectar cambios de máscara en vivo (incluso en juegos DX12 como Metro Awakening)
     g_shm.SyncConfig(g_cfg);
 
     static int s_lastMaskState = -1;
@@ -709,6 +769,14 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
     }
     s_lastMaskState = curMaskState;
+
+    if (!g_d3d11Device) {
+        XrResult res = g_nextWaitFrame(session, info, state);
+        if (XR_SUCCEEDED(res) && state && state->predictedDisplayTime > 0) {
+            g_lastPredictedDisplayTime.store(state->predictedDisplayTime, std::memory_order_relaxed);
+        }
+        return res;
+    }
 
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
