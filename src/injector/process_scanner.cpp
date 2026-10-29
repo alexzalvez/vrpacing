@@ -31,6 +31,7 @@ namespace {
 
 std::unordered_set<DWORD> s_systemIgnoredPids;
 std::unordered_set<DWORD> s_hookedPids;
+std::unordered_map<DWORD, int> s_openFailCounts;
 
 void EnableDebugPrivilegeOnce() {
     static std::once_flag s_privFlag;
@@ -63,6 +64,9 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"bettervr_launcher.exe",
         L"ofxrbridgetray.exe",
         L"ofxrbridge.exe",
+        L"witcher3.exe",
+        L"titanfall2.exe",
+        L"titanfall2vrlauncher.exe",
         L"vrserver.exe",
         L"vrcompositor.exe",
         L"vrmonitor.exe",
@@ -259,14 +263,18 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
 
     if (s_systemIgnoredPids.size() > 4096) {
         s_systemIgnoredPids.clear();
+        s_openFailCounts.clear();
     }
 
+    std::unordered_set<DWORD> activeSnapPids;
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
 
     if (Process32FirstW(hSnap, &pe)) {
         do {
             const DWORD pid = pe.th32ProcessID;
+            activeSnapPids.insert(pid);
+
             if (pid <= 4 || pid == GetCurrentProcessId()) continue;
             if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
             if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
@@ -285,15 +293,23 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                     continue;
                 }
             } else {
-                s_systemIgnoredPids.insert(pid);
+                if (++s_openFailCounts[pid] >= 5) {
+                    s_systemIgnoredPids.insert(pid);
+                    s_openFailCounts.erase(pid);
+                }
                 continue;
             }
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProc) {
-                s_systemIgnoredPids.insert(pid);
+                if (++s_openFailCounts[pid] >= 5) {
+                    s_systemIgnoredPids.insert(pid);
+                    s_openFailCounts.erase(pid);
+                }
                 continue;
             }
+
+            s_openFailCounts.erase(pid);
 
             bool alreadyHooked = false;
             const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
@@ -317,6 +333,14 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
+
+    for (auto it = s_hookedPids.begin(); it != s_hookedPids.end();) {
+        if (activeSnapPids.find(*it) == activeSnapPids.end()) {
+            it = s_hookedPids.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace vrpacing

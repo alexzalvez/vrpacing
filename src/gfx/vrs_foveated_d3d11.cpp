@@ -145,9 +145,11 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
         arrayWidth_ = 0;
         arrayHeight_ = 0;
         vrsCurrentlyBound_ = false;
+        fastBound_.store(false, std::memory_order_relaxed);
 
         device_ = dev;
         context_ = ctx;
+        immediateContext_.store(ctx, std::memory_order_relaxed);
 
         if (!nvapiLoaded_) {
             if (NvAPI_Initialize() != NVAPI_OK) {
@@ -213,6 +215,7 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
                                     float rightProjY) {
     std::lock_guard<std::mutex> lock(mutex_);
     enabled_ = enabled;
+    fastEnabled_.store(enabled, std::memory_order_relaxed);
 
     if (!enabled) {
         if (vrsCurrentlyBound_ && context_) {
@@ -226,6 +229,8 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
     }
 
     if (!EnsureInitializedLocked(device, context)) {
+        enabled_ = false;
+        fastEnabled_.store(false, std::memory_order_relaxed);
         return;
     }
 
@@ -239,6 +244,9 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
 }
 
 void VrsFoveatedD3D11::EndFrame() {
+    if (!fastEnabled_.load(std::memory_order_relaxed) && !fastBound_.load(std::memory_order_relaxed)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (currentSingleEyeRT_ > 0) {
         if (currentSingleEyeRT_ != singleEyeOrder_.size()) {
@@ -279,14 +287,24 @@ void VrsFoveatedD3D11::Shutdown() {
     arrayHeight_ = 0;
     device_.Reset();
     context_.Reset();
+    immediateContext_.store(nullptr, std::memory_order_relaxed);
     enabled_ = false;
+    fastEnabled_.store(false, std::memory_order_relaxed);
+    fastBound_.store(false, std::memory_order_relaxed);
 }
 
 void VrsFoveatedD3D11::OnPostOMSetRenderTargets(ID3D11DeviceContext* ctx,
                                                 UINT numViews,
                                                 ID3D11RenderTargetView* const* renderTargetViews) {
+    if (!ctx || ctx != immediateContext_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!fastEnabled_.load(std::memory_order_relaxed) && !fastBound_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!nvapiSupported_ || !device_ || !ctx) {
+    if (!nvapiSupported_ || !device_ || ctx != context_.Get()) {
         return;
     }
 
@@ -361,6 +379,7 @@ void VrsFoveatedD3D11::EnableVRS(ID3D11DeviceContext* ctx) {
 
     if (NvAPI_D3D11_RSSetViewportsPixelShadingRates(ctx, &srd) == NVAPI_OK) {
         vrsCurrentlyBound_ = true;
+        fastBound_.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -381,6 +400,7 @@ void VrsFoveatedD3D11::DisableVRS(ID3D11DeviceContext* ctx) {
     NvAPI_D3D11_RSSetViewportsPixelShadingRates(ctx, &srd);
     NvAPI_D3D11_RSSetShadingRateResourceView(ctx, nullptr);
     vrsCurrentlyBound_ = false;
+    fastBound_.store(false, std::memory_order_relaxed);
 }
 
 void VrsFoveatedD3D11::ApplySingleEyeVRS(ID3D11DeviceContext* ctx, int eye, int width, int height) {

@@ -316,7 +316,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     D3D11_TEXTURE2D_DESC inDesc{};
     inTex->GetDesc(&inDesc);
-    g_lastFormat = static_cast<uint32_t>(inDesc.Format);
 
     static const vr::VRTextureBounds_t defaultBounds{ 0.0f, 0.0f, 1.0f, 1.0f };
     const vr::VRTextureBounds_t* b = pBounds ? pBounds : &defaultBounds;
@@ -333,11 +332,13 @@ vr::EVRCompositorError HookedSubmit(void* self,
     const uint32_t cropW = static_cast<uint32_t>(std::lround((uMax - uMin) * inDesc.Width));
     const uint32_t cropH = static_cast<uint32_t>(std::lround((vMax - vMin) * inDesc.Height));
 
-    if (cropW == 0 || cropH == 0) {
+    // Ignorar buffers vacios o mini-buffers de pantallas de carga (< 1000px) para evitar realocar VRAM
+    if (cropW < 1000 || cropH < 1000) {
         inSubmit = false;
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
+    g_lastFormat = static_cast<uint32_t>(inDesc.Format);
     g_lastInW = cropW;
     g_lastInH = cropH;
 

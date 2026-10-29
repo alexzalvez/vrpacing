@@ -153,6 +153,18 @@ public:
         const DWORD currentPid = GetCurrentProcessId();
         const bool pidChanged = (shared_->activePid != currentPid);
 
+        if (pidChanged) {
+            shared_->inputWidth = 0;
+            shared_->inputHeight = 0;
+            shared_->outputWidth = 0;
+            shared_->outputHeight = 0;
+            shared_->dxgiFormat = 0;
+            shared_->upscaleStatus = 0;
+            shared_->lastHResult = 0;
+            shared_->avgFps = 0.0;
+            shared_->onePercentLowFps = 0.0;
+        }
+
         shared_->activePid = currentPid;
         shared_->effectiveHz = effectiveHz;
         shared_->appliedCap = appliedCap;

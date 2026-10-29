@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -65,6 +66,10 @@ private:
     void SetupSingleEyeVRS(int eye, int width, int height, float projX, float projY);
     void SetupCombinedVRS(int width, int height, float leftProjX, float leftProjY, float rightProjX, float rightProjY);
     void SetupArrayVRS(int width, int height, float leftProjX, float leftProjY, float rightProjX, float rightProjY);
+
+    std::atomic<ID3D11DeviceContext*> immediateContext_{ nullptr };
+    std::atomic<bool> fastEnabled_{ false };
+    std::atomic<bool> fastBound_{ false };
 
     std::mutex mutex_;
     bool nvapiLoaded_ = false;

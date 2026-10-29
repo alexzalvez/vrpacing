@@ -73,7 +73,6 @@ if(WIN32)
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
-    src/injector/process_scanner.cpp
   )
   target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)
   set_target_properties(VRPacingHook PROPERTIES OUTPUT_NAME "VRPacingHook")
