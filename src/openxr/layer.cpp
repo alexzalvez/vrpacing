@@ -741,7 +741,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
     }
 
     const auto& proxy = it->second;
-    const uint2_t count = static_cast<uint32_t>(proxy.appTextures.size());
+    const uint32_t count = static_cast<uint32_t>(proxy.appTextures.size());
     if (imageCountOutput) *imageCountOutput = count;
     if (imageCapacityInput == 0 || !images) return XR_SUCCESS;
 
