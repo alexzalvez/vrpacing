@@ -136,7 +136,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     }
 
     initialized_ = true;
-    LogMessage(LogLevel::Info, "NisUpscalerD3D11 inicializado correctamente con Compute Shader compilado.");
+    LogMessage(LogLevel::Info, "NisUpscalerD3D11 initialized successfully with compiled Compute Shader.");
     return true;
 }
 

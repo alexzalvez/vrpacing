@@ -71,7 +71,7 @@ void InitLogging(const std::wstring& customPath) {
 
     std::ofstream ofs(g_logFilePath, std::ios::app);
     if (ofs.is_open()) {
-        ofs << "=== VRPacing " << kAppVersionAnsi << " | Proceso: "
+        ofs << "=== VRPacing " << kAppVersionAnsi << " | Process: "
             << exeA << " [PID " << pid << "] ===" << std::endl;
     }
 }
