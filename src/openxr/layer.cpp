@@ -904,9 +904,8 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
-    static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_warmupFrames = 0;
     static uint32_t s_sswHalfRateHits = 0;
-    static uint32_t s_heavyWaitStreak = 0;
     static double s_panelHz = 90.0;
     static bool s_sswHalfRateActive = false;
 
@@ -920,7 +919,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
-    if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
+    if (g_cfg.pacing.enabled && s_warmupFrames >= 30) {
         LimitInputs lim{};
         lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
@@ -935,9 +934,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     g_shm.UpdateTelemetry(apiLabel, hz, targetFps,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
-
-    LARGE_INTEGER beforeWaitQpc{};
-    QueryPerformanceCounter(&beforeWaitQpc);
 
     XrResult res = g_nextWaitFrame(session, info, state);
 
@@ -954,7 +950,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
                 const double snappedPanel = HzTracker::SnapToCommonHz(rawDisplayHz).value_or(std::round(rawDisplayHz));
                 if (std::abs(snappedPanel - s_panelHz) > 0.5) {
                     s_panelHz = snappedPanel;
-                    s_calibrationFrames = 0;
+                    s_warmupFrames = 0;
                     s_sswHalfRateHits = 0;
                     s_sswHalfRateActive = false;
                 }
@@ -963,38 +959,39 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     }
 
     if (s_qpcFreq > 0) {
-        const double waitMs = static_cast<double>(afterWaitQpc.QuadPart - beforeWaitQpc.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq);
-
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.004 && dt < 0.050) {
-                const double measuredHz = 1.0 / dt;
-                if (s_calibrationFrames < 45) {
-                    s_calibrationFrames++;
+            if (dt > 0.250) {
+                s_warmupFrames = 0;
+                s_sswHalfRateHits = 0;
+                s_sswHalfRateActive = false;
+            } else if (dt > 0.004 && dt < 0.050) {
+                if (s_warmupFrames < 30) {
+                    s_warmupFrames++;
+                }
+
+                if (!s_sswHalfRateActive) {
+                    const double measuredHz = 1.0 / dt;
                     const double halfPanel = s_panelHz * 0.5;
-                    if (waitMs > 2.0 && std::abs(measuredHz - halfPanel) <= (halfPanel * 0.04)) {
+                    if (std::abs(measuredHz - halfPanel) <= (halfPanel * 0.035)) {
                         s_sswHalfRateHits++;
-                    }
-                    if (s_calibrationFrames == 45) {
-                        s_sswHalfRateActive = (s_sswHalfRateHits >= 20);
-                    }
-                } else {
-                    if (waitMs > 5.0) {
-                        s_heavyWaitStreak++;
-                        if (s_heavyWaitStreak >= 45) {
-                            s_heavyWaitStreak = 0;
-                            s_calibrationFrames = 0;
+                        if (s_sswHalfRateHits >= 40) {
+                            s_sswHalfRateActive = true;
                             s_sswHalfRateHits = 0;
-                            s_sswHalfRateActive = false;
+                            LogMessage(LogLevel::Info, "OpenXR Pacing: SSW half-rate lock detected (" +
+                                       std::to_string(static_cast<int>(std::lround(halfPanel))) + " Hz / " +
+                                       std::to_string(static_cast<int>(std::lround(s_panelHz))) + " Hz panel).");
                         }
-                    } else {
-                        s_heavyWaitStreak = 0;
+                    } else if (measuredHz > (halfPanel * 1.10)) {
+                        s_sswHalfRateHits = 0;
+                    } else if (s_sswHalfRateHits > 0) {
+                        s_sswHalfRateHits--;
                     }
                 }
             }
         }
+        s_lastWaitExitQpc = afterWaitQpc.QuadPart;
     }
-    s_lastWaitExitQpc = afterWaitQpc.QuadPart;
     return res;
 }
 

@@ -181,9 +181,9 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
 
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
-    static uint32_t s_calibrationFrames = 0;
+    static uint32_t s_warmupFrames = 0;
     static uint32_t s_sswHalfRateHits = 0;
-    static uint32_t s_heavyWaitStreak = 0;
+    static uint32_t s_hzPollCounter = 0;
     static double s_panelHz = 90.0;
     static bool s_sswHalfRateActive = false;
 
@@ -193,18 +193,23 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         s_qpcFreq = f.QuadPart;
     }
 
-    if (s_calibrationFrames == 0) {
+    if (s_hzPollCounter == 0) {
         const double hwHz = QueryOpenVRHardwareHz();
-        if (hwHz > 0.0) {
+        if (hwHz > 0.0 && std::abs(hwHz - s_panelHz) > 0.5) {
             s_panelHz = hwHz;
+            s_warmupFrames = 0;
+            s_sswHalfRateHits = 0;
+            s_sswHalfRateActive = false;
         }
     }
+    s_hzPollCounter = (s_hzPollCounter + 1) % 180;
 
+    const bool hasSubmitted3D = g_openVrHandlingFrames.load(std::memory_order_relaxed);
     const double effectiveHz = s_sswHalfRateActive ? (s_panelHz * 0.5) : s_panelHz;
     const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
-    if (g_cfg.pacing.enabled && s_calibrationFrames >= 45) {
+    if (g_cfg.pacing.enabled && hasSubmitted3D && s_warmupFrames >= 30) {
         LimitInputs lim{};
         lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
@@ -219,47 +224,45 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
 
-    LARGE_INTEGER beforeWaitQpc{};
-    QueryPerformanceCounter(&beforeWaitQpc);
-
     vr::EVRCompositorError res = origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
 
     LARGE_INTEGER afterWaitQpc{};
     QueryPerformanceCounter(&afterWaitQpc);
 
-    if (s_qpcFreq > 0) {
-        const double waitMs = static_cast<double>(afterWaitQpc.QuadPart - beforeWaitQpc.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq);
-
+    if (hasSubmitted3D && s_qpcFreq > 0) {
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
-            if (dt > 0.004 && dt < 0.050) {
-                const double measuredHz = 1.0 / dt;
-                if (s_calibrationFrames < 45) {
-                    s_calibrationFrames++;
+            if (dt > 0.250) {
+                s_warmupFrames = 0;
+                s_sswHalfRateHits = 0;
+                s_sswHalfRateActive = false;
+            } else if (dt > 0.004 && dt < 0.050) {
+                if (s_warmupFrames < 30) {
+                    s_warmupFrames++;
+                }
+
+                if (!s_sswHalfRateActive) {
+                    const double measuredHz = 1.0 / dt;
                     const double halfPanel = s_panelHz * 0.5;
-                    if (waitMs > 2.0 && std::abs(measuredHz - halfPanel) <= (halfPanel * 0.04)) {
+                    if (std::abs(measuredHz - halfPanel) <= (halfPanel * 0.035)) {
                         s_sswHalfRateHits++;
-                    }
-                    if (s_calibrationFrames == 45) {
-                        s_sswHalfRateActive = (s_sswHalfRateHits >= 20);
-                    }
-                } else {
-                    if (waitMs > 5.0) {
-                        s_heavyWaitStreak++;
-                        if (s_heavyWaitStreak >= 45) {
-                            s_heavyWaitStreak = 0;
-                            s_calibrationFrames = 0;
+                        if (s_sswHalfRateHits >= 40) {
+                            s_sswHalfRateActive = true;
                             s_sswHalfRateHits = 0;
-                            s_sswHalfRateActive = false;
+                            LogMessage(LogLevel::Info, "OpenVR Pacing: SSW half-rate lock detected (" +
+                                       std::to_string(static_cast<int>( std::lround(halfPanel))) + " Hz / " +
+                                       std::to_string(static_cast<int>(std::lround(s_panelHz))) + " Hz panel).");
                         }
-                    } else {
-                        s_heavyWaitStreak = 0;
+                    } else if (measuredHz > (halfPanel * 1.10)) {
+                        s_sswHalfRateHits = 0;
+                    } else if (s_sswHalfRateHits > 0) {
+                        s_sswHalfRateHits--;
                     }
                 }
             }
         }
+        s_lastWaitExitQpc = afterWaitQpc.QuadPart;
     }
-    s_lastWaitExitQpc = afterWaitQpc.QuadPart;
 
     inWait = false;
     return res;
@@ -342,6 +345,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
+    g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
     g_lastFormat = static_cast<uint32_t>(inDesc.Format);
     g_lastInW = cropW;
     g_lastInH = cropH;
@@ -455,7 +459,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     }
 
     g_upscaleStatus = 1;
-    g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
 
     const float uMaxOut = static_cast<float>(outW) / static_cast<float>(sharedOut.width);
     const float vMaxOut = static_cast<float>(outH) / static_cast<float>(sharedOut.height);
