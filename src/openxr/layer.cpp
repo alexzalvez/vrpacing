@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -93,6 +94,7 @@ EyeTangents g_eyeTangents[2];
 std::atomic<bool> g_pendingMaskEvent[2]{ false, false };
 std::atomic<XrTime> g_lastPredictedDisplayTime{ 1 };
 std::atomic<bool> g_maskWasActiveInSession{ false };
+std::atomic<bool> g_reFrameworkBridgeActive{ false };
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -124,11 +126,45 @@ bool IsCurrentProcessBlacklisted() {
     if (pos != std::wstring::npos) p = p.substr(pos + 1);
     std::transform(p.begin(), p.end(), p.begin(), ::towlower);
 
-    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe") {
+    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe" ||
+        p == L"witcher3.exe" || p == L"titanfall2.exe" || p == L"titanfall2vrlauncher.exe") {
         s_cached = 1;
         return true;
     }
     s_cached = 0;
+    return false;
+}
+
+bool IsReFrameworkProcess() {
+    wchar_t modPath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, modPath, MAX_PATH)) {
+        return false;
+    }
+
+    std::wstring fullPath(modPath);
+    std::wstring exeName = fullPath;
+    std::wstring exeDir = fullPath;
+
+    const auto pos = fullPath.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) {
+        exeName = fullPath.substr(pos + 1);
+        exeDir.resize(pos);
+    }
+
+    std::transform(exeName.begin(), exeName.end(), exeName.begin(), ::towlower);
+
+    if (exeName == L"re2.exe" || exeName == L"re3.exe" || exeName == L"re4.exe" ||
+        exeName == L"re7.exe" || exeName == L"re8.exe" || exeName == L"re9.exe" ||
+        exeName == L" devilmaycry5.exe" || exeName == L"dmc5.exe" ||
+        exeName == L"monsterhunterrise.exe" || exeName == L"dd2.exe") {
+        return true;
+    }
+
+    if (std::filesystem::exists(exeDir + L"\\reframework") ||
+        std::filesystem::exists(exeDir + L"\\re2_fw_config.txt")) {
+        return true;
+    }
+
     return false;
 }
 
@@ -162,7 +198,7 @@ void EnsureHookDllLoadedForVdxrBridge() {
         if (fn) {
             fn();
         }
-        LogMessage(LogLevel::Info, "OpenXR Layer (DX12/Vulkan): Linked VRPacingHook.dll for VDXR D3D11 (LibOVR) bridge.");
+        LogMessage(LogLevel::Info, "OpenXR Layer (REFramework DX12): Linked VRPacingHook.dll for VDXR D3D11 (LibOVR) bridge.");
     }
 }
 
@@ -464,6 +500,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
+    g_reFrameworkBridgeActive.store(false, std::memory_order_relaxed);
 
     const auto* next = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
     while (next) {
@@ -485,9 +522,15 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         next = next->next;
     }
 
+    const bool isReFramework = (!g_d3d11Device && !IsCurrentProcessBlacklisted() && IsReFrameworkProcess());
+
     if (!g_d3d11Device) {
         g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-        LogMessage(LogLevel::Info, "OpenXR Layer: DX12/Vulkan session detected. OpenXR Pacing active; delegating upscaling to LibOVR D3D11 bridge if using VDXR.");
+        if (isReFramework) {
+            LogMessage(LogLevel::Info, "OpenXR Layer: REFramework DX12 session detected. Enabling VDXR D3D11 bridge and OpenXR Pacing.");
+        } else {
+            LogMessage(LogLevel::Info, "OpenXR Layer: Non-D3D11 session detected (DX12/Vulkan). Pure passthrough active.");
+        }
     }
 
     XrResult res = g_nextCreateSession(instance, createInfo, session);
@@ -499,11 +542,12 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
             g_eyeTangents[1].valid = false;
             g_maskWasActiveInSession.store(false, std::memory_order_relaxed);
         }
-        if (!IsCurrentProcessBlacklisted()) {
+        if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
-            if (!g_d3d11Device) {
-                EnsureHookDllLoadedForVdxrBridge();
-            }
+        } else if (isReFramework) {
+            g_openXrSessionActive.store(true, std::memory_order_relaxed);
+            g_reFrameworkBridgeActive.store(true, std::memory_order_relaxed);
+            EnsureHookDllLoadedForVdxrBridge();
         }
     }
     return res;
@@ -514,6 +558,7 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     g_openXrSessionActive.store(false, std::memory_order_relaxed);
+    g_reFrameworkBridgeActive.store(false, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
     }
@@ -696,7 +741,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
     }
 
     const auto& proxy = it->second;
-    const uint32_t count = static_cast<uint32_t>(proxy.appTextures.size());
+    const uint2_t count = static_cast<uint32_t>(proxy.appTextures.size());
     if (imageCountOutput) *imageCountOutput = count;
     if (imageCapacityInput == 0 || !images) return XR_SUCCESS;
 
@@ -815,6 +860,14 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     }
     s_lastMaskState = curMaskState;
 
+    if (!g_d3d11Device && !g_reFrameworkBridgeActive.load(std::memory_order_relaxed)) {
+        XrResult res = g_nextWaitFrame(session, info, state);
+        if (XR_SUCCEEDED(res) && state && state->predictedDisplayTime > 0) {
+            g_lastPredictedDisplayTime.store(state->predictedDisplayTime, std::memory_order_relaxed);
+        }
+        return res;
+    }
+
     static int64_t s_qpcFreq = 0;
     static int64_t s_lastWaitExitQpc = 0;
     static uint32_t s_calibrationFrames = 0;
@@ -844,7 +897,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_limiter.WaitBeforeRuntime();
     }
 
-    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (DX12/VDXR)";
+    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (REFramework)";
     g_shm.UpdateTelemetry(apiLabel, hz, targetFps,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
@@ -1004,6 +1057,33 @@ void ResolveProcPointers(XrInstance instance) {
 
 } // namespace
 
+XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function);
+
+XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCreateInfo* info,
+                                                              const XrApiLayerCreateInfo* layerInfo,
+                                                              XrInstance* instance) {
+    auto nextInfo = layerInfo ? layerInfo->nextInfo : nullptr;
+    if (!nextInfo || !nextInfo->nextGetInstanceProcAddr || !nextInfo->nextCreateApiLayerInstance) {
+        return XR_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // Avanzar el puntero nextInfo conforme a la especificacion Khronos OpenXR
+    XrApiLayerCreateInfo localLayerInfo = *layerInfo;
+    localLayerInfo.nextInfo = nextInfo->next;
+
+    // Si la capa fue registrada por duplicado (HKCU + HKLM), pasar al siguiente eslabon sin auto-recursar
+    if (nextInfo->nextGetInstanceProcAddr == &Layer_xrGetInstanceProcAddr) {
+        return nextInfo->nextCreateApiLayerInstance(info, &localLayerInfo, instance);
+    }
+
+    XrResult res = nextInfo->nextCreateApiLayerInstance(info, &localLayerInfo, instance);
+    if (XR_FAILED(res)) return res;
+
+    g_nextGetInstanceProcAddr = nextInfo->nextGetInstanceProcAddr;
+    ResolveProcPointers(*instance);
+    return XR_SUCCESS;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function) {
     if (!name || !function) return XR_ERROR_VALIDATION_FAILURE;
 
@@ -1026,22 +1106,6 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, 
     else if (strcmp(name, "xrPollEvent") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrPollEvent);
     else return g_nextGetInstanceProcAddr(instance, name, function);
 
-    return XR_SUCCESS;
-}
-
-XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCreateInfo* info,
-                                                              const XrApiLayerCreateInfo* layerInfo,
-                                                              XrInstance* instance) {
-    auto nextInfo = layerInfo ? layerInfo->nextInfo : nullptr;
-    if (!nextInfo || !nextInfo->nextGetInstanceProcAddr || !nextInfo->nextCreateApiLayerInstance) {
-        return XR_ERROR_INITIALIZATION_FAILED;
-    }
-
-    g_nextGetInstanceProcAddr = nextInfo->nextGetInstanceProcAddr;
-    XrResult res = nextInfo->nextCreateApiLayerInstance(info, layerInfo, instance);
-    if (XR_FAILED(res)) return res;
-
-    ResolveProcPointers(*instance);
     return XR_SUCCESS;
 }
 
