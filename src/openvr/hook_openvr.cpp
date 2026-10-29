@@ -332,8 +332,12 @@ vr::EVRCompositorError HookedSubmit(void* self,
     const uint32_t cropW = static_cast<uint32_t>(std::lround((uMax - uMin) * inDesc.Width));
     const uint32_t cropH = static_cast<uint32_t>(std::lround((vMax - vMin) * inDesc.Height));
 
-    // Ignorar buffers vacios o mini-buffers de pantallas de carga (< 1000px) para evitar realocar VRAM
-    if (cropW < 1000 || cropH < 1000) {
+    const bool isSideBySide = (inDesc.ArraySize == 1) && ((uMax - uMin) <= 0.60f) && (inDesc.Width >= (inDesc.Height * 4 / 3));
+    const uint32_t fullEyeW = isSideBySide ? (inDesc.Width / 2) : inDesc.Width;
+    const uint32_t fullEyeH = inDesc.Height;
+
+    // Ignorar mini-buffers de pantallas de carga (< 1000px) para evitar realocar VRAM
+    if (fullEyeW < 1000 || fullEyeH < 1000 || cropW < 600 || cropH < 600) {
         inSubmit = false;
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
@@ -346,15 +350,15 @@ vr::EVRCompositorError HookedSubmit(void* self,
     VrsTextureMode vrsMode = VrsTextureMode::SingleEye;
     if (inDesc.ArraySize >= 2) {
         vrsMode = VrsTextureMode::TextureArray;
-    } else if (cropW < inDesc.Width * 3 / 4) {
+    } else if (isSideBySide) {
         vrsMode = VrsTextureMode::CombinedSideBySide;
     }
     VrsFoveatedD3D11::Instance().UpdateTarget(
         g_ovrCtx.device.Get(),
         g_ovrCtx.context.Get(),
         g_cfg.ffr.enabled,
-        cropW,
-        cropH,
+        fullEyeW,
+        fullEyeH,
         vrsMode,
         g_projCenters[0][0], g_projCenters[0][1],
         g_projCenters[1][0], g_projCenters[1][1]);
@@ -365,15 +369,20 @@ vr::EVRCompositorError HookedSubmit(void* self,
     }
 
     const double s = g_cfg.upscaling.scale;
-    uint32_t outW = static_cast<uint32_t>((std::max)(1.0, std::floor(cropW * s)));
-    uint32_t outH = static_cast<uint32_t>((std::max)(1.0, std::floor(cropH * s)));
+    uint32_t maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(fullEyeW * s)));
+    uint32_t maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(fullEyeH * s)));
 
-    const uint64_t px = static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH);
-    if (px > g_cfg.upscaling.maxOutputPixels) {
-        const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(px));
-        outW = static_cast<uint32_t>((std::max)(1.0, std::floor(outW * factor)));
-        outH = static_cast<uint32_t>((std::max)(1.0, std::floor(outH * factor)));
+    const uint64_t maxPx = static_cast<uint64_t>(maxOutW) * static_cast<uint64_t>(maxOutH);
+    if (maxPx > g_cfg.upscaling.maxOutputPixels) {
+        const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(maxPx));
+        maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutW * factor)));
+        maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutH * factor)));
     }
+
+    const double effScaleX = static_cast<double>(maxOutW) / static_cast<double>(fullEyeW);
+    const double effScaleY = static_cast<double>(maxOutH) / static_cast<double>(fullEyeH);
+    const uint32_t outW = (std::min)(maxOutW, static_cast<uint32_t>((std::max)(1L, std::lround(cropW * effScaleX))));
+    const uint32_t outH = (std::min)(maxOutH, static_cast<uint32_t>((std::max)(1L, std::lround(cropH * effScaleY))));
 
     g_lastOutW = outW;
     g_lastOutH = outH;
@@ -392,12 +401,12 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!sharedOut.texture || sharedOut.width != outW || sharedOut.height != outH || sharedOut.format != inDesc.Format) {
+        if (!sharedOut.texture || sharedOut.width != maxOutW || sharedOut.height != maxOutH || sharedOut.format != inDesc.Format) {
             sharedOut.texture.Reset();
 
             D3D11_TEXTURE2D_DESC outDesc{};
-            outDesc.Width = outW;
-            outDesc.Height = outH;
+            outDesc.Width = maxOutW;
+            outDesc.Height = maxOutH;
             outDesc.MipLevels = 1;
             outDesc.ArraySize = 1;
             outDesc.Format = inDesc.Format;
@@ -416,23 +425,24 @@ vr::EVRCompositorError HookedSubmit(void* self,
                 inSubmit = false;
                 return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
             }
-            sharedOut.width = outW;
-            sharedOut.height = outH;
+            sharedOut.width = maxOutW;
+            sharedOut.height = maxOutH;
             sharedOut.format = inDesc.Format;
-            LogMessage(LogLevel::Info, "OpenVR: Shared output texture allocated: " + std::to_string(outW) + "x" + std::to_string(outH));
+            LogMessage(LogLevel::Info, "OpenVR: Shared output texture allocated: " + std::to_string(maxOutW) + "x" + std::to_string(maxOutH));
         }
     }
 
     ID3D11RenderTargetView* nullRTV[1] = { nullptr };
     g_ovrCtx.context->OMSetRenderTargets(1, nullRTV, nullptr);
 
+    const int eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
     UpscaleDispatchDesc dispatch{};
     dispatch.srcRect = { cropX, cropY, cropW, cropH };
     dispatch.dstRect = { 0, 0, outW, outH };
-    dispatch.srcArrayIndex = (inDesc.ArraySize > 1) ? ((eEye == vr::Eye_Right) ? 1 : 0) : 0;
+    dispatch.srcArrayIndex = (inDesc.ArraySize > 1) ? eyeIdx : 0;
     dispatch.dstArrayIndex = 0;
-    dispatch.projCenterX = 0.5f;
-    dispatch.projCenterY = 0.5f;
+    dispatch.projCenterX = g_projCenters[eyeIdx][0];
+    dispatch.projCenterY = g_projCenters[eyeIdx][1];
     dispatch.radius = g_cfg.upscaling.radius;
     dispatch.sharpness = g_cfg.upscaling.sharpness;
     dispatch.maskEnabled = false;
@@ -447,11 +457,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
     g_upscaleStatus = 1;
     g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
 
+    const float uMaxOut = static_cast<float>(outW) / static_cast<float>(sharedOut.width);
+    const float vMaxOut = static_cast<float>(outH) / static_cast<float>(sharedOut.height);
+
     vr::VRTextureBounds_t outBounds{};
-    outBounds.uMin = isFlippedX ? 1.0f : 0.0f;
-    outBounds.uMax = isFlippedX ? 0.0f : 1.0f;
-    outBounds.vMin = isFlippedY ? 1.0f : 0.0f;
-    outBounds.vMax = isFlippedY ? 0.0f : 1.0f;
+    outBounds.uMin = isFlippedX ? uMaxOut : 0.0f;
+    outBounds.uMax = isFlippedX ? 0.0f : uMaxOut;
+    outBounds.vMin = isFlippedY ? vMaxOut : 0.0f;
+    outBounds.vMax = isFlippedY ? 0.0f : vMaxOut;
 
     auto* mutableTex = const_cast<vr::Texture_t*>(pTexture);
     void* origHandle = mutableTex->handle;

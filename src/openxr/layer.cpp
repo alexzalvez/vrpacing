@@ -155,7 +155,7 @@ bool IsReFrameworkProcess() {
 
     if (exeName == L"re2.exe" || exeName == L"re3.exe" || exeName == L"re4.exe" ||
         exeName == L"re7.exe" || exeName == L"re8.exe" || exeName == L"re9.exe" ||
-        exeName == L" devilmaycry5.exe" || exeName == L"dmc5.exe" ||
+        exeName == L"devilmaycry5.exe" || exeName == L"dmc5.exe" ||
         exeName == L"monsterhunterrise.exe" || exeName == L"dd2.exe") {
         return true;
     }
@@ -608,12 +608,23 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 
     g_shm.SyncConfig(g_cfg);
 
-    const bool isColor = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
+    const bool isStatic = (createInfo->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0;
+    const bool isColor = !isStatic &&
+                         (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
                          (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
 
-    const bool isEyeResolution = (createInfo->arraySize >= 2) ||
-                                 (g_nativeViewW > 0 && createInfo->width >= (g_nativeViewW * 7 / 10)) ||
-                                 (createInfo->width >= 1200 && createInfo->height >= 1200);
+    bool isEyeResolution = false;
+    if (g_nativeViewW > 0 && g_nativeViewH > 0) {
+        const bool heightMatches = (createInfo->height >= (g_nativeViewH * 4 / 5)) &&
+                                   (createInfo->height <= (g_nativeViewH * 6 / 5));
+        const bool widthMatchesSingle = (createInfo->width >= (g_nativeViewW * 4 / 5)) &&
+                                        (createInfo->width <= (g_nativeViewW * 6 / 5));
+        const bool widthMatchesSbs = (createInfo->width >= (g_nativeViewW * 8 / 5)) &&
+                                     (createInfo->width <= (g_nativeViewW * 12 / 5));
+        isEyeResolution = heightMatches && (widthMatchesSingle || widthMatchesSbs);
+    } else {
+        isEyeResolution = (createInfo->width >= 1400 && createInfo->height >= 1400);
+    }
 
     if (!isColor || !isEyeResolution || !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
@@ -807,6 +818,7 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 
     if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
         const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
+        const bool isSideBySide = (numSlices == 1) && (proxy.appWidth >= (proxy.appHeight * 3 / 2));
 
         static std::atomic<bool> s_firstFrameLogged{ false };
         if (!s_firstFrameLogged.exchange(true)) {
@@ -819,21 +831,43 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
         }
 
         bool allSlicesOk = true;
-        for (uint32_t slice = 0; slice < numSlices; ++slice) {
-            UpscaleDispatchDesc desc{};
-            desc.srcRect = { 0, 0, proxy.appWidth, proxy.appHeight };
-            desc.dstRect = { 0, 0, proxy.realWidth, proxy.realHeight };
-            desc.srcArrayIndex = static_cast<int>(slice);
-            desc.dstArrayIndex = static_cast<int>(slice);
-            desc.projCenterX = 0.5f;
-            desc.projCenterY = 0.5f;
-            desc.radius = g_cfg.upscaling.radius;
-            desc.sharpness = g_cfg.upscaling.sharpness;
-            desc.maskEnabled = false;
-            desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+        if (isSideBySide) {
+            const uint32_t halfAppW = proxy.appWidth / 2;
+            const uint32_t halfRealW = proxy.realWidth / 2;
+            for (uint32_t eye = 0; eye < 2; ++eye) {
+                UpscaleDispatchDesc desc{};
+                desc.srcRect = { eye * halfAppW, 0, halfAppW, proxy.appHeight };
+                desc.dstRect = { eye * halfRealW, 0, halfRealW, proxy.realHeight };
+                desc.srcArrayIndex = 0;
+                desc.dstArrayIndex = 0;
+                desc.projCenterX = 0.5f;
+                desc.projCenterY = 0.5f;
+                desc.radius = g_cfg.upscaling.radius;
+                desc.sharpness = g_cfg.upscaling.sharpness;
+                desc.maskEnabled = false;
+                desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
 
-            if (!g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
-                allSlicesOk = false;
+                if (!g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
+                    allSlicesOk = false;
+                }
+            }
+        } else {
+            for (uint32_t slice = 0; slice < numSlices; ++slice) {
+                UpscaleDispatchDesc desc{};
+                desc.srcRect = { 0, 0, proxy.appWidth, proxy.appHeight };
+                desc.dstRect = { 0, 0, proxy.realWidth, proxy.realHeight };
+                desc.srcArrayIndex = static_cast<int>(slice);
+                desc.dstArrayIndex = static_cast<int>(slice);
+                desc.projCenterX = 0.5f;
+                desc.projCenterY = 0.5f;
+                desc.radius = g_cfg.upscaling.radius;
+                desc.sharpness = g_cfg.upscaling.sharpness;
+                desc.maskEnabled = false;
+                desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+
+                if (!g_upscaler.Upscale(g_d3d11Context.Get(), proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
+                    allSlicesOk = false;
+                }
             }
         }
 
@@ -971,7 +1005,11 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
 
     std::vector<const XrCompositionLayerBaseHeader*> remapped(frameEndInfo->layerCount);
     std::vector<XrCompositionLayerProjection> projCopies;
+    std::vector<std::vector<XrCompositionLayerProjectionView>> viewsCopies;
+    std::vector<XrCompositionLayerQuad> quadCopies;
     projCopies.reserve(frameEndInfo->layerCount);
+    viewsCopies.reserve(frameEndInfo->layerCount);
+    quadCopies.reserve(frameEndInfo->layerCount);
 
     std::lock_guard<std::mutex> lock(g_layerMutex);
 
@@ -982,9 +1020,10 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
         if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
             const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
             XrCompositionLayerProjection copy = *proj;
+            std::vector<XrCompositionLayerProjectionView> vCopy(proj->views, proj->views + proj->viewCount);
 
             for (uint32_t v = 0; v < copy.viewCount; ++v) {
-                auto& view = const_cast<XrCompositionLayerProjectionView&>(copy.views[v]);
+                auto& view = vCopy[v];
                 auto it = g_swapchains.find(view.subImage.swapchain);
                 if (it != g_swapchains.end()) {
                     const auto& p = it->second;
@@ -997,8 +1036,28 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
                     view.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(view.subImage.imageRect.extent.height * sy));
                 }
             }
+            viewsCopies.push_back(std::move(vCopy));
+            copy.views = viewsCopies.back().data();
             projCopies.push_back(copy);
             remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projCopies.back());
+        } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(layer);
+            auto it = g_swapchains.find(quad->subImage.swapchain);
+            if (it != g_swapchains.end()) {
+                XrCompositionLayerQuad qCopy = *quad;
+                const auto& p = it->second;
+                const double sx = static_cast<double>(p.realWidth) / p.appWidth;
+                const double sy = static_cast<double>(p.realHeight) / p.appHeight;
+
+                qCopy.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.x * sx));
+                qCopy.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.y * sy));
+                qCopy.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.width * sx));
+                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.height * sy));
+                quadCopies.push_back(qCopy);
+                remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadCopies.back());
+            } else {
+                remapped[i] = layer;
+            }
         } else {
             remapped[i] = layer;
         }
@@ -1067,11 +1126,9 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCr
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
-    // Avanzar el puntero nextInfo conforme a la especificacion Khronos OpenXR
     XrApiLayerCreateInfo localLayerInfo = *layerInfo;
     localLayerInfo.nextInfo = nextInfo->next;
 
-    // Si la capa fue registrada por duplicado (HKCU + HKLM), pasar al siguiente eslabon sin auto-recursar
     if (nextInfo->nextGetInstanceProcAddr == &Layer_xrGetInstanceProcAddr) {
         return nextInfo->nextCreateApiLayerInstance(info, &localLayerInfo, instance);
     }
