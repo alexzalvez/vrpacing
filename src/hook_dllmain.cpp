@@ -49,7 +49,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(module);
             vrpacing::InitLogging();
-            vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook cargado en proceso.");
+            vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook loaded into process.");
 
             vrpacing::InstallOpenVRHooks();
             vrpacing::InstallOculusHooks();
@@ -62,7 +62,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         }
         case DLL_PROCESS_DETACH:
             g_stopWatcher.store(true, std::memory_order_relaxed);
-            vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook descargado.");
+            vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook unloaded.");
             break;
         default:
             break;

@@ -147,7 +147,7 @@ void EnsureInit() {
         g_cfg.upscaling.sharpness = 0.0f;
         g_cfg.pacing.enabled = true;
         g_limiter.Initialize();
-        LogMessage(LogLevel::Info, "OpenVR Hook inicializado.");
+        LogMessage(LogLevel::Info, "OpenVR Hook initialized.");
     });
 }
 
@@ -379,7 +379,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     static std::atomic<bool> s_firstFrameLogged{ false };
     if (!s_firstFrameLogged.exchange(true)) {
-        LogMessage(LogLevel::Info, "OpenVR [Submit] Primer frame: InTex=" + std::to_string(inDesc.Width) + "x" + std::to_string(inDesc.Height) +
+        LogMessage(LogLevel::Info, "OpenVR [Submit] First frame: InTex=" + std::to_string(inDesc.Width) + "x" + std::to_string(inDesc.Height) +
                    " FMT=" + std::to_string(inDesc.Format) +
                    " ArraySize=" + std::to_string(inDesc.ArraySize) +
                    " Flags=" + std::to_string(nSubmitFlags) +
@@ -411,14 +411,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
             if (FAILED(hr)) {
                 g_upscaleStatus = -1;
                 g_lastHResult = hr;
-                LogMessage(LogLevel::Error, "OpenVR Hook: Error al crear textura compartida escalada. HR=" + std::to_string(hr));
+                LogMessage(LogLevel::Error, "OpenVR Hook: Failed to allocate shared output texture. HR=" + std::to_string(hr));
                 inSubmit = false;
                 return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
             }
             sharedOut.width = outW;
             sharedOut.height = outH;
             sharedOut.format = inDesc.Format;
-            LogMessage(LogLevel::Info, "OpenVR: Textura unica compartida alocada: " + std::to_string(outW) + "x" + std::to_string(outH));
+            LogMessage(LogLevel::Info, "OpenVR: Shared output texture allocated: " + std::to_string(outW) + "x" + std::to_string(outH));
         }
     }
 
@@ -503,7 +503,7 @@ void HookCompositorInstance(const char* name, void* iface) {
 
     if (g_hookedInterfaces.find(name) == g_hookedInterfaces.end()) {
         g_hookedInterfaces.insert(name);
-        LogMessage(LogLevel::Info, "OpenVR hooks instalados en " + std::string(name) +
+        LogMessage(LogLevel::Info, "OpenVR hooks installed on " + std::string(name) +
                    " (WaitGetPoses vtbl[2], Submit vtbl[" + std::to_string(submitIndex) + "])");
     }
 }
@@ -544,7 +544,7 @@ void InstallOpenVRHooks() {
     if (MH_CreateHook(reinterpret_cast<void*>(fn), reinterpret_cast<void*>(&HookedVRGetGenericInterface), reinterpret_cast<void**>(&g_origGetGenericInterface)) == MH_OK) {
         MH_EnableHook(reinterpret_cast<void*>(fn));
         s_installed.store(true);
-        LogMessage(LogLevel::Info, "Hook OpenVR VR_GetGenericInterface instalado.");
+        LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed.");
     }
 }
 

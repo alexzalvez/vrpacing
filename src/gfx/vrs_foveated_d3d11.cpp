@@ -151,7 +151,7 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
 
         if (!nvapiLoaded_) {
             if (NvAPI_Initialize() != NVAPI_OK) {
-                LogMessage(LogLevel::Warn, "VRS: NvAPI_Initialize fallo. Variable Rate Shading no disponible.");
+                LogMessage(LogLevel::Warn, "VRS: NvAPI_Initialize failed. Variable Rate Shading is unavailable.");
                 nvapiSupported_ = false;
                 return false;
             }
@@ -161,13 +161,13 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
         NV_D3D1x_GRAPHICS_CAPS caps{};
         NvAPI_Status status = NvAPI_D3D1x_GetGraphicsCapabilities(dev, NV_D3D1x_GRAPHICS_CAPS_VER, &caps);
         if (status != NVAPI_OK || !caps.bVariablePixelRateShadingSupported) {
-            LogMessage(LogLevel::Warn, "VRS: La GPU no soporta NVIDIA Variable Pixel Rate Shading en D3D11.");
+            LogMessage(LogLevel::Warn, "VRS: GPU does not support NVIDIA Variable Pixel Rate Shading in D3D11.");
             nvapiSupported_ = false;
             return false;
         }
 
         nvapiSupported_ = true;
-        LogMessage(LogLevel::Info, "VRS: NVIDIA NVAPI inicializado correctamente (Anillos: 60% 1x, 100% 1/2x, >100% 1/16x).");
+        LogMessage(LogLevel::Info, "VRS: NVIDIA NVAPI initialized successfully (Rings: 60% 1x, 100% 1/2x, >100% 1/16x).");
     }
 
     if (nvapiSupported_ && !hooksInstalled_) {
@@ -198,7 +198,7 @@ void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
     }
 
     hooksInstalled_ = true;
-    LogMessage(LogLevel::Info, "VRS: Hooks ID3D11DeviceContext instalados (OMSetRenderTargets vtbl[33], vtbl[34]).");
+    LogMessage(LogLevel::Info, "VRS: ID3D11DeviceContext hooks installed (OMSetRenderTargets vtbl[33], vtbl[34]).");
 }
 
 void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
@@ -221,7 +221,6 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* device,
         return;
     }
 
-    // Ignorar resoluciones transitorias de carga o mini-buffers (< 1000px)
     if (eyeWidth < 1000 || eyeHeight < 1000) {
         return;
     }
@@ -448,8 +447,8 @@ void VrsFoveatedD3D11::SetupSingleEyeVRS(int eye, int width, int height, float p
     vd.Texture2D.MipSlice = 0;
 
     if (NvAPI_D3D11_CreateShadingRateResourceView(device_.Get(), singleEyeVRSTex_[eye].Get(), &vd, singleEyeVRSView_[eye].GetAddressOf()) == NVAPI_OK) {
-        LogMessage(LogLevel::Info, "VRS: Textura SingleEye [" + std::to_string(eye) + "] creada (" +
-                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles para " +
+        LogMessage(LogLevel::Info, "VRS: SingleEye [" + std::to_string(eye) + "] pattern texture created (" +
+                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles for " +
                    std::to_string(width) + "x" + std::to_string(height) + ").");
     }
 }
@@ -496,8 +495,8 @@ void VrsFoveatedD3D11::SetupCombinedVRS(int width, int height, float leftProjX, 
     vd.Texture2D.MipSlice = 0;
 
     if (NvAPI_D3D11_CreateShadingRateResourceView(device_.Get(), combinedVRSTex_.Get(), &vd, combinedVRSView_.GetAddressOf()) == NVAPI_OK) {
-        LogMessage(LogLevel::Info, "VRS: Textura Combined Side-by-Side creada (" +
-                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles para " +
+        LogMessage(LogLevel::Info, "VRS: Combined Side-by-Side pattern texture created (" +
+                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles for " +
                    std::to_string(width) + "x" + std::to_string(height) + ").");
     }
 }
@@ -545,8 +544,8 @@ void VrsFoveatedD3D11::SetupArrayVRS(int width, int height, float leftProjX, flo
     vd.Texture2DArray.FirstArraySlice = 0;
 
     if (NvAPI_D3D11_CreateShadingRateResourceView(device_.Get(), arrayVRSTex_.Get(), &vd, arrayVRSView_.GetAddressOf()) == NVAPI_OK) {
-        LogMessage(LogLevel::Info, "VRS: Textura ArraySize=2 creada (" +
-                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles para " +
+        LogMessage(LogLevel::Info, "VRS: ArraySize=2 pattern texture created (" +
+                   std::to_string(vrsWidth) + "x" + std::to_string(vrsHeight) + " tiles for " +
                    std::to_string(width) + "x" + std::to_string(height) + ").");
     }
 }

@@ -86,6 +86,9 @@ if(WIN32)
   )
   target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32)
   set_target_properties(VRPacingTray PROPERTIES OUTPUT_NAME "VRPacingTray")
+  if(MSVC)
+    set_target_properties(VRPacingTray PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
+  endif()
 
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/openxr/VRPacingLayer.json.in

@@ -31,7 +31,6 @@ namespace {
 
 std::unordered_set<DWORD> s_systemIgnoredPids;
 std::unordered_set<DWORD> s_hookedPids;
-std::unordered_set<DWORD> s_accessDeniedLoggedPids;
 
 void EnableDebugPrivilegeOnce() {
     static std::once_flag s_privFlag;
@@ -56,6 +55,10 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
     if (!exeName) return true;
 
     static const wchar_t* const kBlacklist[] = {
+        L"system",
+        L"secure system",
+        L"registry",
+        L"memory compression",
         L"cemu.exe",
         L"bettervr_launcher.exe",
         L"ofxrbridgetray.exe",
@@ -69,6 +72,7 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"steamtours.exe",
         L"steam.exe",
         L"steamwebhelper.exe",
+        L"steamservice.exe",
         L"ovrserver_x64.exe",
         L"oculusclient.exe",
         L"oculusdash.exe",
@@ -89,16 +93,39 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"sihost.exe",
         L"ctfmon.exe",
         L"searchhost.exe",
+        L"searchindexer.exe",
+        L"searchprotocolhost.exe",
+        L"searchfilterhost.exe",
         L"devenv.exe",
         L"csrss.exe",
         L"smss.exe",
         L"services.exe",
         L"lsass.exe",
+        L"lsaiso.exe",
         L"wininit.exe",
         L"winlogon.exe",
         L"fontdrvhost.exe",
         L"spoolsv.exe",
-        L"audiodg.exe"
+        L"audiodg.exe",
+        L"wudfhost.exe",
+        L"wmiprvse.exe",
+        L"conhost.exe",
+        L"powershell.exe",
+        L"pwsh.exe",
+        L"cmd.exe",
+        L"msiafterburner.exe",
+        L"rtss.exe",
+        L"rtsshooksloader64.exe",
+        L"encoderserver.exe",
+        L"nvcontainer.exe",
+        L"nvdisplay.container.exe",
+        L"msmpeng.exe",
+        L"mpdefendercoservice.exe",
+        L"nissrv.exe",
+        L"securityhealthservice.exe",
+        L"gameinputsvc.exe",
+        L"gamingservices.exe",
+        L"gamingservicesnet.exe"
     };
 
     std::wstring lower(exeName);
@@ -118,7 +145,9 @@ bool IsSystemWindowsProcess(HANDLE hProc) {
     }
     std::wstring lower(fullPath);
     std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-    return (lower.find(L"\\windows\\") != std::wstring::npos);
+    return (lower.find(L"\\windows\\") != std::wstring::npos ||
+            lower.find(L"\\microsoft office\\") != std::wstring::npos ||
+            lower.find(L"\\windows defender\\") != std::wstring::npos);
 }
 
 bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
@@ -137,16 +166,15 @@ bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
 
     for (DWORD i = 0; i < count; ++i) {
         if (GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH)) {
-            if (_wcsicmp(modName, L"VRPacingHook.dll") == 0) {
+            if (_wcsicmp(modName, L"VRPacingHook.dll") == 0 ||
+                _wcsicmp(modName, L"VRPacingLayer.dll") == 0) {
                 alreadyHooked = true;
                 return false;
             }
             if (_wcsicmp(modName, L"openvr_api.dll") == 0 ||
                 _wcsicmp(modName, L"LibOVRRT64_1.dll") == 0 ||
                 _wcsicmp(modName, L"VirtualDesktop.LibOVRRT64_1.dll") == 0 ||
-                _wcsicmp(modName, L"LibPVRRT64_1_X.dll") == 0 ||
-                _wcsicmp(modName, L"openxr_loader.dll") == 0 ||
-                _wcsicmp(modName, L"VirtualDesktop.OpenXR.dll") == 0) {
+                _wcsicmp(modName, L"LibPVRRT64_1_X.dll") == 0) {
                 foundVrMod = true;
             }
         }
@@ -156,7 +184,7 @@ bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
 
 bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
     if (!std::filesystem::exists(dllPath)) {
-        LogMessage(LogLevel::Error, "ProcessScanner: DLL de inyeccion no encontrada en disco.");
+        LogMessage(LogLevel::Error, "ProcessScanner: Hook DLL not found on disk.");
         return false;
     }
 
@@ -256,20 +284,14 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                     s_systemIgnoredPids.insert(pid);
                     continue;
                 }
+            } else {
+                s_systemIgnoredPids.insert(pid);
+                continue;
             }
 
             HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProc) {
-                const DWORD err = GetLastError();
-                if (err == ERROR_ACCESS_DENIED && s_accessDeniedLoggedPids.find(pid) == s_accessDeniedLoggedPids.end()) {
-                    s_accessDeniedLoggedPids.insert(pid);
-                    char exeA[MAX_PATH]{};
-                    size_t converted = 0;
-                    wcstombs_s(&converted, exeA, pe.szExeFile, sizeof(exeA) - 1);
-                    LogMessage(LogLevel::Warn, "ProcessScanner: Acceso denegado al inspeccionar " +
-                               std::string(exeA) + " [PID " + std::to_string(pid) +
-                               "]. Si es un juego VR elevado, ejecuta VRPacingTray.exe como Administrador.");
-                }
+                s_systemIgnoredPids.insert(pid);
                 continue;
             }
 
@@ -288,7 +310,7 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
                     char exeA[MAX_PATH]{};
                     size_t converted = 0;
                     wcstombs_s(&converted, exeA, pe.szExeFile, sizeof(exeA) - 1);
-                    LogMessage(LogLevel::Info, "Inyeccion automatica aplicada a juego VR: " +
+                    LogMessage(LogLevel::Info, "Automatic injection applied to VR process: " +
                                std::string(exeA) + " [PID " + std::to_string(pid) + "]");
                 }
             }

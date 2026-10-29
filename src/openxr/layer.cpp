@@ -162,7 +162,7 @@ void EnsureHookDllLoadedForVdxrBridge() {
         if (fn) {
             fn();
         }
-        LogMessage(LogLevel::Info, "OpenXR Layer (DX12/Vulkan): VRPacingHook.dll enlazado para puente VDXR D3D11 (LibOVR).");
+        LogMessage(LogLevel::Info, "OpenXR Layer (DX12/Vulkan): Linked VRPacingHook.dll for VDXR D3D11 (LibOVR) bridge.");
     }
 }
 
@@ -172,7 +172,7 @@ void EnsureInit() {
         InitLogging();
         g_cfg = LoadConfig();
         g_limiter.Initialize();
-        LogMessage(LogLevel::Info, "OpenXR Layer inicializada.");
+        LogMessage(LogLevel::Info, "OpenXR Layer initialized.");
     });
 }
 
@@ -242,7 +242,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         if (IsOpenCompositeActive() && g_cfg.mask.enabled) {
             static std::atomic<bool> s_ocMaskLogged{ false };
             if (!s_ocMaskLogged.exchange(true)) {
-                LogMessage(LogLevel::Info, "OpenXR Layer: OpenComposite detectado (openvr_api.dll). Mascara circular excluida automaticamente; NIS y Pacing activos.");
+                LogMessage(LogLevel::Info, "OpenXR Layer: OpenComposite detected (openvr_api.dll). Circular mask automatically excluded; NIS and Pacing active.");
             }
         }
         if (g_nextGetVisibilityMaskKHR) {
@@ -396,7 +396,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
 
     static std::atomic<bool> s_loggedEye[2]{ false, false };
     if (viewIndex < 2 && !s_loggedEye[viewIndex].exchange(true)) {
-        LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 seg) aplicada al ojo " +
+        LogMessage(LogLevel::Info, "OpenXR Layer: Pre-Render Circular Visibility Mask (r=1.00, 256 seg) applied to eye " +
                    std::to_string(viewIndex) + " Tangents=[" + std::to_string(minX) + ", " + std::to_string(maxX) +
                    ", " + std::to_string(minY) + ", " + std::to_string(maxY) + "]");
     }
@@ -472,7 +472,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
             if (d3d->device) {
                 g_d3d11Device = d3d->device;
                 g_d3d11Device->GetImmediateContext(g_d3d11Context.ReleaseAndGetAddressOf());
-                LogMessage(LogLevel::Info, "OpenXR Layer: ID3D11Device capturado en xrCreateSession.");
+                LogMessage(LogLevel::Info, "OpenXR Layer: Captured ID3D11Device in xrCreateSession.");
 
                 if (!IsCurrentProcessBlacklisted()) {
                     g_openXrD3D11Active.store(true, std::memory_order_relaxed);
@@ -487,7 +487,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
     if (!g_d3d11Device) {
         g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-        LogMessage(LogLevel::Info, "OpenXR Layer: Sesion DX12/Vulkan detectada. Pacing OpenXR activo; delegando escalado a puente LibOVR D3D11 si usa VDXR.");
+        LogMessage(LogLevel::Info, "OpenXR Layer: DX12/Vulkan session detected. OpenXR Pacing active; delegating upscaling to LibOVR D3D11 bridge if using VDXR.");
     }
 
     XrResult res = g_nextCreateSession(instance, createInfo, session);
@@ -544,7 +544,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
     static std::atomic<bool> s_viewsLogged{ false };
     if (!s_viewsLogged.exchange(true) && viewCountOutput) {
         for (uint32_t i = 0; i < *viewCountOutput; ++i) {
-            LogMessage(LogLevel::Info, "OpenXR ViewConfig[" + std::to_string(i) + "]: Nativo=" +
+            LogMessage(LogLevel::Info, "OpenXR ViewConfig[" + std::to_string(i) + "]: Native=" +
                        std::to_string(views[i].recommendedImageRectWidth) + "x" +
                        std::to_string(views[i].recommendedImageRectHeight));
         }
@@ -609,7 +609,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     if (XR_FAILED(r)) {
         g_upscaleStatus = -1;
         g_lastHResult = r;
-        LogMessage(LogLevel::Error, "OpenXR Layer: Error al crear swapchain nativo escalado.");
+        LogMessage(LogLevel::Error, "OpenXR Layer: Failed to create native upscaled swapchain.");
         return r;
     }
 
@@ -658,7 +658,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
         if (FAILED(hr)) {
             g_upscaleStatus = -1;
             g_lastHResult = hr;
-            LogMessage(LogLevel::Error, "OpenXR Layer: Error al crear textura intermedia D3D11. HR=" + std::to_string(hr));
+            LogMessage(LogLevel::Error, "OpenXR Layer: Failed to create intermediate D3D11 texture. HR=" + std::to_string(hr));
             g_nextDestroySwapchain(real);
             return XR_ERROR_RUNTIME_FAILURE;
         }
@@ -669,7 +669,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     g_swapchains[real] = std::move(proxy);
     *swapchain = real;
 
-    LogMessage(LogLevel::Info, "OpenXR Proxy Swapchain creado: " +
+    LogMessage(LogLevel::Info, "OpenXR Proxy Swapchain created: " +
                std::to_string(appW) + "x" + std::to_string(appH) +
                " (ArraySize=" + std::to_string(arrSize) + ") -> " +
                std::to_string(realW) + "x" + std::to_string(realH));
@@ -765,7 +765,7 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 
         static std::atomic<bool> s_firstFrameLogged{ false };
         if (!s_firstFrameLogged.exchange(true)) {
-            LogMessage(LogLevel::Info, "OpenXR [Release] Primer frame: App=" +
+            LogMessage(LogLevel::Info, "OpenXR [Release] First frame: App=" +
                        std::to_string(proxy.appWidth) + "x" + std::to_string(proxy.appHeight) +
                        " ArraySize=" + std::to_string(numSlices) +
                        " FMT=" + std::to_string(proxy.format) +
@@ -1059,6 +1059,7 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
     const XrNegotiateLoaderInfo* loaderInfo,
     const char* layerName,
     XrNegotiateApiLayerRequest* apiLayerRequest) {
+    (void)layerName;
     if (!loaderInfo || !apiLayerRequest) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
@@ -1081,7 +1082,7 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
     apiLayerRequest->createApiLayerInstance = vrpacing::Layer_xrCreateApiLayerInstance;
 
     vrpacing::InitLogging();
-    vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR Layer negociada exitosamente con el runtime.");
+    vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR Layer negotiated successfully with runtime.");
 
     return XR_SUCCESS;
 }

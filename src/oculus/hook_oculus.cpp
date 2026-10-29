@@ -131,12 +131,10 @@ bool GetSwapChainBufferD3D11(ovrSession session, ovrTextureSwapChain chain, int 
     outTex.Reset();
     if (!g_ovrGetTextureSwapChainBufferDX || !chain) return false;
 
-    // 1. Petición directa con __uuidof(ID3D11Texture2D), idéntico a vrperfkit para VirtualDesktop.LibOVRRT64_1.dll
     if (g_ovrGetTextureSwapChainBufferDX(session, chain, index, IID_PPV_ARGS(outTex.GetAddressOf())) >= 0 && outTex) {
         return true;
     }
 
-    // 2. Fallback por IUnknown + QueryInterface
     ComPtr<IUnknown> unk;
     if (g_ovrGetTextureSwapChainBufferDX(session, chain, index, IID_PPV_ARGS(unk.GetAddressOf())) >= 0 && unk) {
         if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(outTex.GetAddressOf()))) && outTex) {
@@ -152,7 +150,7 @@ void EnsureInit() {
         InitLogging();
         g_cfg = LoadConfig();
         g_limiter.Initialize();
-        LogMessage(LogLevel::Info, "Oculus LibOVR Hook inicializado.");
+        LogMessage(LogLevel::Info, "Oculus LibOVR Hook initialized.");
     });
 }
 
@@ -172,7 +170,7 @@ bool IsLegacyOculusLayer(const ovrLayerHeader* header) {
             newL->Viewport[0].Size.w < 256 || newL->Viewport[0].Size.w > 8192 ||
             newL->Viewport[0].Size.h < 256 || newL->Viewport[0].Size.h > 8192) {
             g_oculusVersion = 17;
-            LogMessage(LogLevel::Info, "Oculus Hook: Detectado layout legacy (< v25, ej. Lone Echo). Fijado g_oculusVersion = 17.");
+            LogMessage(LogLevel::Info, "Oculus Hook: Legacy layer layout detected (< v25, e.g. Lone Echo). Locked g_oculusVersion = 17.");
             return true;
         }
     }
@@ -254,7 +252,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         if (descRes < 0) {
             g_upscaleStatus = -1;
             g_lastHResult = descRes;
-            LogMessage(LogLevel::Error, "Oculus Hook: ovr_GetTextureSwapChainDesc fallo. Res=" + std::to_string(descRes));
+            LogMessage(LogLevel::Error, "Oculus Hook: ovr_GetTextureSwapChainDesc failed. Res=" + std::to_string(descRes));
             return false;
         }
 
@@ -274,14 +272,14 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
                     if (!g_upscaler.IsInitialized()) {
                         if (!g_upscaler.Initialize(ctx.device.Get())) {
                             g_upscaleStatus = -2;
-                            LogMessage(LogLevel::Error, "Oculus Hook: Error al inicializar NisUpscalerD3D11.");
+                            LogMessage(LogLevel::Error, "Oculus Hook: Failed to initialize NisUpscalerD3D11.");
                         }
                     }
                 }
             } else {
                 static std::atomic<bool> s_warnedNonD3D11{ false };
                 if (!s_warnedNonD3D11.exchange(true)) {
-                    LogMessage(LogLevel::Warn, "Oculus Hook: No se pudo obtener ID3D11Texture2D del Swapchain actual.");
+                    LogMessage(LogLevel::Warn, "Oculus Hook: Could not retrieve ID3D11Texture2D from current swapchain.");
                 }
                 return false;
             }
@@ -289,7 +287,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
 
         if (!ctx.device) {
             g_upscaleStatus = -2;
-            LogMessage(LogLevel::Error, "Oculus Hook: No se pudo capturar ID3D11Device desde el Swapchain.");
+            LogMessage(LogLevel::Error, "Oculus Hook: Could not capture ID3D11Device from swapchain.");
             return false;
         }
 
@@ -326,7 +324,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         if (createRes < 0 || !outChain) {
             g_upscaleStatus = -1;
             g_lastHResult = createRes;
-            LogMessage(LogLevel::Error, "Oculus Hook: ovr_CreateTextureSwapChainDX fallo. Res=" + std::to_string(createRes));
+            LogMessage(LogLevel::Error, "Oculus Hook: ovr_CreateTextureSwapChainDX failed. Res=" + std::to_string(createRes));
             return false;
         }
 
@@ -345,7 +343,7 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
             ctx.outputChains[eye].textures.push_back(tex);
         }
 
-        LogMessage(LogLevel::Info, "Oculus Output Swapchain [ojo " + std::to_string(eye) + "] creado: " +
+        LogMessage(LogLevel::Info, "Oculus Output Swapchain [eye " + std::to_string(eye) + "] created: " +
                    std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
                    " (FMT=" + std::to_string(desc.Format) + ") -> " +
                    std::to_string(outW) + "x" + std::to_string(outH));
@@ -368,11 +366,11 @@ void ProcessAndUpscaleLayer(ovrSession session,
                 (curDesc.Width != g_oculusCtx->lastInputWidth[0] ||
                  curDesc.Height != g_oculusCtx->lastInputHeight[0] ||
                  static_cast<int>(curDesc.Format) != g_oculusCtx->lastInputFormat[0])) {
-                LogMessage(LogLevel::Info, "Oculus Hook: Cambio en resolucion/formato de Swapchain (" +
+                LogMessage(LogLevel::Info, "Oculus Hook: Swapchain resolution/format changed (" +
                            std::to_string(g_oculusCtx->lastInputWidth[0]) + "x" + std::to_string(g_oculusCtx->lastInputHeight[0]) +
                            " FMT=" + std::to_string(g_oculusCtx->lastInputFormat[0]) +
                            " -> " + std::to_string(curDesc.Width) + "x" + std::to_string(curDesc.Height) +
-                           " FMT=" + std::to_string(curDesc.Format) + "). Recreando salida...");
+                           " FMT=" + std::to_string(curDesc.Format) + "). Recreating output...");
                 CleanupOutputChains(*g_oculusCtx);
             }
         }
@@ -424,12 +422,13 @@ void ProcessAndUpscaleLayer(ovrSession session,
 
     const uint32_t eyeW = static_cast<uint32_t>(inViewport[0].Size.w);
     const uint32_t eyeH = static_cast<uint32_t>(inViewport[0].Size.h);
+    const bool vrsActive = g_cfg.ffr.enabled && !IsOpenXrLayerSessionActive();
 
     if (ctx.device && ctx.context) {
         VrsFoveatedD3D11::Instance().UpdateTarget(
             ctx.device.Get(),
             ctx.context.Get(),
-            g_cfg.ffr.enabled,
+            vrsActive,
             eyeW,
             eyeH,
             vrsMode,
@@ -534,7 +533,7 @@ void ProcessAndUpscaleLayer(ovrSession session,
 ovrResult __cdecl Hooked_ovrInitialize(const ovrInitParams* params) {
     if (params) {
         g_oculusVersion = params->RequestedMinorVersion;
-        LogMessage(LogLevel::Info, "Oculus Hook: ovr_Initialize interceptado con version minor " + std::to_string(g_oculusVersion));
+        LogMessage(LogLevel::Info, "Oculus Hook: ovr_Initialize intercepted with minor version " + std::to_string(g_oculusVersion));
     }
     return g_origInitialize ? g_origInitialize(params) : 0;
 }
@@ -607,7 +606,9 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
     g_shm.SyncConfig(g_cfg);
 
     if (!g_waitToBeginCalled.load(std::memory_order_relaxed)) {
-        VrsFoveatedD3D11::Instance().EndFrame();
+        if (!IsOpenXrLayerSessionActive()) {
+            VrsFoveatedD3D11::Instance().EndFrame();
+        }
         if (g_ovrGetPredictedDisplayTime) {
             const double t0 = g_ovrGetPredictedDisplayTime(session, frameIndex);
             const double t1 = g_ovrGetPredictedDisplayTime(session, frameIndex + 1);
@@ -619,7 +620,8 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
     }
 
     const bool doUpscale = g_cfg.upscaling.enabled && (g_cfg.upscaling.scale > 1.0f);
-    if (!layerPtrList || layerCount == 0 || (!doUpscale && !g_cfg.ffr.enabled)) {
+    const bool doVrs = g_cfg.ffr.enabled && !IsOpenXrLayerSessionActive();
+    if (!layerPtrList || layerCount == 0 || (!doUpscale && !doVrs)) {
         if (!IsOpenXrLayerSessionActive() && !g_waitToBeginCalled.load(std::memory_order_relaxed)) {
             const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : g_hzTracker.GetEffectiveHz().value_or(90.0);
             double targetFps = 0.0;
@@ -644,7 +646,7 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
 
     static std::atomic<bool> s_submitLogged{ false };
     if (!s_submitLogged.exchange(true)) {
-        LogMessage(LogLevel::Info, "Oculus [SubmitFrame] Primer frame: layerCount=" + std::to_string(layerCount) +
+        LogMessage(LogLevel::Info, "Oculus [SubmitFrame] First frame: layerCount=" + std::to_string(layerCount) +
                    " Layer0 Type=" + std::to_string(layerPtrList[0] ? layerPtrList[0]->Type : -1) +
                    " Scale=" + std::to_string(g_cfg.upscaling.scale));
     }
@@ -859,7 +861,7 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(getSize));
     }
 
-    LogMessage(LogLevel::Info, "Hooks Oculus LibOVR instalados con soporte completo D3D11 NIS (SubmitFrame, SubmitFrame2, EndFrame).");
+    LogMessage(LogLevel::Info, "Oculus LibOVR hooks installed with full D3D11 NIS support (SubmitFrame, SubmitFrame2, EndFrame).");
 }
 
 } // namespace vrpacing
