@@ -241,8 +241,9 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     EnsureInit();
     if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
 
-    // En sesiones no-D3D11 (DX12/Vulkan/Mods), passthrough 100% puro sin tocar la mascara
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted() || IsOpenCompositeActive()) {
+    g_shm.SyncConfig(g_cfg);
+
+    if (IsCurrentProcessBlacklisted() || IsOpenCompositeActive()) {
         if (IsOpenCompositeActive() && g_cfg.mask.enabled) {
             static std::atomic<bool> s_ocMaskLogged{ false };
             if (!s_ocMaskLogged.exchange(true)) {
@@ -256,8 +257,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         visibilityMask->indexCountOutput = 0;
         return XR_SUCCESS;
     }
-
-    g_shm.SyncConfig(g_cfg);
 
     float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
     PopulateTangentsIfNeeded(session, viewConfigurationType, viewIndex, minX, maxX, minY, maxY);
@@ -418,7 +417,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
     uint32_t* viewCountOutput,
     XrView* views) {
     XrResult res = g_nextLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
-    if (g_d3d11Device && XR_SUCCEEDED(res) && views && viewCountOutput && !IsOpenCompositeActive()) {
+    if (XR_SUCCEEDED(res) && views && viewCountOutput && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
         const uint32_t count = (std::min)(*viewCountOutput, 2u);
         for (uint32_t i = 0; i < count; ++i) {
             const float l = std::tan(views[i].fov.angleLeft);
@@ -448,7 +447,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
 }
 
 XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eventData) {
-    if (g_d3d11Device && eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
+    if (eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
         for (uint32_t eye = 0; eye < 2; ++eye) {
             if (g_pendingMaskEvent[eye].exchange(false, std::memory_order_relaxed)) {
                 auto* ev = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(eventData);
@@ -854,7 +853,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
     static int s_lastMaskState = -1;
     const int curMaskState = g_cfg.mask.enabled ? 1 : 0;
-    if (g_d3d11Device && !IsOpenCompositeActive() && s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
+    if (!IsOpenCompositeActive() && s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
         g_pendingMaskEvent[0].store(true, std::memory_order_relaxed);
         g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
     }
