@@ -32,7 +32,7 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
             break;
         }
 
-        Sleep(150);
+        Sleep(100);
     }
     return 0;
 }
@@ -51,9 +51,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             vrpacing::InitLogging();
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingHook loaded into process.");
 
-            vrpacing::InstallOpenVRHooks();
-            vrpacing::InstallOculusHooks();
-
+            // Instalamos los hooks exclusivamente desde HookWatcherThread (fuera de DllMain)
+            // para no ejecutar MinHook (SuspendThread) bajo el Windows Loader Lock.
             HANDLE hThread = CreateThread(nullptr, 0, HookWatcherThread, nullptr, 0, nullptr);
             if (hThread) {
                 CloseHandle(hThread);

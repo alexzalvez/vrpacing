@@ -94,7 +94,10 @@ EyeTangents g_eyeTangents[2];
 std::atomic<bool> g_pendingMaskEvent[2]{ false, false };
 std::atomic<XrTime> g_lastPredictedDisplayTime{ 1 };
 std::atomic<bool> g_maskWasActiveInSession{ false };
-std::atomic<bool> g_reFrameworkBridgeActive{ false };
+
+std::atomic<bool> g_vdxrBridgeStandby{ false };
+std::atomic<bool> g_vdxrBridgeActive{ false };
+std::atomic<uint32_t> g_vdxrWarmupFrames{ 0 };
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -126,45 +129,11 @@ bool IsCurrentProcessBlacklisted() {
     if (pos != std::wstring::npos) p = p.substr(pos + 1);
     std::transform(p.begin(), p.end(), p.begin(), ::towlower);
 
-    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe" ||
-        p == L"witcher3.exe" || p == L"titanfall2.exe" || p == L"titanfall2vrlauncher.exe") {
+    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe") {
         s_cached = 1;
         return true;
     }
     s_cached = 0;
-    return false;
-}
-
-bool IsReFrameworkProcess() {
-    wchar_t modPath[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, modPath, MAX_PATH)) {
-        return false;
-    }
-
-    std::wstring fullPath(modPath);
-    std::wstring exeName = fullPath;
-    std::wstring exeDir = fullPath;
-
-    const auto pos = fullPath.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) {
-        exeName = fullPath.substr(pos + 1);
-        exeDir.resize(pos);
-    }
-
-    std::transform(exeName.begin(), exeName.end(), exeName.begin(), ::towlower);
-
-    if (exeName == L"re2.exe" || exeName == L"re3.exe" || exeName == L"re4.exe" ||
-        exeName == L"re7.exe" || exeName == L"re8.exe" || exeName == L"re9.exe" ||
-        exeName == L"devilmaycry5.exe" || exeName == L"dmc5.exe" ||
-        exeName == L"monsterhunterrise.exe" || exeName == L"dd2.exe") {
-        return true;
-    }
-
-    if (std::filesystem::exists(exeDir + L"\\reframework") ||
-        std::filesystem::exists(exeDir + L"\\re2_fw_config.txt")) {
-        return true;
-    }
-
     return false;
 }
 
@@ -198,7 +167,7 @@ void EnsureHookDllLoadedForVdxrBridge() {
         if (fn) {
             fn();
         }
-        LogMessage(LogLevel::Info, "OpenXR Layer (REFramework DX12): Linked VRPacingHook.dll for VDXR D3D11 (LibOVR) bridge.");
+        LogMessage(LogLevel::Info, "OpenXR Layer (Pure VDXR Bridge): Linked VRPacingHook.dll for post-render D3D11 NIS upscaling.");
     }
 }
 
@@ -272,9 +241,8 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     EnsureInit();
     if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
 
-    g_shm.SyncConfig(g_cfg);
-
-    if (IsCurrentProcessBlacklisted() || IsOpenCompositeActive()) {
+    // En sesiones no-D3D11 (DX12/Vulkan/Mods), passthrough 100% puro sin tocar la mascara
+    if (!g_d3d11Device || IsCurrentProcessBlacklisted() || IsOpenCompositeActive()) {
         if (IsOpenCompositeActive() && g_cfg.mask.enabled) {
             static std::atomic<bool> s_ocMaskLogged{ false };
             if (!s_ocMaskLogged.exchange(true)) {
@@ -288,6 +256,8 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         visibilityMask->indexCountOutput = 0;
         return XR_SUCCESS;
     }
+
+    g_shm.SyncConfig(g_cfg);
 
     float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
     PopulateTangentsIfNeeded(session, viewConfigurationType, viewIndex, minX, maxX, minY, maxY);
@@ -448,7 +418,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
     uint32_t* viewCountOutput,
     XrView* views) {
     XrResult res = g_nextLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
-    if (XR_SUCCEEDED(res) && views && viewCountOutput && !IsOpenCompositeActive()) {
+    if (g_d3d11Device && XR_SUCCEEDED(res) && views && viewCountOutput && !IsOpenCompositeActive()) {
         const uint32_t count = (std::min)(*viewCountOutput, 2u);
         for (uint32_t i = 0; i < count; ++i) {
             const float l = std::tan(views[i].fov.angleLeft);
@@ -478,7 +448,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
 }
 
 XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eventData) {
-    if (eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
+    if (g_d3d11Device && eventData && g_activeSession != XR_NULL_HANDLE && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
         for (uint32_t eye = 0; eye < 2; ++eye) {
             if (g_pendingMaskEvent[eye].exchange(false, std::memory_order_relaxed)) {
                 auto* ev = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(eventData);
@@ -500,7 +470,9 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
-    g_reFrameworkBridgeActive.store(false, std::memory_order_relaxed);
+    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+    g_vdxrBridgeActive.store(false, std::memory_order_relaxed);
+    g_vdxrWarmupFrames.store(0, std::memory_order_relaxed);
 
     const auto* next = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
     while (next) {
@@ -522,15 +494,9 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         next = next->next;
     }
 
-    const bool isReFramework = (!g_d3d11Device && !IsCurrentProcessBlacklisted() && IsReFrameworkProcess());
-
     if (!g_d3d11Device) {
         g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-        if (isReFramework) {
-            LogMessage(LogLevel::Info, "OpenXR Layer: REFramework DX12 session detected. Enabling VDXR D3D11 bridge and OpenXR Pacing.");
-        } else {
-            LogMessage(LogLevel::Info, "OpenXR Layer: Non-D3D11 session detected (DX12/Vulkan). Pure passthrough active.");
-        }
+        LogMessage(LogLevel::Info, "OpenXR Layer: Non-D3D11 session (DX12/Vulkan) detected. Pure VDXR Bridge standby active.");
     }
 
     XrResult res = g_nextCreateSession(instance, createInfo, session);
@@ -544,10 +510,8 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         }
         if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
-        } else if (isReFramework) {
-            g_openXrSessionActive.store(true, std::memory_order_relaxed);
-            g_reFrameworkBridgeActive.store(true, std::memory_order_relaxed);
-            EnsureHookDllLoadedForVdxrBridge();
+        } else if (!g_d3d11Device && !IsCurrentProcessBlacklisted()) {
+            g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
         }
     }
     return res;
@@ -558,7 +522,9 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     g_openXrSessionActive.store(false, std::memory_order_relaxed);
-    g_reFrameworkBridgeActive.store(false, std::memory_order_relaxed);
+    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+    g_vdxrBridgeActive.store(false, std::memory_order_relaxed);
+    g_vdxrWarmupFrames.store(0, std::memory_order_relaxed);
     if (g_shm.IsOpenXrD3D11ActiveForCurrentProcess()) {
         g_shm.SetOpenXrD3D11Pid(0);
     }
@@ -888,13 +854,13 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
     static int s_lastMaskState = -1;
     const int curMaskState = g_cfg.mask.enabled ? 1 : 0;
-    if (!IsOpenCompositeActive() && s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
+    if (g_d3d11Device && !IsOpenCompositeActive() && s_lastMaskState != -1 && s_lastMaskState != curMaskState) {
         g_pendingMaskEvent[0].store(true, std::memory_order_relaxed);
         g_pendingMaskEvent[1].store(true, std::memory_order_relaxed);
     }
     s_lastMaskState = curMaskState;
 
-    if (!g_d3d11Device && !g_reFrameworkBridgeActive.load(std::memory_order_relaxed)) {
+    if (!g_d3d11Device && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
         XrResult res = g_nextWaitFrame(session, info, state);
         if (XR_SUCCEEDED(res) && state && state->predictedDisplayTime > 0) {
             g_lastPredictedDisplayTime.store(state->predictedDisplayTime, std::memory_order_relaxed);
@@ -930,7 +896,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_limiter.WaitBeforeRuntime();
     }
 
-    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (REFramework)";
+    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (VDXR Bridge)";
     g_shm.UpdateTelemetry(apiLabel, hz, targetFps,
                           g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                           g_lastFormat, g_upscaleStatus, g_lastHResult);
@@ -996,7 +962,26 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 }
 
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted() || !frameEndInfo || frameEndInfo->layerCount == 0 || !frameEndInfo->layers) {
+    if (!g_d3d11Device) {
+        if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
+            const uint32_t frames = g_vdxrWarmupFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (frames >= 60) {
+                if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") ||
+                    GetModuleHandleW(L"LibOVRRT64_1.dll") ||
+                    GetModuleHandleW(L"LibPVRRT64_1_X.dll")) {
+                    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+                    g_openXrSessionActive.store(true, std::memory_order_relaxed);
+                    g_vdxrBridgeActive.store(true, std::memory_order_relaxed);
+                    EnsureHookDllLoadedForVdxrBridge();
+                } else if (frames >= 300) {
+                    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+        return g_nextEndFrame(session, frameEndInfo);
+    }
+
+    if (IsCurrentProcessBlacklisted() || !frameEndInfo || frameEndInfo->layerCount == 0 || !frameEndInfo->layers) {
         return g_nextEndFrame(session, frameEndInfo);
     }
 
