@@ -17,12 +17,41 @@ bool InstallOpenVRHooksWithStatus();
 
 namespace {
 
+enum class BackendStatus {
+    NotPresent,
+    TransientFailure,
+    ReadyVerified,
+    UnverifiedInvoked,
+    TerminalFailure
+};
+
+// Politica de ciclo de vida:
+// 1. La descarga dinamica (FreeLibrary) NO esta soportada. Antes de instalar cualquier hook,
+//    el modulo se fija en el espacio de direcciones del proceso mediante GET_MODULE_HANDLE_EX_FLAG_PIN.
+//    Si el pin falla, se aborta la instalacion de todos los hooks y se senala Failed.
+// 2. DllMain nunca adquiere g_lifecycleMutex, nunca cierra handles compartidos con el worker y
+//    nunca invoca funciones de logging bajo el Windows Loader Lock.
+// 3. HookWatcherThread y VRPacingHook_RefreshHooks comparten un unico estado serializado (g_state).
+struct LifecycleState {
+    bool loggingInitialized = false;
+    bool modulePinned = false;
+    bool pinFailedTerminal = false;
+    bool loadedSignaled = false;
+    bool readySignaled = false;
+    bool failedSignaled = false;
+    BackendStatus openvrStatus = BackendStatus::NotPresent;
+    int openvrFailures = 0;
+    BackendStatus oculusStatus = BackendStatus::NotPresent;
+};
+
+constexpr int kMaxOpenVrInstallAttempts = 10;
+
 std::atomic<bool> g_stopWatcher{ false };
 std::mutex g_lifecycleMutex;
+LifecycleState g_state{};
 HANDLE g_hLoadedEvent = nullptr;
 HANDLE g_hReadyEvent = nullptr;
 HANDLE g_hFailedEvent = nullptr;
-bool g_modulePinned = false;
 
 uint64_t GetCurrentProcessCreationTime() {
     FILETIME ftCreate{}, ftExit{}, ftKernel{}, ftUser{};
@@ -35,13 +64,11 @@ uint64_t GetCurrentProcessCreationTime() {
     return 0;
 }
 
-void PinSelfModuleOnce() {
-    if (g_modulePinned) return;
+bool TryPinSelfModule() {
     HMODULE hPin = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                           reinterpret_cast<LPCWSTR>(&PinSelfModuleOnce), &hPin)) {
-        g_modulePinned = true;
-    }
+    return (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               reinterpret_cast<LPCWSTR>(&TryPinSelfModule), &hPin) != FALSE &&
+            hPin != nullptr);
 }
 
 void SignalNamedProcessEventLocked(const wchar_t* prefix, HANDLE& outHandle) {
@@ -57,60 +84,107 @@ void SignalNamedProcessEventLocked(const wchar_t* prefix, HANDLE& outHandle) {
     }
 }
 
-bool TryInstallAvailableHooksLocked(bool& openvrDone, bool& oculusDone, int& openvrFailCount) {
-    bool anyNewlyReady = false;
+void AdvanceHookLifecycleLocked() {
+    if (!g_state.loggingInitialized) {
+        vrpacing::InitLogging();
+        vrpacing::LogMessage(vrpacing::LogLevel::Info,
+                             std::string("VRPacingHook worker initialized outside Loader Lock (Build: ") +
+                             __DATE__ + " " + __TIME__ + ").");
+        g_state.loggingInitialized = true;
+    }
 
-    if (!openvrDone && GetModuleHandleW(L"openvr_api.dll")) {
-        PinSelfModuleOnce();
-        if (vrpacing::InstallOpenVRHooksWithStatus()) {
-            openvrDone = true;
-            anyNewlyReady = true;
+    if (!g_state.loadedSignaled) {
+        SignalNamedProcessEventLocked(L"Local\\VRPacingHookLoaded_", g_hLoadedEvent);
+        g_state.loadedSignaled = true;
+    }
+
+    if (g_state.pinFailedTerminal) {
+        return;
+    }
+
+    const bool hasOpenVrMod = (GetModuleHandleW(L"openvr_api.dll") != nullptr);
+    const bool hasOculusMod = (GetModuleHandleW(L"LibOVRRT64_1.dll") != nullptr ||
+                               GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") != nullptr ||
+                               GetModuleHandleW(L"LibPVRRT64_1_X.dll") != nullptr);
+
+    if (!hasOpenVrMod && !hasOculusMod) {
+        return;
+    }
+
+    // Requisito estricto antes de instalar cualquier hook: fijar la DLL en memoria.
+    if (!g_state.modulePinned) {
+        if (TryPinSelfModule()) {
+            g_state.modulePinned = true;
         } else {
-            openvrFailCount++;
+            g_state.pinFailedTerminal = true;
+            vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                                 "CRITICAL: GET_MODULE_HANDLE_EX_FLAG_PIN failed. Aborting all hook installations.");
+            if (!g_state.readySignaled && !g_state.failedSignaled) {
+                SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
+                g_state.failedSignaled = true;
+            }
+            return;
         }
     }
 
-    if (!oculusDone && (GetModuleHandleW(L"LibOVRRT64_1.dll") ||
-                        GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") ||
-                        GetModuleHandleW(L"LibPVRRT64_1_X.dll"))) {
-        PinSelfModuleOnce();
-        vrpacing::InstallOculusHooks();
-        oculusDone = true;
-        anyNewlyReady = true;
+    // 1. Ruta OpenVR (con resultado verificable sobre VR_GetGenericInterface)
+    if (hasOpenVrMod &&
+        g_state.openvrStatus != BackendStatus::ReadyVerified &&
+        g_state.openvrStatus != BackendStatus::TerminalFailure) {
+        if (vrpacing::InstallOpenVRHooksWithStatus()) {
+            g_state.openvrStatus = BackendStatus::ReadyVerified;
+            g_state.openvrFailures = 0;
+            if (!g_state.readySignaled && !g_state.failedSignaled) {
+                SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent);
+                g_state.readySignaled = true;
+                vrpacing::LogMessage(vrpacing::LogLevel::Info,
+                                     "HookLifecycle: OpenVR VR_GetGenericInterface acquisition hook verified READY.");
+            }
+        } else {
+            g_state.openvrFailures++;
+            if (g_state.openvrFailures >= kMaxOpenVrInstallAttempts) {
+                g_state.openvrStatus = BackendStatus::TerminalFailure;
+                vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                                     "HookLifecycle: OpenVR hook installation reached terminal failure after " +
+                                     std::to_string(g_state.openvrFailures) + " attempts.");
+                if (!g_state.readySignaled && !g_state.failedSignaled) {
+                    SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
+                    g_state.failedSignaled = true;
+                }
+            } else {
+                g_state.openvrStatus = BackendStatus::TransientFailure;
+            }
+        }
     }
 
-    return anyNewlyReady;
+    // 2. Ruta Oculus (instalador void sin retorno verificable; no afirma Ready)
+    if (hasOculusMod && g_state.oculusStatus == BackendStatus::NotPresent) {
+        vrpacing::InstallOculusHooks();
+        g_state.oculusStatus = BackendStatus::UnverifiedInvoked;
+        vrpacing::LogMessage(vrpacing::LogLevel::Info,
+                             "HookLifecycle: Oculus LibOVR installer invoked (unverified status; Ready event not asserted).");
+    }
 }
 
 DWORD WINAPI HookWatcherThread(LPVOID) {
-    {
-        std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-        SignalNamedProcessEventLocked(L"Local\\VRPacingHookLoaded_", g_hLoadedEvent);
-    }
-
-    bool openvrDone = false;
-    bool oculusDone = false;
-    bool readySignaled = false;
-    bool failedSignaled = false;
-    int openvrFailCount = 0;
-
     while (!g_stopWatcher.load(std::memory_order_relaxed)) {
+        bool shouldExitLoop = false;
         {
             std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-            TryInstallAvailableHooksLocked(openvrDone, oculusDone, openvrFailCount);
+            AdvanceHookLifecycleLocked();
 
-            if ((openvrDone || oculusDone) && !readySignaled) {
-                SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent);
-                readySignaled = true;
-            } else if (!readySignaled && !failedSignaled && openvrFailCount >= 10) {
-                SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
-                failedSignaled = true;
-                vrpacing::LogMessage(vrpacing::LogLevel::Error,
-                                     "HookWatcherThread: OpenVR hook installation failed repeatedly after 10 attempts.");
+            const bool openvrSettled = (g_state.openvrStatus == BackendStatus::ReadyVerified ||
+                                        g_state.openvrStatus == BackendStatus::TerminalFailure);
+            const bool oculusSettled = (g_state.oculusStatus == BackendStatus::UnverifiedInvoked);
+
+            if (g_state.pinFailedTerminal ||
+                g_state.openvrStatus == BackendStatus::TerminalFailure ||
+                (openvrSettled && oculusSettled)) {
+                shouldExitLoop = true;
             }
         }
 
-        if ((openvrDone && oculusDone) || failedSignaled) {
+        if (shouldExitLoop) {
             break;
         }
 
@@ -123,28 +197,13 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
 
 extern "C" __declspec(dllexport) void __cdecl VRPacingHook_RefreshHooks() {
     std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-    SignalNamedProcessEventLocked(L"Local\\VRPacingHookLoaded_", g_hLoadedEvent);
-
-    bool openvrDone = false;
-    bool oculusDone = false;
-    int openvrFailCount = 0;
-    TryInstallAvailableHooksLocked(openvrDone, oculusDone, openvrFailCount);
-
-    if (openvrDone || oculusDone) {
-        SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent);
-    } else if (openvrFailCount > 0) {
-        SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
-    }
+    AdvanceHookLifecycleLocked();
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID lpReserved) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(module);
-            vrpacing::InitLogging();
-            vrpacing::LogMessage(vrpacing::LogLevel::Info,
-                                 std::string("VRPacingHook loaded into process (Build: ") + __DATE__ + " " + __TIME__ + ").");
-
             HANDLE hThread = CreateThread(nullptr, 0, HookWatcherThread, nullptr, 0, nullptr);
             if (hThread) {
                 CloseHandle(hThread);
@@ -152,25 +211,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID lpReserved) {
             break;
         }
         case DLL_PROCESS_DETACH:
+            // El modulo permanece fijado (GET_MODULE_HANDLE_EX_FLAG_PIN); no se adquiere
+            // g_lifecycleMutex ni se cierran handles compartidos bajo el Loader Lock.
             g_stopWatcher.store(true, std::memory_order_relaxed);
-            if (lpReserved == nullptr) {
-                std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-                if (g_hFailedEvent) {
-                    CloseHandle(g_hFailedEvent);
-                    g_hFailedEvent = nullptr;
-                }
-                if (g_hReadyEvent) {
-                    CloseHandle(g_hReadyEvent);
-                    g_hReadyEvent = nullptr;
-                }
-                if (g_hLoadedEvent) {
-                    CloseHandle(g_hLoadedEvent);
-                    g_hLoadedEvent = nullptr;
-                }
-            }
-            vrpacing::LogMessage(vrpacing::LogLevel::Info,
-                                 lpReserved ? "VRPacingHook detached (process terminating)."
-                                            : "VRPacingHook detached (explicit unload).");
             break;
         default:
             break;

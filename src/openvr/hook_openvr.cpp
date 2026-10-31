@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -52,9 +53,10 @@ struct HookSlotRegistry {
     std::unordered_map<void*, void*> instanceToTarget;
 };
 
-// Separacion estricta de cerrojos (Seccion 3.5):
-// - g_installMutex: serializa la creacion/habilitacion de hooks en MinHook (nunca tomado en callbacks).
-// - g_registryMutex: protege solo lecturas/escrituras rapidas en memoria (nunca mantenido durante MinHook ni D3D11).
+// Separacion de cerrojos:
+// - g_installMutex: serializa la instalacion en MinHook (nunca adquirido en callbacks).
+// - g_registryMutex: protege solo lecturas/escrituras en memoria de HookSlotRegistry y
+//   g_loggedDiagInterfaces (nunca mantenido durante llamadas a MinHook, D3D11 ni LogMessage).
 // - g_gfxMutex: protege la inicializacion de recursos D3D11 en HookedSubmit.
 std::mutex g_installMutex;
 std::mutex g_registryMutex;
@@ -106,15 +108,11 @@ std::string PtrToHex(const void* ptr) {
     return std::string(buf);
 }
 
-// Verifica explicitamente si la version de IVRCompositor pertenece al rango validado (012..028),
-// donde WaitGetPoses ocupa vtbl[2] y Submit ocupa vtbl[5].
+// Lista explicita de versiones de IVRCompositor verificadas (vtbl[2] = WaitGetPoses, vtbl[5] = Submit).
 bool GetVerifiedCompositorSlots(const char* name, uint32_t& outWaitSlot, uint32_t& outSubmitSlot) {
     if (!name) return false;
-    unsigned int version = 0;
-    if (::sscanf_s(name, "IVRCompositor_%u", &version) != 1) {
-        return false;
-    }
-    if (version >= 12 && version <= 28) {
+    if (std::strcmp(name, "IVRCompositor_022") == 0 ||
+        std::strcmp(name, "IVRCompositor_026") == 0) {
         outWaitSlot = 2;
         outSubmitSlot = 5;
         return true;
@@ -149,7 +147,7 @@ FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self) {
 }
 
 // Requiere que el llamador mantenga g_installMutex.
-// Nunca mantiene g_registryMutex durante MH_CreateHook, MH_EnableHook ni MH_RemoveHook.
+// Nunca mantiene g_registryMutex durante MH_CreateHook, MH_EnableHook, MH_RemoveHook ni LogMessage.
 bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
                                      const char* ifaceName,
                                      const char* methodName,
@@ -163,19 +161,25 @@ bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
 
     void* targetFn = vtbl[slotIdx];
 
+    void* existingTrampoline = nullptr;
+    bool newlyAssociated = false;
     {
         std::lock_guard<std::mutex> regLock(g_registryMutex);
         auto itExisting = reg.targetToTrampoline.find(targetFn);
         if (itExisting != reg.targetToTrampoline.end()) {
-            const bool wasMapped = (reg.instanceToTarget.find(iface) != reg.instanceToTarget.end());
+            existingTrampoline = itExisting->second;
+            newlyAssociated = (reg.instanceToTarget.find(iface) == reg.instanceToTarget.end());
             reg.instanceToTarget[iface] = targetFn;
-            if (!wasMapped) {
-                LogMessage(LogLevel::Info, "OpenVR Hook: Associated " + std::string(ifaceName) + "::" + methodName +
-                           " [iface=" + PtrToHex(iface) + ", vtbl[" + std::to_string(slotIdx) + "]=" + PtrToHex(targetFn) +
-                           "] with existing verified trampoline=" + PtrToHex(itExisting->second));
-            }
-            return true;
         }
+    }
+
+    if (existingTrampoline) {
+        if (newlyAssociated) {
+            LogMessage(LogLevel::Info, "OpenVR Hook: Associated " + std::string(ifaceName) + "::" + methodName +
+                       " [iface=" + PtrToHex(iface) + ", vtbl[" + std::to_string(slotIdx) + "]=" + PtrToHex(targetFn) +
+                       "] with existing verified trampoline=" + PtrToHex(existingTrampoline));
+        }
+        return true;
     }
 
     void* trampoline = nullptr;
@@ -678,7 +682,7 @@ void HookCompositorInstance(const char* name, void* iface) {
     uint32_t waitSlot = 0;
     uint32_t submitSlot = 0;
     if (!GetVerifiedCompositorSlots(name, waitSlot, submitSlot)) {
-        LogMessage(LogLevel::Warn, "OpenVR Hook: Unsupported IVRCompositor version \"" +
+        LogMessage(LogLevel::Warn, "OpenVR Hook: Unverified IVRCompositor version \"" +
                    std::string(name) + "\". Leaving in passthrough.");
         return;
     }
@@ -698,15 +702,20 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
         return iface;
     }
 
+    bool shouldLogDiag = false;
     {
         std::lock_guard<std::mutex> regLock(g_registryMutex);
         std::string diagKey = std::string(name) + "@" + PtrToHex(iface);
         if (g_loggedDiagInterfaces.find(diagKey) == g_loggedDiagInterfaces.end()) {
             g_loggedDiagInterfaces.insert(diagKey);
-            const int errCode = error ? *error : 0;
-            LogMessage(LogLevel::Info, "OpenVR [DIAG] VR_GetGenericInterface: name=\"" + std::string(name) +
-                       "\" -> iface=" + PtrToHex(iface) + " (err=" + std::to_string(errCode) + ")");
+            shouldLogDiag = true;
         }
+    }
+
+    if (shouldLogDiag) {
+        const int errCode = error ? *error : 0;
+        LogMessage(LogLevel::Info, "OpenVR [DIAG] VR_GetGenericInterface: name=\"" + std::string(name) +
+                   "\" -> iface=" + PtrToHex(iface) + " (err=" + std::to_string(errCode) + ")");
     }
 
     if (!iface) {

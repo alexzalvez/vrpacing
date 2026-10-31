@@ -31,6 +31,11 @@
 namespace vrpacing {
 namespace {
 
+// Contrato de concurrencia de ProcessScanner:
+// Todas las estructuras de estado de este archivo son accedidas exclusivamente desde el
+// hilo principal de interfaz (UI thread) de VRPacingTray.exe a traves del temporizador
+// WM_TIMER (IDT_SCANNER_TIMER). No existen llamadas concurrentes desde hilos secundarios.
+
 struct TrackedProcessInstance {
     DWORD pid = 0;
     uint64_t creationTime = 0;
@@ -347,7 +352,7 @@ void UpdatePendingInjections() {
                 LogMessage(LogLevel::Info, "ProcessScanner: Deferred remote thread finished for " +
                            entry.exeName + " [PID " + std::to_string(entry.pid) +
                            "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
-                           ", Hooks Ready=" + std::to_string(ready ? 1 : 0) + ").");
+                           ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + ").");
 
                 if (loaded) entry.loadedLogged = true;
                 if (ready) entry.readyLogged = true;
@@ -373,17 +378,10 @@ void UpdatePendingInjections() {
                            entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
             }
 
-            if (IsNamedInstanceEventSignaled(L"Local\\VRPacingHookFailed_", entry.pid, entry.creationTime)) {
-                BlockProcessInstanceFromRetry(entry, false,
-                                              "VRPacingHook reported hook installation failure via Failed event");
-                it = s_pendingInjections.erase(it);
-                continue;
-            }
-
             if (!entry.readyLogged &&
                 IsNamedInstanceEventSignaled(L"Local\\VRPacingHookReady_", entry.pid, entry.creationTime)) {
                 entry.readyLogged = true;
-                LogMessage(LogLevel::Info, "ProcessScanner: VRPacingHook instrumentation confirmed READY in " +
+                LogMessage(LogLevel::Info, "ProcessScanner: OpenVR VR_GetGenericInterface hook confirmed READY in " +
                            entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
             }
 
@@ -393,9 +391,18 @@ void UpdatePendingInjections() {
                 continue;
             }
 
+            if (IsNamedInstanceEventSignaled(L"Local\\VRPacingHookFailed_", entry.pid, entry.creationTime)) {
+                BlockProcessInstanceFromRetry(entry, false,
+                                              "VRPacingHook reported terminal hook installation failure via Failed event");
+                it = s_pendingInjections.erase(it);
+                continue;
+            }
+
             if ((GetTickCount64() - entry.startTick) > 15000) {
                 BlockProcessInstanceFromRetry(entry, false,
-                                              "Timed out (15000ms) waiting for verified Ready signal from DLL");
+                                              entry.loadedLogged
+                                                  ? "DLL loaded without verified OpenVR Ready signal (e.g. unverified Oculus path)"
+                                                  : "Timed out (15000ms) waiting for DLL Load/Ready confirmation");
                 it = s_pendingInjections.erase(it);
                 continue;
             }
@@ -482,21 +489,21 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
         LogMessage(LogLevel::Info, "ProcessScanner: Injection thread finished for " +
                    exeName + " [PID " + std::to_string(pid) +
                    "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
-                   ", Hooks Ready=" + std::to_string(ready ? 1 : 0) + ").");
-
-        if (failed) {
-            BlockProcessInstanceFromRetry(entry, false,
-                                          "VRPacingHook reported hook installation failure via Failed event");
-            return false;
-        }
+                   ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + ").");
 
         if (loaded) entry.loadedLogged = true;
         if (ready) {
             entry.readyLogged = true;
-            LogMessage(LogLevel::Info, "ProcessScanner: VRPacingHook instrumentation confirmed READY in " +
+            LogMessage(LogLevel::Info, "ProcessScanner: OpenVR VR_GetGenericInterface hook confirmed READY in " +
                        exeName + " [PID " + std::to_string(pid) + "].");
             PromoteToHookedInstance(entry);
             return true;
+        }
+
+        if (failed) {
+            BlockProcessInstanceFromRetry(entry, false,
+                                          "VRPacingHook reported terminal hook installation failure via Failed event");
+            return false;
         }
 
         s_pendingInjections[pid] = entry;
@@ -518,6 +525,7 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
 
 } // namespace
 
+// Nota: Debe invocarse exclusivamente desde el mismo hilo de interfaz que PollAndInject.
 bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
     EnableDebugPrivilegeOnce();
     PruneExitedTrackedProcesses();
@@ -542,7 +550,15 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
     return injected;
 }
 
+// Invocado exclusivamente desde el hilo UI de VRPacingTray.exe mediante WM_TIMER (IDT_SCANNER_TIMER).
 void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
+    static std::once_flag s_logInitFlag;
+    std::call_once(s_logInitFlag, []() {
+        LogMessage(LogLevel::Info,
+                   std::string("ProcessScanner initialized (single-threaded UI timer contract, Build: ") +
+                   __DATE__ + " " + __TIME__ + ").");
+    });
+
     EnableDebugPrivilegeOnce();
     PruneExitedTrackedProcesses();
     UpdatePendingInjections();
