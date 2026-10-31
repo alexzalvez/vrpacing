@@ -349,10 +349,10 @@ void UpdatePendingInjections() {
 
                 const bool loaded = IsNamedInstanceEventSignaled(L"Local\\VRPacingHookLoaded_", entry.pid, entry.creationTime);
                 const bool ready = IsNamedInstanceEventSignaled(L"Local\\VRPacingHookReady_", entry.pid, entry.creationTime);
-                LogMessage(LogLevel::Info, "ProcessScanner: Deferred remote thread finished for " +
+                LogMessage(LogLevel::Info, "ProcessScanner: Deferred LoadLibraryW thread exited for " +
                            entry.exeName + " [PID " + std::to_string(entry.pid) +
-                           "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
-                           ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + ").");
+                           "] (provisional state: Loaded=" + std::to_string(loaded ? 1 : 0) +
+                           ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + "; awaiting async worker signal).");
 
                 if (loaded) entry.loadedLogged = true;
                 if (ready) entry.readyLogged = true;
@@ -486,10 +486,10 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
         const bool ready = IsNamedInstanceEventSignaled(L"Local\\VRPacingHookReady_", pid, creationTime);
         const bool failed = IsNamedInstanceEventSignaled(L"Local\\VRPacingHookFailed_", pid, creationTime);
 
-        LogMessage(LogLevel::Info, "ProcessScanner: Injection thread finished for " +
+        LogMessage(LogLevel::Info, "ProcessScanner: LoadLibraryW thread exited for " +
                    exeName + " [PID " + std::to_string(pid) +
-                   "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
-                   ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + ").");
+                   "] (provisional state: Loaded=" + std::to_string(loaded ? 1 : 0) +
+                   ", OpenVR Ready=" + std::to_string(ready ? 1 : 0) + "; awaiting async worker signal).");
 
         if (loaded) entry.loadedLogged = true;
         if (ready) {

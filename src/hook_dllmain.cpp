@@ -71,17 +71,36 @@ bool TryPinSelfModule() {
             hPin != nullptr);
 }
 
-void SignalNamedProcessEventLocked(const wchar_t* prefix, HANDLE& outHandle) {
+bool SignalNamedProcessEventLocked(const wchar_t* prefix, HANDLE& outHandle) {
     const DWORD pid = GetCurrentProcessId();
     const uint64_t createTime = GetCurrentProcessCreationTime();
+    if (createTime == 0) {
+        const DWORD err = GetLastError();
+        vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                             "HookLifecycle: GetCurrentProcessCreationTime failed (GLE=" +
+                             std::to_string(err) + "); refusing to signal event with invalid identity.");
+        return false;
+    }
+
     wchar_t evName[128]{};
     swprintf_s(evName, L"%s%lu_%llX", prefix, pid, static_cast<unsigned long long>(createTime));
     if (!outHandle) {
         outHandle = CreateEventW(nullptr, TRUE, FALSE, evName);
+        if (!outHandle) {
+            const DWORD err = GetLastError();
+            vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                                 "HookLifecycle: CreateEventW failed (GLE=" + std::to_string(err) + ").");
+            return false;
+        }
     }
-    if (outHandle) {
-        SetEvent(outHandle);
+
+    if (!SetEvent(outHandle)) {
+        const DWORD err = GetLastError();
+        vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                             "HookLifecycle: SetEvent failed (GLE=" + std::to_string(err) + ").");
+        return false;
     }
+    return true;
 }
 
 void AdvanceHookLifecycleLocked() {
@@ -94,11 +113,17 @@ void AdvanceHookLifecycleLocked() {
     }
 
     if (!g_state.loadedSignaled) {
-        SignalNamedProcessEventLocked(L"Local\\VRPacingHookLoaded_", g_hLoadedEvent);
-        g_state.loadedSignaled = true;
+        if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookLoaded_", g_hLoadedEvent)) {
+            g_state.loadedSignaled = true;
+        }
     }
 
     if (g_state.pinFailedTerminal) {
+        if (!g_state.readySignaled && !g_state.failedSignaled) {
+            if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent)) {
+                g_state.failedSignaled = true;
+            }
+        }
         return;
     }
 
@@ -120,8 +145,9 @@ void AdvanceHookLifecycleLocked() {
             vrpacing::LogMessage(vrpacing::LogLevel::Error,
                                  "CRITICAL: GET_MODULE_HANDLE_EX_FLAG_PIN failed. Aborting all hook installations.");
             if (!g_state.readySignaled && !g_state.failedSignaled) {
-                SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
-                g_state.failedSignaled = true;
+                if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent)) {
+                    g_state.failedSignaled = true;
+                }
             }
             return;
         }
@@ -134,12 +160,6 @@ void AdvanceHookLifecycleLocked() {
         if (vrpacing::InstallOpenVRHooksWithStatus()) {
             g_state.openvrStatus = BackendStatus::ReadyVerified;
             g_state.openvrFailures = 0;
-            if (!g_state.readySignaled && !g_state.failedSignaled) {
-                SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent);
-                g_state.readySignaled = true;
-                vrpacing::LogMessage(vrpacing::LogLevel::Info,
-                                     "HookLifecycle: OpenVR VR_GetGenericInterface acquisition hook verified READY.");
-            }
         } else {
             g_state.openvrFailures++;
             if (g_state.openvrFailures >= kMaxOpenVrInstallAttempts) {
@@ -147,13 +167,25 @@ void AdvanceHookLifecycleLocked() {
                 vrpacing::LogMessage(vrpacing::LogLevel::Error,
                                      "HookLifecycle: OpenVR hook installation reached terminal failure after " +
                                      std::to_string(g_state.openvrFailures) + " attempts.");
-                if (!g_state.readySignaled && !g_state.failedSignaled) {
-                    SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent);
-                    g_state.failedSignaled = true;
-                }
             } else {
                 g_state.openvrStatus = BackendStatus::TransientFailure;
             }
+        }
+    }
+
+    // Publicacion/recuperacion de eventos Ready/Failed desacoplada de la instalacion:
+    // si SetEvent fallo transitoriamente en un ciclo previo, se reintenta sin reinstalar hooks.
+    if (g_state.openvrStatus == BackendStatus::ReadyVerified &&
+        !g_state.readySignaled && !g_state.failedSignaled) {
+        if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent)) {
+            g_state.readySignaled = true;
+            vrpacing::LogMessage(vrpacing::LogLevel::Info,
+                                 "HookLifecycle: OpenVR VR_GetGenericInterface acquisition hook verified READY.");
+        }
+    } else if (g_state.openvrStatus == BackendStatus::TerminalFailure &&
+               !g_state.readySignaled && !g_state.failedSignaled) {
+        if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent)) {
+            g_state.failedSignaled = true;
         }
     }
 
@@ -167,19 +199,28 @@ void AdvanceHookLifecycleLocked() {
 }
 
 DWORD WINAPI HookWatcherThread(LPVOID) {
+    int postSettleSignalRetries = 0;
     while (!g_stopWatcher.load(std::memory_order_relaxed)) {
         bool shouldExitLoop = false;
         {
             std::lock_guard<std::mutex> lock(g_lifecycleMutex);
             AdvanceHookLifecycleLocked();
 
-            const bool openvrSettled = (g_state.openvrStatus == BackendStatus::ReadyVerified ||
-                                        g_state.openvrStatus == BackendStatus::TerminalFailure);
+            const bool openvrSettled =
+                (g_state.openvrStatus == BackendStatus::ReadyVerified && g_state.readySignaled) ||
+                (g_state.openvrStatus == BackendStatus::TerminalFailure && g_state.failedSignaled);
             const bool oculusSettled = (g_state.oculusStatus == BackendStatus::UnverifiedInvoked);
+            const bool pinFailSettled = (g_state.pinFailedTerminal && g_state.failedSignaled);
 
-            if (g_state.pinFailedTerminal ||
-                g_state.openvrStatus == BackendStatus::TerminalFailure ||
-                (openvrSettled && oculusSettled)) {
+            if (g_state.loadedSignaled &&
+                (pinFailSettled ||
+                 (g_state.openvrStatus == BackendStatus::TerminalFailure && g_state.failedSignaled) ||
+                 (openvrSettled && oculusSettled))) {
+                shouldExitLoop = true;
+            } else if ((g_state.pinFailedTerminal ||
+                        g_state.openvrStatus == BackendStatus::ReadyVerified ||
+                        g_state.openvrStatus == BackendStatus::TerminalFailure) &&
+                       ++postSettleSignalRetries >= 20) {
                 shouldExitLoop = true;
             }
         }

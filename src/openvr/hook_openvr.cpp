@@ -54,7 +54,8 @@ struct HookSlotRegistry {
 };
 
 // Separacion de cerrojos:
-// - g_installMutex: serializa la instalacion en MinHook (nunca adquirido en callbacks).
+// - g_installMutex: serializa la instalacion en MinHook (adquirido en InstallOpenVRHooksWithStatus y
+//   en HookCompositorInstance desde HookedVRGetGenericInterface; nunca adquirido en los callbacks por frame HookedWaitGetPoses/HookedSubmit).
 // - g_registryMutex: protege solo lecturas/escrituras en memoria de HookSlotRegistry y
 //   g_loggedDiagInterfaces (nunca mantenido durante llamadas a MinHook, D3D11 ni LogMessage).
 // - g_gfxMutex: protege la inicializacion de recursos D3D11 en HookedSubmit.
