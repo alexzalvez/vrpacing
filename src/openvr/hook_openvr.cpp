@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -45,13 +46,16 @@ VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
 
-std::mutex g_mutex;
-std::unordered_map<void*, WaitGetPosesFn> g_origWaitGetPosesMap;
-std::unordered_map<void*, SubmitFn> g_origSubmitMap;
-std::unordered_set<std::string> g_hookedInterfaces;
+struct HookSlotRegistry {
+    std::unordered_map<void*, void*> targetToTrampoline;
+    std::unordered_map<void*, void*> instanceToTarget;
+    std::unordered_set<uint32_t> activeSlots;
+};
 
-WaitGetPosesFn g_activeOrigWaitGetPoses = nullptr;
-SubmitFn g_activeOrigSubmit = nullptr;
+std::mutex g_mutex;
+HookSlotRegistry g_waitGetPosesReg;
+HookSlotRegistry g_submitReg;
+std::unordered_set<std::string> g_loggedDiagInterfaces;
 
 RuntimeConfig g_cfg;
 FrameLimiterWin g_limiter;
@@ -87,6 +91,100 @@ struct OpenVRContext {
 };
 
 OpenVRContext g_ovrCtx;
+
+std::string PtrToHex(const void* ptr) {
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "0x%p", ptr);
+    return std::string(buf);
+}
+
+template <typename FnType>
+FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self) {
+    if (!self) return nullptr;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    auto itInst = reg.instanceToTarget.find(self);
+    if (itInst != reg.instanceToTarget.end()) {
+        auto itTramp = reg.targetToTrampoline.find(itInst->second);
+        if (itTramp != reg.targetToTrampoline.end()) {
+            return reinterpret_cast<FnType>(itTramp->second);
+        }
+    }
+
+    // Si otro objeto wrapper comparte exactamente la misma funcion destino en su vtable,
+    // verificamos si la direccion del slot coincide con un destino registrado por este modulo.
+    void** vtbl = *reinterpret_cast<void***>(self);
+    if (vtbl) {
+        for (uint32_t slot : reg.activeSlots) {
+            void* candidateTarget = vtbl[slot];
+            auto itTramp = reg.targetToTrampoline.find(candidateTarget);
+            if (itTramp != reg.targetToTrampoline.end()) {
+                return reinterpret_cast<FnType>(itTramp->second);
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+bool RegisterAndEnableSlotHook(HookSlotRegistry& reg,
+                               const char* ifaceName,
+                               const char* methodName,
+                               void* iface,
+                               uint32_t slotIdx,
+                               void* detourFn) {
+    if (!iface || !detourFn) return false;
+
+    void** vtbl = *reinterpret_cast<void***>(iface);
+    if (!vtbl || !vtbl[slotIdx]) return false;
+
+    void* targetFn = vtbl[slotIdx];
+
+    // 1. Comprobar si esta direccion exacta ya fue interceptada y verificada por este registro
+    auto itExisting = reg.targetToTrampoline.find(targetFn);
+    if (itExisting != reg.targetToTrampoline.end()) {
+        const bool wasMapped = (reg.instanceToTarget.find(iface) != reg.instanceToTarget.end());
+        reg.instanceToTarget[iface] = targetFn;
+        reg.activeSlots.insert(slotIdx);
+        if (!wasMapped) {
+            LogMessage(LogLevel::Info, "OpenVR Hook: Associated " + std::string(ifaceName) + "::" + methodName +
+                       " [iface=" + PtrToHex(iface) + ", vtbl[" + std::to_string(slotIdx) + "]=" + PtrToHex(targetFn) +
+                       "] with existing verified trampoline=" + PtrToHex(itExisting->second));
+        }
+        return true;
+    }
+
+    // 2. Crear nuevo hook verificando el estado devuelto por MinHook
+    void* trampoline = nullptr;
+    const MH_STATUS stCreate = MH_CreateHook(targetFn, detourFn, &trampoline);
+    if (stCreate != MH_OK || !trampoline) {
+        LogMessage(LogLevel::Error, "OpenVR Hook: MH_CreateHook failed for " + std::string(ifaceName) + "::" + methodName +
+                   " [iface=" + PtrToHex(iface) + ", vtbl[" + std::to_string(slotIdx) + "]=" + PtrToHex(targetFn) +
+                   "] status=" + std::string(MH_StatusToString(stCreate)) + ". Leaving unhooked (no fallback).");
+        return false;
+    }
+
+    // 3. Registrar asociaciones ANTES de habilitar el hook para evitar carreras de entrada
+    reg.targetToTrampoline[targetFn] = trampoline;
+    reg.instanceToTarget[iface] = targetFn;
+    reg.activeSlots.insert(slotIdx);
+
+    const MH_STATUS stEnable = MH_EnableHook(targetFn);
+    if (stEnable != MH_OK && stEnable != MH_ERROR_ENABLED) {
+        reg.targetToTrampoline.erase(targetFn);
+        reg.instanceToTarget.erase(iface);
+        MH_RemoveHook(targetFn);
+        LogMessage(LogLevel::Error, "OpenVR Hook: MH_EnableHook failed for " + std::string(ifaceName) + "::" + methodName +
+                   " [target=" + PtrToHex(targetFn) + "] status=" + std::string(MH_StatusToString(stEnable)) + ". Rolled back.");
+        return false;
+    }
+
+    LogMessage(LogLevel::Info, "OpenVR Hook installed: " + std::string(ifaceName) + "::" + methodName +
+               " [iface=" + PtrToHex(iface) + ", vtbl[" + std::to_string(slotIdx) + "]=" + PtrToHex(targetFn) +
+               ", trampoline=" + PtrToHex(trampoline) + "]");
+    return true;
+}
 
 bool IsOpenXrLayerHandlingD3D11() {
     HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
@@ -166,14 +264,14 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          uint32_t unRenderPoseArrayCount,
                                          vr::TrackedDevicePose_t* pGamePoseArray,
                                          uint32_t unGamePoseArrayCount) {
-    WaitGetPosesFn origFn = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_origWaitGetPosesMap.find(self);
-        origFn = (it != g_origWaitGetPosesMap.end()) ? it->second : g_activeOrigWaitGetPoses;
+    WaitGetPosesFn origFn = ResolveSlotTrampoline<WaitGetPosesFn>(g_waitGetPosesReg, self);
+    if (!origFn) {
+        static std::atomic<bool> s_loggedMiss{ false };
+        if (!s_loggedMiss.exchange(true)) {
+            LogMessage(LogLevel::Error, "OpenVR Hook: Unresolved trampoline in HookedWaitGetPoses for self=" + PtrToHex(self));
+        }
+        return vr::VRCompositorError_None;
     }
-
-    if (!origFn) return vr::VRCompositorError_None;
 
     if (IsOpenXrLayerHandlingD3D11()) {
         return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
@@ -329,14 +427,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
                                     const vr::Texture_t* pTexture,
                                     const vr::VRTextureBounds_t* pBounds,
                                     vr::EVRSubmitFlags nSubmitFlags) {
-    SubmitFn origFn = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_origSubmitMap.find(self);
-        origFn = (it != g_origSubmitMap.end()) ? it->second : g_activeOrigSubmit;
+    SubmitFn origFn = ResolveSlotTrampoline<SubmitFn>(g_submitReg, self);
+    if (!origFn) {
+        static std::atomic<bool> s_loggedMiss{ false };
+        if (!s_loggedMiss.exchange(true)) {
+            LogMessage(LogLevel::Error, "OpenVR Hook: Unresolved trampoline in HookedSubmit for self=" + PtrToHex(self));
+        }
+        return vr::VRCompositorError_None;
     }
-
-    if (!origFn) return vr::VRCompositorError_None;
 
     if (IsOpenXrLayerHandlingD3D11()) {
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
@@ -562,38 +660,33 @@ void HookCompositorInstance(const char* name, void* iface) {
         submitIndex = 4;
     }
 
-    void** vtbl = *reinterpret_cast<void***>(iface);
     MH_Initialize();
 
-    WaitGetPosesFn origWait = nullptr;
-    if (MH_CreateHook(vtbl[2], reinterpret_cast<void*>(&HookedWaitGetPoses), reinterpret_cast<void**>(&origWait)) == MH_OK) {
-        MH_EnableHook(vtbl[2]);
-        g_origWaitGetPosesMap[iface] = origWait;
-        g_activeOrigWaitGetPoses = origWait;
-    } else if (g_activeOrigWaitGetPoses) {
-        g_origWaitGetPosesMap[iface] = g_activeOrigWaitGetPoses;
-    }
-
-    SubmitFn origSub = nullptr;
-    if (MH_CreateHook(vtbl[submitIndex], reinterpret_cast<void*>(&HookedSubmit), reinterpret_cast<void**>(&origSub)) == MH_OK) {
-        MH_EnableHook(vtbl[submitIndex]);
-        g_origSubmitMap[iface] = origSub;
-        g_activeOrigSubmit = origSub;
-    } else if (g_activeOrigSubmit) {
-        g_origSubmitMap[iface] = g_activeOrigSubmit;
-    }
-
-    if (g_hookedInterfaces.find(name) == g_hookedInterfaces.end()) {
-        g_hookedInterfaces.insert(name);
-        LogMessage(LogLevel::Info, "OpenVR hooks installed on " + std::string(name) +
-                   " (WaitGetPoses vtbl[2], Submit vtbl[" + std::to_string(submitIndex) + "])");
-    }
+    RegisterAndEnableSlotHook(g_waitGetPosesReg, name, "WaitGetPoses", iface, 2,
+                              reinterpret_cast<void*>(&HookedWaitGetPoses));
+    RegisterAndEnableSlotHook(g_submitReg, name, "Submit", iface, submitIndex,
+                              reinterpret_cast<void*>(&HookedSubmit));
 }
 
 void* HookedVRGetGenericInterface(const char* name, int* error) {
     void* iface = g_origGetGenericInterface(name, error);
-    if (!iface || !name) {
+    if (!name) {
         return iface;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        std::string diagKey = std::string(name) + "@" + PtrToHex(iface);
+        if (g_loggedDiagInterfaces.find(diagKey) == g_loggedDiagInterfaces.end()) {
+            g_loggedDiagInterfaces.insert(diagKey);
+            const int errCode = error ? *error : 0;
+            LogMessage(LogLevel::Info, "OpenVR [DIAG] VR_GetGenericInterface: name=\"" + std::string(name) +
+                       "\" -> iface=" + PtrToHex(iface) + " (err=" + std::to_string(errCode) + ")");
+        }
+    }
+
+    if (!iface) {
+        return nullptr;
     }
 
     std::string sName(name);
@@ -623,11 +716,29 @@ void InstallOpenVRHooks() {
     if (!fn) return;
 
     MH_Initialize();
-    if (MH_CreateHook(reinterpret_cast<void*>(fn), reinterpret_cast<void*>(&HookedVRGetGenericInterface), reinterpret_cast<void**>(&g_origGetGenericInterface)) == MH_OK) {
-        MH_EnableHook(reinterpret_cast<void*>(fn));
-        s_installed.store(true);
-        LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed.");
+    void* origFn = nullptr;
+    const MH_STATUS stCreate = MH_CreateHook(reinterpret_cast<void*>(fn),
+                                             reinterpret_cast<void*>(&HookedVRGetGenericInterface),
+                                             &origFn);
+    if (stCreate != MH_OK || !origFn) {
+        LogMessage(LogLevel::Error, "OpenVR Hook: MH_CreateHook failed on VR_GetGenericInterface status=" +
+                   std::string(MH_StatusToString(stCreate)));
+        return;
     }
+
+    g_origGetGenericInterface = reinterpret_cast<VRGetGenericInterfaceFn>(origFn);
+    const MH_STATUS stEnable = MH_EnableHook(reinterpret_cast<void*>(fn));
+    if (stEnable != MH_OK && stEnable != MH_ERROR_ENABLED) {
+        g_origGetGenericInterface = nullptr;
+        MH_RemoveHook(reinterpret_cast<void*>(fn));
+        LogMessage(LogLevel::Error, "OpenVR Hook: MH_EnableHook failed on VR_GetGenericInterface status=" +
+                   std::string(MH_StatusToString(stEnable)));
+        return;
+    }
+
+    s_installed.store(true);
+    LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed [target=" +
+               PtrToHex(reinterpret_cast<const void*>(fn)) + ", trampoline=" + PtrToHex(origFn) + "].");
 }
 
 } // namespace vrpacing

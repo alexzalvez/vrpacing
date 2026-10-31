@@ -14,6 +14,7 @@
 #include <psapi.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <mutex>
@@ -29,9 +30,55 @@
 namespace vrpacing {
 namespace {
 
+struct PendingInjection {
+    DWORD pid = 0;
+    std::string exeName;
+    HANDLE hProcess = nullptr;
+    HANDLE hThread = nullptr;
+    void* remoteMem = nullptr;
+    ULONGLONG startTick = 0;
+    bool threadFinished = false;
+    bool loadedLogged = false;
+    bool readyLogged = false;
+};
+
 std::unordered_set<DWORD> s_systemIgnoredPids;
 std::unordered_set<DWORD> s_hookedPids;
 std::unordered_map<DWORD, int> s_openFailCounts;
+std::unordered_map<DWORD, PendingInjection> s_pendingInjections;
+
+std::string WideToNarrow(const wchar_t* wstr) {
+    if (!wstr) return "";
+    char buf[MAX_PATH]{};
+    size_t converted = 0;
+    wcstombs_s(&converted, buf, wstr, sizeof(buf) - 1);
+    return std::string(buf);
+}
+
+bool IsNamedProcessEventSignaled(const wchar_t* prefix, DWORD pid) {
+    wchar_t evName[96]{};
+    swprintf_s(evName, L"%s%lu", prefix, pid);
+    HANDLE hEv = OpenEventW(SYNCHRONIZE, FALSE, evName);
+    if (!hEv) return false;
+    const DWORD res = WaitForSingleObject(hEv, 0);
+    CloseHandle(hEv);
+    return (res == WAIT_OBJECT_0);
+}
+
+void CleanupPendingEntryHandles(PendingInjection& entry, bool freeRemoteMem) {
+    if (freeRemoteMem && entry.remoteMem && entry.hProcess) {
+        VirtualFreeEx(entry.hProcess, entry.remoteMem, 0, MEM_RELEASE);
+        entry.remoteMem = nullptr;
+    }
+    if (entry.hThread) {
+        CloseHandle(entry.hThread);
+        entry.hThread = nullptr;
+    }
+    if (entry.hProcess) {
+        CloseHandle(entry.hProcess);
+        entry.hProcess = nullptr;
+    }
+}
 
 void EnableDebugPrivilegeOnce() {
     static std::once_flag s_privFlag;
@@ -183,14 +230,92 @@ bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
     return foundVrMod;
 }
 
-bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
+void UpdatePendingInjections(const std::unordered_set<DWORD>& activeSnapPids) {
+    for (auto it = s_pendingInjections.begin(); it != s_pendingInjections.end();) {
+        PendingInjection& entry = it->second;
+
+        if (activeSnapPids.find(entry.pid) == activeSnapPids.end()) {
+            CleanupPendingEntryHandles(entry, false);
+            it = s_pendingInjections.erase(it);
+            continue;
+        }
+
+        if (!entry.threadFinished && entry.hThread) {
+            const DWORD waitRes = WaitForSingleObject(entry.hThread, 0);
+            if (waitRes == WAIT_OBJECT_0) {
+                CleanupPendingEntryHandles(entry, true);
+                entry.threadFinished = true;
+
+                const bool loaded = IsNamedProcessEventSignaled(L"Local\\VRPacingHookLoaded_", entry.pid);
+                const bool ready = IsNamedProcessEventSignaled(L"Local\\VRPacingHookReady_", entry.pid);
+                LogMessage(LogLevel::Info, "ProcessScanner: Deferred remote thread finished for " +
+                           entry.exeName + " [PID " + std::to_string(entry.pid) +
+                           "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
+                           ", Hooks Ready=" + std::to_string(ready ? 1 : 0) + ").");
+
+                if (loaded) {
+                    entry.loadedLogged = true;
+                    s_hookedPids.insert(entry.pid);
+                }
+                if (ready) {
+                    entry.readyLogged = true;
+                }
+            } else if (waitRes == WAIT_FAILED) {
+                const DWORD err = GetLastError();
+                LogMessage(LogLevel::Error, "ProcessScanner: WaitForSingleObject failed on pending thread for " +
+                           entry.exeName + " [PID " + std::to_string(entry.pid) +
+                           "] (GLE=" + std::to_string(err) + "). Preserving remoteMem until process exit.");
+                CleanupPendingEntryHandles(entry, false);
+                entry.threadFinished = true;
+            }
+        }
+
+        if (entry.threadFinished) {
+            if (!entry.loadedLogged && IsNamedProcessEventSignaled(L"Local\\VRPacingHookLoaded_", entry.pid)) {
+                entry.loadedLogged = true;
+                s_hookedPids.insert(entry.pid);
+                LogMessage(LogLevel::Info, "ProcessScanner: VRPacingHook DLL confirmed loaded in " +
+                           entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
+            }
+            if (!entry.readyLogged && IsNamedProcessEventSignaled(L"Local\\VRPacingHookReady_", entry.pid)) {
+                entry.readyLogged = true;
+                s_hookedPids.insert(entry.pid);
+                LogMessage(LogLevel::Info, "ProcessScanner: VRPacingHook instrumentation confirmed READY in " +
+                           entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
+            }
+
+            if (entry.readyLogged) {
+                it = s_pendingInjections.erase(it);
+                continue;
+            }
+
+            if (!entry.loadedLogged && (GetTickCount64() - entry.startTick) > 10000) {
+                LogMessage(LogLevel::Error, "ProcessScanner: Injection timed out waiting for DLL load confirmation in " +
+                           entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
+                s_openFailCounts[entry.pid]++;
+                it = s_pendingInjections.erase(it);
+                continue;
+            }
+        }
+
+        ++it;
+    }
+}
+
+bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std::wstring& dllPath, DWORD waitTimeoutMs) {
+    if (s_pendingInjections.find(pid) != s_pendingInjections.end()) {
+        return false;
+    }
+
     if (!std::filesystem::exists(dllPath)) {
         LogMessage(LogLevel::Error, "ProcessScanner: Hook DLL not found on disk.");
         return false;
     }
 
+    const std::string exeName = WideToNarrow(exeNameW);
+
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
-                               PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                               PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE,
                                FALSE, pid);
     if (!hProc) {
         return false;
@@ -214,16 +339,62 @@ bool InjectDllByPid(DWORD pid, const std::wstring& dllPath) {
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, loadLibAddr, remoteMem, 0, nullptr);
     if (!hThread) {
+        const DWORD err = GetLastError();
+        LogMessage(LogLevel::Error, "ProcessScanner: CreateRemoteThread failed for " +
+                   exeName + " [PID " + std::to_string(pid) + "] (GLE=" + std::to_string(err) + ").");
         VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
         CloseHandle(hProc);
         return false;
     }
 
-    WaitForSingleObject(hThread, 5000);
-    CloseHandle(hThread);
-    VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
-    CloseHandle(hProc);
-    return true;
+    PendingInjection entry{};
+    entry.pid = pid;
+    entry.exeName = exeName;
+    entry.hProcess = hProc;
+    entry.hThread = hThread;
+    entry.remoteMem = remoteMem;
+    entry.startTick = GetTickCount64();
+
+    const DWORD waitRes = WaitForSingleObject(hThread, waitTimeoutMs);
+    if (waitRes == WAIT_OBJECT_0) {
+        CleanupPendingEntryHandles(entry, true);
+        entry.threadFinished = true;
+
+        const bool loaded = IsNamedProcessEventSignaled(L"Local\\VRPacingHookLoaded_", pid);
+        const bool ready = IsNamedProcessEventSignaled(L"Local\\VRPacingHookReady_", pid);
+
+        LogMessage(LogLevel::Info, "ProcessScanner: Injection thread finished for " +
+                   exeName + " [PID " + std::to_string(pid) +
+                   "] (DLL Loaded=" + std::to_string(loaded ? 1 : 0) +
+                   ", Hooks Ready=" + std::to_string(ready ? 1 : 0) + ").");
+
+        if (loaded) {
+            entry.loadedLogged = true;
+            s_hookedPids.insert(pid);
+        }
+        if (ready) {
+            entry.readyLogged = true;
+            LogMessage(LogLevel::Info, "ProcessScanner: VRPacingHook instrumentation confirmed READY in " +
+                       exeName + " [PID " + std::to_string(pid) + "].");
+        } else {
+            s_pendingInjections[pid] = entry;
+        }
+        return loaded;
+    } else if (waitRes == WAIT_TIMEOUT) {
+        // El hilo remoto sigue ejecutandose: NO liberamos remoteMem ni cerramos handles.
+        LogMessage(LogLevel::Warn, "ProcessScanner: Remote thread WAIT_TIMEOUT (" +
+                   std::to_string(waitTimeoutMs) + "ms) for " + exeName +
+                   " [PID " + std::to_string(pid) + "]. Preserving remoteMem and monitoring asynchronously.");
+        s_pendingInjections[pid] = entry;
+        return false;
+    } else {
+        const DWORD err = GetLastError();
+        LogMessage(LogLevel::Error, "ProcessScanner: WaitForSingleObject failed (res=" +
+                   std::to_string(waitRes) + ", GLE=" + std::to_string(err) + ") for " +
+                   exeName + " [PID " + std::to_string(pid) + "]. Preserving remoteMem until process exit.");
+        CleanupPendingEntryHandles(entry, false);
+        return false;
+    }
 }
 
 } // namespace
@@ -241,8 +412,7 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
     if (Process32FirstW(hSnap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
-                if (InjectDllByPid(pe.th32ProcessID, dllPath)) {
-                    s_hookedPids.insert(pe.th32ProcessID);
+                if (StartOrCompleteInjectionByPid(pe.th32ProcessID, pe.szExeFile, dllPath, 5000)) {
                     injected = true;
                 }
             }
@@ -264,72 +434,73 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
     }
 
     std::unordered_set<DWORD> activeSnapPids;
+    std::vector<PROCESSENTRY32W> processEntries;
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
 
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            const DWORD pid = pe.th32ProcessID;
-            activeSnapPids.insert(pid);
-
-            if (pid <= 4 || pid == GetCurrentProcessId()) continue;
-            if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
-            if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
-
-            if (IsBlacklistedProcess(pe.szExeFile)) {
-                s_systemIgnoredPids.insert(pid);
-                continue;
-            }
-
-            HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (hCheck) {
-                const bool isWinSys = IsSystemWindowsProcess(hCheck);
-                CloseHandle(hCheck);
-                if (isWinSys) {
-                    s_systemIgnoredPids.insert(pid);
-                    continue;
-                }
-            } else {
-                if (++s_openFailCounts[pid] >= 5) {
-                    s_systemIgnoredPids.insert(pid);
-                    s_openFailCounts.erase(pid);
-                }
-                continue;
-            }
-
-            HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-            if (!hProc) {
-                if (++s_openFailCounts[pid] >= 5) {
-                    s_systemIgnoredPids.insert(pid);
-                    s_openFailCounts.erase(pid);
-                }
-                continue;
-            }
-
-            s_openFailCounts.erase(pid);
-
-            bool alreadyHooked = false;
-            const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
-            CloseHandle(hProc);
-
-            if (alreadyHooked) {
-                s_hookedPids.insert(pid);
-                continue;
-            }
-
-            if (isVrTarget) {
-                if (InjectDllByPid(pid, dllPath)) {
-                    s_hookedPids.insert(pid);
-                    char exeA[MAX_PATH]{};
-                    size_t converted = 0;
-                    wcstombs_s(&converted, exeA, pe.szExeFile, sizeof(exeA) - 1);
-                    LogMessage(LogLevel::Info, "Automatic injection applied to VR process: " +
-                               std::string(exeA) + " [PID " + std::to_string(pid) + "]");
-                }
-            }
+            activeSnapPids.insert(pe.th32ProcessID);
+            processEntries.push_back(pe);
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
+
+    UpdatePendingInjections(activeSnapPids);
+
+    for (const auto& entry : processEntries) {
+        const DWORD pid = entry.th32ProcessID;
+
+        if (pid <= 4 || pid == GetCurrentProcessId()) continue;
+        if (s_hookedPids.find(pid) != s_hookedPids.end()) continue;
+        if (s_pendingInjections.find(pid) != s_pendingInjections.end()) continue;
+        if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
+
+        if (IsBlacklistedProcess(entry.szExeFile)) {
+            s_systemIgnoredPids.insert(pid);
+            continue;
+        }
+
+        HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hCheck) {
+            const bool isWinSys = IsSystemWindowsProcess(hCheck);
+            CloseHandle(hCheck);
+            if (isWinSys) {
+                s_systemIgnoredPids.insert(pid);
+                continue;
+            }
+        } else {
+            if (++s_openFailCounts[pid] >= 5) {
+                s_systemIgnoredPids.insert(pid);
+                s_openFailCounts.erase(pid);
+            }
+            continue;
+        }
+
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!hProc) {
+            if (++s_openFailCounts[pid] >= 5) {
+                s_systemIgnoredPids.insert(pid);
+                s_openFailCounts.erase(pid);
+            }
+            continue;
+        }
+
+        s_openFailCounts.erase(pid);
+
+        bool alreadyHooked = false;
+        const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
+        CloseHandle(hProc);
+
+        if (alreadyHooked) {
+            s_hookedPids.insert(pid);
+            continue;
+        }
+
+        if (isVrTarget) {
+            StartOrCompleteInjectionByPid(pid, entry.szExeFile, dllPath, 1500);
+        }
+    }
 
     for (auto it = s_hookedPids.begin(); it != s_hookedPids.end();) {
         if (activeSnapPids.find(*it) == activeSnapPids.end()) {
