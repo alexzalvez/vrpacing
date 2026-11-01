@@ -32,6 +32,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -117,6 +118,10 @@ int32_t g_upscaleStatus = 0;
 int32_t g_lastHResult = 0;
 uint32_t g_nativeViewW = 0;
 uint32_t g_nativeViewH = 0;
+uint32_t g_vrsTargetEyeW = 0;
+uint32_t g_vrsTargetEyeH = 0;
+bool g_vrsLastEnabled = false;
+int g_vrsLastDebugMode = -1;
 
 bool IsCurrentProcessBlacklisted() {
     static int s_cached = -1;
@@ -509,8 +514,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         }
         if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
-        } else if (!g_d3d11Device && !IsCurrentProcessBlacklisted()) {
-            g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
+        } else g_vrsTargetEyeW = 0; g_vrsTargetEyeH = 0; g_vrsLastEnabled = false; g_vrsLastDebugMode = -1; if (!IsCurrentProcessBlacklisted()) { g_openXrSessionActive.store(true, std::memory_order_relaxed); } if (!g_d3d11Device && !IsCurrentProcessBlacklisted()) { g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
         }
     }
     return res;
@@ -518,7 +522,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
-    g_swapchains.clear();
+    if (g_d3d11Device && !IsCurrentProcessBlacklisted()) { if (g_d3d11Context) { VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true); } VrsFoveatedD3D11::Instance().Shutdown(); } g_vrsTargetEyeW = 0; g_vrsTargetEyeH = 0; g_vrsLastEnabled = false; g_vrsLastDebugMode = -1; g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     g_openXrSessionActive.store(false, std::memory_order_relaxed);
     g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
@@ -795,8 +799,7 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
                        " Scale=" + std::to_string(g_cfg.upscaling.scale));
         }
 
-        bool allSlicesOk = true;
-        if (isSideBySide) {
+        if (g_vrsLastEnabled) { VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true); } VrsSuppressScope vrsSuppress; bool allSlicesOk = true; if (isSideBySide) {
             const uint32_t halfAppW = proxy.appWidth / 2;
             const uint32_t halfRealW = proxy.realWidth / 2;
             for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -984,7 +987,7 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
         return g_nextEndFrame(session, frameEndInfo);
     }
 
-    std::vector<const XrCompositionLayerBaseHeader*> remapped(frameEndInfo->layerCount);
+    if (g_d3d11Device && g_d3d11Context) { uint32_t projEyeW = 0; uint32_t projEyeH = 0; for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) { const auto* layer = frameEndInfo->layers[i]; if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) { const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(layer); if (proj->viewCount >= 2 && proj->views) { const int32_t extW = proj->views[0].subImage.imageRect.extent.width; const int32_t extH = proj->views[0].subImage.imageRect.extent.height; if (extW > 0 && extH > 0) { projEyeW = static_cast<uint32_t>(extW); projEyeH = static_cast<uint32_t>(extH); break; } } } } if (projEyeW > 0 && projEyeH > 0) { const bool ffrEnabled = g_cfg.ffr.enabled || (g_cfg.ffr.debugMode > 0); const int dbgMode = g_cfg.ffr.debugMode; if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) { LogMessage(LogLevel::Info, "VRS: OpenXR target eye " + std::to_string(projEyeW) + "x" + std::to_string(projEyeH) + " (from projection layer)"); } if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH || ffrEnabled != g_vrsLastEnabled || dbgMode != g_vrsLastDebugMode) { g_vrsTargetEyeW = projEyeW; g_vrsTargetEyeH = projEyeH; g_vrsLastEnabled = ffrEnabled; g_vrsLastDebugMode = dbgMode; VrsFoveatedD3D11::Instance().UpdateTarget(g_d3d11Device.Get(), g_d3d11Context.Get(), ffrEnabled, projEyeW, projEyeH, dbgMode); } } VrsFoveatedD3D11::Instance().EndFrame(); } std::vector<const XrCompositionLayerBaseHeader*> remapped(frameEndInfo->layerCount);
     std::vector<XrCompositionLayerProjection> projCopies;
     std::vector<std::vector<XrCompositionLayerProjectionView>> viewsCopies;
     std::vector<XrCompositionLayerQuad> quadCopies;

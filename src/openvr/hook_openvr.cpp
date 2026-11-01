@@ -121,6 +121,31 @@ bool GetVerifiedCompositorSlots(const char* name, uint32_t& outWaitSlot, uint32_
     return false;
 }
 
+bool IsOpenXrLayerHandlingD3D11() {
+    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    if (hLayer) {
+        using IsActiveFn = bool(__cdecl*)();
+        auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
+        if (fn && fn()) {
+            return true;
+        }
+    }
+    return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
+}
+
+// [A0] Generalized OpenXR session check covering D3D11, D3D12, and Vulkan sessions
+bool IsOpenXrSessionActiveAnyApi() {
+    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    if (hLayer) {
+        using IsActiveFn = bool(__cdecl*)();
+        auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveSession"));
+        if (fn && fn()) {
+            return true;
+        }
+    }
+    return IsOpenXrLayerHandlingD3D11();
+}
+
 template <typename FnType>
 FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self) {
     if (!self) return nullptr;
@@ -218,18 +243,6 @@ bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
     return true;
 }
 
-bool IsOpenXrLayerHandlingD3D11() {
-    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
-    if (hLayer) {
-        using IsActiveFn = bool(__cdecl*)();
-        auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
-        if (fn && fn()) {
-            return true;
-        }
-    }
-    return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
-}
-
 double QueryOpenVRHardwareHz() {
     if (!g_origGetGenericInterface) return 0.0;
     int err = 0;
@@ -306,7 +319,8 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         return vr::VRCompositorError_RequestFailed;
     }
 
-    if (IsOpenXrLayerHandlingD3D11()) {
+    // [A0] Bypass OpenVR hooks during any active OpenXR session
+    if (IsOpenXrSessionActiveAnyApi()) {
         return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
 
@@ -470,7 +484,8 @@ vr::EVRCompositorError HookedSubmit(void* self,
         return vr::VRCompositorError_RequestFailed;
     }
 
-    if (IsOpenXrLayerHandlingD3D11()) {
+    // [A0] Bypass OpenVR hooks during any active OpenXR session
+    if (IsOpenXrSessionActiveAnyApi()) {
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
@@ -548,21 +563,14 @@ vr::EVRCompositorError HookedSubmit(void* self,
     g_lastInH = cropH;
 
     CalculateOpenVRProjectionCenters();
-    VrsTextureMode vrsMode = VrsTextureMode::SingleEye;
-    if (inDesc.ArraySize >= 2) {
-        vrsMode = VrsTextureMode::TextureArray;
-    } else if (isSideBySide) {
-        vrsMode = VrsTextureMode::CombinedSideBySide;
-    }
+    // [A4] & [F1] Simplified centered-pattern UpdateTarget call
     VrsFoveatedD3D11::Instance().UpdateTarget(
         g_ovrCtx.device.Get(),
         g_ovrCtx.context.Get(),
         g_cfg.ffr.enabled,
         fullEyeW,
         fullEyeH,
-        vrsMode,
-        g_projCenters[0][0], g_projCenters[0][1],
-        g_projCenters[1][0], g_projCenters[1][1]);
+        g_cfg.ffr.debugMode);
 
     if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
         inSubmit = false;
