@@ -413,6 +413,15 @@ void ProcessAndUpscaleLayer(ovrSession session,
     ovrTextureSwapChainDesc inDesc0{};
     g_ovrGetTextureSwapChainDesc(session, inLeft, &inDesc0);
 
+    VrsTextureMode vrsMode = VrsTextureMode::SingleEye;
+    if (inDesc0.ArraySize >= 2) {
+        vrsMode = VrsTextureMode::TextureArray;
+    } else if (singleTexture) {
+        vrsMode = VrsTextureMode::CombinedSideBySide;
+    }
+
+    const uint32_t eyeW = static_cast<uint32_t>(inViewport[0].Size.w);
+    const uint32_t eyeH = static_cast<uint32_t>(inViewport[0].Size.h);
     const bool vrsActive = g_cfg.ffr.enabled && !IsOpenXrLayerSessionActive();
 
     if (ctx.device && ctx.context) {
@@ -422,7 +431,7 @@ void ProcessAndUpscaleLayer(ovrSession session,
             vrsActive,
             eyeW,
             eyeH,
-        g_cfg.ffr.debugMode);
+            vrsMode,
             leftProjX, leftProjY,
             rightProjX, rightProjY
         );
