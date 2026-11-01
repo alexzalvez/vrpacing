@@ -13,6 +13,13 @@
 
 namespace vrpacing {
 
+// [A4] Compatibilidad hacia atras para llamadas heredadas de Oculus
+enum class VrsTextureMode {
+    SingleEye,
+    CombinedSideBySide,
+    TextureArray
+};
+
 // [A4] Unified centered Fixed Foveated Rendering (Hardware VRS via NVIDIA NVAPI)
 class VrsFoveatedD3D11 {
 public:
@@ -27,6 +34,18 @@ public:
                       uint32_t eyeWidth,
                       uint32_t eyeHeight,
                       int debugMode = 0);
+
+    // Sobrecarga de compatibilidad para llamadas heredadas de 10 parametros
+    void UpdateTarget(ID3D11Device* dev,
+                      ID3D11DeviceContext* ctx,
+                      bool enabled,
+                      uint32_t eyeWidth,
+                      uint32_t eyeHeight,
+                      VrsTextureMode /*mode*/,
+                      float /*p0x*/ = 0.5f, float /*p0y*/ = 0.5f,
+                      float /*p1x*/ = 0.5f, float /*p1y*/ = 0.5f) {
+        UpdateTarget(dev, ctx, enabled, eyeWidth, eyeHeight, 0);
+    }
 
     // [A8] Periodic stats logging every 900 frames.
     void EndFrame();
