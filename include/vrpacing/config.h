@@ -1,44 +1,58 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace vrpacing {
 
 struct UpscalingConfig {
     bool enabled = true;
     float scale = 2.0f;
-    float radius = 0.60f;
     float sharpness = 0.0f;
-    uint64_t maxOutputPixels = 3296ULL * 3584ULL;
-};
-
-struct PacingConfig {
-    bool enabled = true;
-    double offsetFps = 0.10;
-    double frameGenDivisor = 1.0;
-    double afrMultiplier = 1.0;
-    double hzOverride = 0.0;
+    float radius = 0.60f;
+    uint64_t maxOutputPixels = 32000000ull;
 };
 
 struct MaskConfig {
-    bool enabled = false;
-    float radiusX = 1.00f;
-    float radiusY = 1.00f;
-    uint32_t segments = 256;
+    bool enabled = true;
+    float radiusX = 1.0f;
+    float radiusY = 1.0f;
+    float centerX = 0.0f;
+    float centerY = 0.0f;
+    uint32_t segments = 96;
+    bool flipWinding = false;
 };
 
 struct FfrConfig {
     bool enabled = false;
     float innerRadius = 0.60f;
-    int debugMode = 0; // [A8] 0=normal, 1=passive, 2=transparent, 3=extreme
+    int debugMode = 0;
+    float outerRadius = 1.00f;
+};
+
+struct PacingConfig {
+    bool enabled = true;
+    double offsetFps = 0.1;
+    double frameGenDivisor = 1.0;
+    double afrMultiplier = 1.0;
+    double hzOverride = 0.0;
+};
+
+struct LoggingConfig {
+    std::string level = "info";
 };
 
 struct RuntimeConfig {
     bool enabled = true;
     UpscalingConfig upscaling;
-    PacingConfig pacing;
     MaskConfig mask;
     FfrConfig ffr;
+    PacingConfig pacing;
+    LoggingConfig logging;
 };
+
+inline RuntimeConfig DefaultConfig() {
+    return RuntimeConfig{};
+}
 
 } // namespace vrpacing

@@ -24,10 +24,8 @@ namespace vrpacing {
 
 namespace {
 
-// [A5] & [F3] Proportional candidate detection constants
-// Adapted from OpenXR-Toolkit (XR_APILAYER_MBUCCHIA_toolkit/vrs.cpp), MIT License, Copyright (c) 2021-2022 Matthieu Bucchianeri.
 constexpr float kAspectTolerance = 0.01f;
-constexpr float kMinScale = 0.75f; // [F3] Raised to 0.75 to exclude half-resolution post-process buffers
+constexpr float kMinScale = 0.75f;
 constexpr float kMaxScale = 1.50f;
 constexpr float kSquareAspectTolerance = 0.02f;
 
@@ -35,10 +33,9 @@ constexpr float kInnerRadius = 0.60f;
 constexpr float kMidRadius = 1.00f;
 constexpr size_t kMaxUniqueRtLogs = 48;
 constexpr uint32_t kMaxNvFailLogs = 5;
+constexpr UINT kMaxViewports = 16;
 
-// [A6] Thread-local suppression depth counter
 thread_local int g_vrsSuppressDepth = 0;
-// [F5] Thread-local reentrancy guard
 thread_local bool g_inVrsHook = false;
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
@@ -60,7 +57,6 @@ using OMSetRenderTargetsAndUAVsFn = void(STDMETHODCALLTYPE*)(
 OMSetRenderTargetsFn g_origOMSetRenderTargets = nullptr;
 OMSetRenderTargetsAndUAVsFn g_origOMSetRenderTargetsAndUAVs = nullptr;
 
-// [F5] Restored g_inVrsHook reentrancy guard in addition to IsSuppressed()
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
     ID3D11DeviceContext* self,
     UINT numViews,
@@ -105,15 +101,14 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargetsAndUAVs(
 
 uint8_t DistanceToVRSLevel(float distance) {
     if (distance < kInnerRadius) {
-        return 0; // 1x1 (100%)
+        return 0;
     }
     if (distance < kMidRadius) {
-        return 1; // 2x1 (1/2x)
+        return 1;
     }
-    return 2;     // 4x4 (1/16x)
+    return 2;
 }
 
-// [A3] Unified pixel-space centered pattern generator with ceil tile coverage
 std::vector<uint8_t> CreateCenteredPattern(int tilesW, int tilesH, int rtW, int rtH, bool doubleWide) {
     std::vector<uint8_t> data(static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH), 0);
     if (rtW <= 0 || rtH <= 0 || tilesW <= 0 || tilesH <= 0) {
@@ -171,13 +166,11 @@ uint64_t HashRtCombo(uint32_t w,
 
 } // namespace
 
-// [F4] Safe static teardown: heap object is intentionally never deleted
 VrsFoveatedD3D11& VrsFoveatedD3D11::Instance() {
     static VrsFoveatedD3D11* s_instance = new VrsFoveatedD3D11();
     return *s_instance;
 }
 
-// [A6] Suppression scope helpers
 void VrsFoveatedD3D11::EnterSuppressScope() noexcept {
     ++g_vrsSuppressDepth;
 }
@@ -222,7 +215,6 @@ void VrsFoveatedD3D11::LogUniqueRenderTargetLocked(uint32_t w,
     }
 }
 
-// [F3] & [A9] Detach NVAPI SRRVs and release textures ONLY in Shutdown() and on device change
 void VrsFoveatedD3D11::ClearPatternCacheLocked() {
     for (size_t i = 0; i < static_cast<size_t>(VrsLayout::Count); ++i) {
         for (auto& entry : patternCache_[i]) {
@@ -238,9 +230,7 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
     if (!dev || !ctx) return false;
 
     if (device_.Get() != dev) {
-        // [A9] & [F3] Clear pattern cache and detach SRRVs on device change
         ClearPatternCacheLocked();
-
         vrsCurrentlyBound_ = false;
         fastBound_.store(false, std::memory_order_relaxed);
         loggedUniqueRts_.clear();
@@ -262,7 +252,6 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
         }
 
         NV_D3D1x_GRAPHICS_CAPS caps{};
-        caps.version = NV_D3D1x_GRAPHICS_CAPS_VER;
         if (NvAPI_D3D1x_GetGraphicsCapabilities(dev, NV_D3D1x_GRAPHICS_CAPS_VER, &caps) != NVAPI_OK ||
             !caps.bVariablePixelRateShadingSupported) {
             LogMessage(LogLevel::Warn, "VRS: Variable Pixel Rate Shading not supported on this GPU.");
@@ -281,7 +270,6 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
     return nvapiSupported_ && hooksInstalled_;
 }
 
-// [A1] Hook installation correctness: publish original before MH_EnableHook, verify status, single attempt
 void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
     if (hooksInstalled_ || hookInstallAttempted_ || !ctx) return;
     hookInstallAttempted_ = true;
@@ -299,7 +287,6 @@ void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
     bool ok33 = false;
     bool ok34 = false;
 
-    // Hook vtbl[33]: OMSetRenderTargets
     if (vtbl[33]) {
         const MH_STATUS stCreate33 = MH_CreateHook(
             vtbl[33],
@@ -322,7 +309,6 @@ void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
         }
     }
 
-    // Hook vtbl[34]: OMSetRenderTargetsAndUnorderedAccessViews
     if (vtbl[34]) {
         const MH_STATUS stCreate34 = MH_CreateHook(
             vtbl[34],
@@ -350,7 +336,6 @@ void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
                (ok33 ? "OK" : "FAIL") + " OMSetRenderTargetsAndUAVs=" + (ok34 ? "OK" : "FAIL"));
 }
 
-// [A4], [F1] & [F3] UpdateTarget obeys `enabled` as passed and preserves cached patterns on size changes
 void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
                                     ID3D11DeviceContext* ctx,
                                     bool enabled,
@@ -381,7 +366,6 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
     }
 
     if (targetEyeWidth_ != eyeWidth || targetEyeHeight_ != eyeHeight) {
-        // [F3] Update target dimensions without detaching or recreating existing pattern cache entries
         targetEyeWidth_ = eyeWidth;
         targetEyeHeight_ = eyeHeight;
         loggedUniqueRts_.clear();
@@ -391,7 +375,6 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
     fastEnabled_.store(true, std::memory_order_relaxed);
 }
 
-// [A8] EndFrame periodic telemetry
 void VrsFoveatedD3D11::EndFrame() {
     if (!fastEnabled_.load(std::memory_order_relaxed) &&
         !fastBound_.load(std::memory_order_relaxed)) {
@@ -418,16 +401,12 @@ void VrsFoveatedD3D11::EndFrame() {
     }
 }
 
-// [A9] & [F3] Shutdown detaches NVAPI SRRVs and resets D3D11 textures
 void VrsFoveatedD3D11::Shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (context_) {
         DisableVRSLocked(context_.Get(), true);
     }
 
-    // [A9] Intentionally leak NVAPI ID3D11NvShadingRateResourceView pointers during teardown
-    // to prevent occasional driver crashes when the engine destroys the D3D11 device first
-    // (Adapted from OpenXR-Toolkit XR_APILAYER_MBUCCHIA_toolkit/vrs.cpp:153-166).
     ClearPatternCacheLocked();
 
     context_.Reset();
@@ -441,13 +420,11 @@ void VrsFoveatedD3D11::Shutdown() {
     fastBound_.store(false, std::memory_order_relaxed);
 }
 
-// [A2] & [F2] Public thread-safe DisableVRS wrapper
 void VrsFoveatedD3D11::DisableVRS(ID3D11DeviceContext* ctx, bool force) {
     std::lock_guard<std::mutex> lock(mutex_);
     DisableVRSLocked(ctx, force);
 }
 
-// [A5] Proportional candidate detection & [A8] diagnostics
 void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     ID3D11DeviceContext* ctx,
     UINT numViews,
@@ -506,7 +483,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     const float targetAspect = static_cast<float>(targetEyeWidth_) / static_cast<float>(targetEyeHeight_);
 
-    // [A5] Square rejection only if the target itself is not square (|targetAspect - 1| > 0.02)
     if (std::abs(targetAspect - 1.0f) > kSquareAspectTolerance && td.Width == td.Height) {
         LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
                                     td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_SQUARE");
@@ -535,7 +511,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    // [A4] Inspect RTV descriptor for slice count
     uint32_t rtvSlices = 1;
     if (rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) {
         rtvSlices = rtvDesc.Texture2DArray.ArraySize;
@@ -557,7 +532,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
                                 td.SampleDesc.Count, rtvDesc.ViewDimension, resultLabel);
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
 
-    // [A8] debugMode == 1: passive mode (detect + log, never bind VRS)
     if (debugMode_ == 1) {
         DisableVRSLocked(ctx, false);
         return;
@@ -579,27 +553,24 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 void VrsFoveatedD3D11::EnableVRS(ID3D11DeviceContext* ctx) {
     NV_D3D11_VIEWPORTS_SHADING_RATE_DESC srd{};
     srd.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
-    srd.numViewports = NVAPI_MAX_VIEWPORTS;
+    srd.numViewports = kMaxViewports;
 
-    NV_D3D11_VIEWPORT_SHADING_RATE_DESC_V1 vsrd[NVAPI_MAX_VIEWPORTS]{};
-    for (int i = 0; i < NVAPI_MAX_VIEWPORTS; ++i) {
+    NV_D3D11_VIEWPORT_SHADING_RATE_DESC_V1 vsrd[kMaxViewports]{};
+    for (UINT i = 0; i < kMaxViewports; ++i) {
         vsrd[i].enableVariablePixelShadingRate = true;
         std::memset(vsrd[i].shadingRateTable, 0, sizeof(vsrd[i].shadingRateTable));
 
         if (debugMode_ == 2) {
-            // [A8] debugMode 2: transparent (all 1x1)
             vsrd[i].shadingRateTable[0] = NV_PIXEL_X1_PER_RASTER_PIXEL;
             vsrd[i].shadingRateTable[1] = NV_PIXEL_X1_PER_RASTER_PIXEL;
             vsrd[i].shadingRateTable[2] = NV_PIXEL_X1_PER_RASTER_PIXEL;
             vsrd[i].shadingRateTable[3] = NV_PIXEL_X1_PER_RASTER_PIXEL;
         } else if (debugMode_ == 3) {
-            // [A8] debugMode 3: extreme (ring 1 and ring 2 forced to 4x4)
             vsrd[i].shadingRateTable[0] = NV_PIXEL_X1_PER_RASTER_PIXEL;
             vsrd[i].shadingRateTable[1] = NV_PIXEL_X1_PER_4X4_RASTER_PIXELS;
             vsrd[i].shadingRateTable[2] = NV_PIXEL_X1_PER_4X4_RASTER_PIXELS;
             vsrd[i].shadingRateTable[3] = NV_PIXEL_X1_PER_4X4_RASTER_PIXELS;
         } else {
-            // [A8] debugMode 0: normal fixed 3-ring configuration
             vsrd[i].shadingRateTable[0] = NV_PIXEL_X1_PER_RASTER_PIXEL;
             vsrd[i].shadingRateTable[1] = NV_PIXEL_X1_PER_2X1_RASTER_PIXELS;
             vsrd[i].shadingRateTable[2] = NV_PIXEL_X1_PER_4X4_RASTER_PIXELS;
@@ -618,7 +589,6 @@ void VrsFoveatedD3D11::EnableVRS(ID3D11DeviceContext* ctx) {
     }
 }
 
-// [A2] & [F2] Robust DisableVRSLocked: checks nvapiSupported_ and registered context before any NVAPI call
 void VrsFoveatedD3D11::DisableVRSLocked(ID3D11DeviceContext* ctx, bool force) {
     if (!nvapiSupported_ || !ctx || ctx != context_.Get()) {
         return;
@@ -647,7 +617,6 @@ void VrsFoveatedD3D11::DisableVRSLocked(ID3D11DeviceContext* ctx, bool force) {
     fastBound_.store(false, std::memory_order_relaxed);
 }
 
-// [A2] Set vrsCurrentlyBound_/fastBound_ immediately when SRRV bind succeeds
 void VrsFoveatedD3D11::ApplyVRSViewLocked(ID3D11DeviceContext* ctx,
                                           ID3D11NvShadingRateResourceView* view,
                                           const char* label) {
@@ -663,7 +632,6 @@ void VrsFoveatedD3D11::ApplyVRSViewLocked(ID3D11DeviceContext* ctx,
     }
 }
 
-// [A3], [A4] & [F3] Bounded pattern cache per layout (max 4 entries per layout, never recreated)
 ID3D11NvShadingRateResourceView* VrsFoveatedD3D11::GetOrCreatePatternLocked(
     VrsLayout layout, int rtWidth, int rtHeight) {
     if (!device_ || rtWidth <= 0 || rtHeight <= 0) return nullptr;
