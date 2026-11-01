@@ -1,12 +1,5 @@
 #ifdef _WIN32
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
 #include "oculus/hook_oculus.h"
 
 #include <windows.h>
@@ -19,7 +12,7 @@
 #include <cmath>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 #include "minhook/include/MinHook.h"
 #include "common/config_json.h"
@@ -31,15 +24,97 @@
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
-#define OVR_PTR_SIZE 8
-#include "OVR_CAPI.h"
-#include "OVR_CAPI_D3D.h"
-
 using Microsoft::WRL::ComPtr;
 
 namespace vrpacing {
 
 namespace {
+
+using ovrSession = void*;
+using ovrTextureSwapChain = void*;
+using ovrResult = int32_t;
+
+enum ovrLayerType {
+    ovrLayerType_Disabled = 0,
+    ovrLayerType_EyeFov = 1,
+    ovrLayerType_EyeFovDepth = 2,
+    ovrLayerType_Quad = 3,
+};
+
+struct ovrLayerHeader {
+    ovrLayerType Type;
+    unsigned Flags;
+};
+
+struct ovrViewScaleDesc {
+    float HmdToEyePose[2][7];
+    float HmdToEyeViewOffset[2][3];
+};
+
+struct ovrLayerEyeFov {
+    ovrLayerHeader Header;
+    ovrTextureSwapChain ColorTexture[2];
+    int Viewport[2][4];
+    float Fov[2][4];
+    float RenderPose[2][7];
+    double SensorSampleTime;
+};
+
+enum ovrTextureFormat {
+    OVR_FORMAT_UNKNOWN = 0,
+    OVR_FORMAT_B5G6R5_UNORM = 1,
+    OVR_FORMAT_B5G5R5A1_UNORM = 2,
+    OVR_FORMAT_B4G4R4A4_UNORM = 3,
+    OVR_FORMAT_R8G8B8A8_UNORM = 4,
+    OVR_FORMAT_R8G8B8A8_UNORM_SRGB = 5,
+    OVR_FORMAT_B8G8R8A8_UNORM = 6,
+    OVR_FORMAT_B8G8R8A8_UNORM_SRGB = 7,
+    OVR_FORMAT_B8G8R8X8_UNORM = 8,
+    OVR_FORMAT_B8G8R8X8_UNORM_SRGB = 9,
+    OVR_FORMAT_R16G16B16A16_FLOAT = 10,
+    OVR_FORMAT_D16_UNORM = 11,
+    OVR_FORMAT_D24_UNORM_S8_UINT = 12,
+    OVR_FORMAT_D32_FLOAT = 13,
+    OVR_FORMAT_D32_FLOAT_S8X24_UINT = 14,
+    OVR_FORMAT_BC1_UNORM = 15,
+    OVR_FORMAT_BC1_UNORM_SRGB = 16,
+    OVR_FORMAT_BC2_UNORM = 17,
+    OVR_FORMAT_BC2_UNORM_SRGB = 18,
+    OVR_FORMAT_BC3_UNORM = 19,
+    OVR_FORMAT_BC3_UNORM_SRGB = 20,
+    OVR_FORMAT_BC6H_UF16 = 21,
+    OVR_FORMAT_BC6H_SF16 = 22,
+    OVR_FORMAT_BC7_UNORM = 23,
+    OVR_FORMAT_BC7_UNORM_SRGB = 24,
+};
+
+enum ovrTextureMiscFlags {
+    ovrTextureMisc_None = 0,
+    ovrTextureMisc_DX_Typeless = 0x0001,
+    ovrTextureMisc_AllowGenerateMips = 0x0002,
+    ovrTextureMisc_ProtectedContent = 0x0004,
+    ovrTextureMisc_AutoGenerateMips = 0x0008,
+};
+
+enum ovrTextureBindFlags {
+    ovrTextureBind_None = 0,
+    ovrTextureBind_DX_RenderTarget = 0x0001,
+    ovrTextureBind_DX_UnorderedAccess = 0x0002,
+    ovrTextureBind_DX_DepthStencil = 0x0004,
+};
+
+struct ovrTextureSwapChainDesc {
+    int Type;
+    ovrTextureFormat Format;
+    int ArraySize;
+    int Width;
+    int Height;
+    int MipLevels;
+    int SampleCount;
+    unsigned char StaticImage;
+    unsigned int MiscFlags;
+    unsigned int BindFlags;
+};
 
 struct OculusOutputSwapchain {
     ovrTextureSwapChain chain = nullptr;
@@ -159,15 +234,9 @@ void ProcessOculusLayer(ovrSession session, const ovrLayerHeader* layerHeader) {
     if (!layerHeader) return;
 
     ovrLayerEyeFov* eyeFovLayer = nullptr;
-    bool isLegacyLayout = false;
-
-    if (layerHeader->Type == ovrLayerType_EyeFov) {
+    if (layerHeader->Type == ovrLayerType_EyeFov || static_cast<int>(layerHeader->Type) == 1) {
         eyeFovLayer = reinterpret_cast<ovrLayerEyeFov*>(const_cast<ovrLayerHeader*>(layerHeader));
-    } else if (static_cast<int>(layerHeader->Type) == 1) {
-        eyeFovLayer = reinterpret_cast<ovrLayerEyeFov*>(const_cast<ovrLayerHeader*>(layerHeader));
-        isLegacyLayout = true;
     }
-
     if (!eyeFovLayer) return;
 
     ovrTextureSwapChain inChainL = eyeFovLayer->ColorTexture[0];
@@ -197,10 +266,10 @@ void ProcessOculusLayer(ovrSession session, const ovrLayerHeader* layerHeader) {
     }
 
     int curIdxL = 0;
-    if (OVR_FAILURE(pfnGetCurrentIndex(session, inChainL, &curIdxL))) return;
+    if (pfnGetCurrentIndex(session, inChainL, &curIdxL) < 0) return;
 
     ComPtr<ID3D11Texture2D> inTexL;
-    if (OVR_FAILURE(pfnGetBufferDX(session, inChainL, curIdxL, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(inTexL.GetAddressOf())))) {
+    if (pfnGetBufferDX(session, inChainL, curIdxL, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(inTexL.GetAddressOf())) < 0) {
         return;
     }
 
@@ -273,18 +342,18 @@ void ProcessOculusLayer(ovrSession session, const ovrLayerHeader* layerHeader) {
             chain.textures.clear();
 
             ovrTextureSwapChainDesc desc{};
-            desc.Type = ovrTexture_2D;
+            desc.Type = 1; // 2D Texture
             desc.Format = OVR_FORMAT_R8G8B8A8_UNORM_SRGB;
             desc.ArraySize = 1;
             desc.Width = reqW;
             desc.Height = reqH;
             desc.MipLevels = 1;
             desc.SampleCount = 1;
-            desc.StaticImage = ovrFalse;
+            desc.StaticImage = 0;
             desc.MiscFlags = ovrTextureMisc_DX_Typeless | ovrTextureMisc_AutoGenerateMips;
             desc.BindFlags = ovrTextureBind_DX_RenderTarget | ovrTextureBind_DX_UnorderedAccess;
 
-            if (OVR_FAILURE(pfnCreateSwapChainDX(session, g_oculusCtx.device.Get(), &desc, &chain.chain))) {
+            if (pfnCreateSwapChainDX(session, g_oculusCtx.device.Get(), &desc, &chain.chain) < 0) {
                 g_upscaleStatus = -1;
                 return;
             }
@@ -297,7 +366,7 @@ void ProcessOculusLayer(ovrSession session, const ovrLayerHeader* layerHeader) {
             chain.width = reqW;
             chain.height = reqH;
             LogMessage(LogLevel::Info, "Oculus Output Swapchain [eye " + std::to_string(eye) + "] created: " +
-                       std::to_string(reqW) + "x" + std::to_string(reqH) + " (FMT=" + std::to_string(desc.Format) + ") -> " +
+                       std::to_string(reqW) + "x" + std::to_string(reqH) + " -> " +
                        std::to_string(reqW) + "x" + std::to_string(reqH));
         }
 
