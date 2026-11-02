@@ -48,6 +48,7 @@ namespace {
 PFN_xrGetInstanceProcAddr g_nextGetInstanceProcAddr = nullptr;
 PFN_xrCreateSession g_nextCreateSession = nullptr;
 PFN_xrDestroySession g_nextDestroySession = nullptr;
+PFN_xrDestroyInstance g_nextDestroyInstance = nullptr;
 PFN_xrEnumerateViewConfigurationViews g_nextEnumerateViewConfigurationViews = nullptr;
 PFN_xrCreateSwapchain g_nextCreateSwapchain = nullptr;
 PFN_xrDestroySwapchain g_nextDestroySwapchain = nullptr;
@@ -512,17 +513,35 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
             g_eyeTangents[1].valid = false;
             g_maskWasActiveInSession.store(false, std::memory_order_relaxed);
         }
+        g_vrsTargetEyeW = 0;
+        g_vrsTargetEyeH = 0;
+        g_vrsLastEnabled = false;
+        g_vrsLastDebugMode = -1;
         if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
-        } else g_vrsTargetEyeW = 0; g_vrsTargetEyeH = 0; g_vrsLastEnabled = false; g_vrsLastDebugMode = -1; if (!IsCurrentProcessBlacklisted()) { g_openXrSessionActive.store(true, std::memory_order_relaxed); } if (!g_d3d11Device && !IsCurrentProcessBlacklisted()) { g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
+        } else if (!IsCurrentProcessBlacklisted()) {
+            g_openXrSessionActive.store(true, std::memory_order_relaxed);
+            g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
         }
     }
     return res;
 }
 
+// [B4] Clean shutdown with explicit reason
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
-    if (g_d3d11Device && !IsCurrentProcessBlacklisted()) { if (g_d3d11Context) { VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true); } VrsFoveatedD3D11::Instance().Shutdown(); } g_vrsTargetEyeW = 0; g_vrsTargetEyeH = 0; g_vrsLastEnabled = false; g_vrsLastDebugMode = -1; g_swapchains.clear();
+    if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
+        if (g_d3d11Context) {
+            VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true);
+        }
+        VrsFoveatedD3D11::Instance().Shutdown("DestroySession");
+        VrsFoveatedD3D11::Instance().ClearExcludedTextures();
+    }
+    g_vrsTargetEyeW = 0;
+    g_vrsTargetEyeH = 0;
+    g_vrsLastEnabled = false;
+    g_vrsLastDebugMode = -1;
+    g_swapchains.clear();
     g_openXrD3D11Active.store(false, std::memory_order_relaxed);
     g_openXrSessionActive.store(false, std::memory_order_relaxed);
     g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
@@ -535,6 +554,19 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
         g_activeSession = XR_NULL_HANDLE;
     }
     return g_nextDestroySession(session);
+}
+
+// [B4] Hook for xrDestroyInstance to guarantee teardown safety
+XrResult XRAPI_CALL Impl_xrDestroyInstance(XrInstance instance) {
+    if (g_d3d11Context) {
+        VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true);
+    }
+    VrsFoveatedD3D11::Instance().Shutdown("DestroyInstance");
+    VrsFoveatedD3D11::Instance().ClearExcludedTextures();
+    if (g_nextDestroyInstance) {
+        return g_nextDestroyInstance(instance);
+    }
+    return XR_SUCCESS;
 }
 
 XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
@@ -702,9 +734,19 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     return XR_SUCCESS;
 }
 
+// [B1.a] Unregister excluded textures when swapchain is destroyed
 XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
-    g_swapchains.erase(swapchain);
+    auto it = g_swapchains.find(swapchain);
+    if (it != g_swapchains.end()) {
+        for (auto& tex : it->second.appTextures) {
+            VrsFoveatedD3D11::Instance().UnregisterExcludedTexture(tex.Get());
+        }
+        for (auto& tex : it->second.realTextures) {
+            VrsFoveatedD3D11::Instance().UnregisterExcludedTexture(tex.Get());
+        }
+        g_swapchains.erase(it);
+    }
     g_upscaler.ClearCache();
     return g_nextDestroySwapchain(swapchain);
 }
@@ -713,11 +755,21 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainFormats(XrSession session, uint32_t
     return g_nextEnumerateSwapchainFormats(session, formatCapacityInput, formatCountOutput, formats);
 }
 
+// [B1.a] Register swapchain textures as excluded from VRS
 XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t imageCapacityInput, uint32_t* imageCountOutput, XrSwapchainImageBaseHeader* images) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
-        return g_nextEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
+        XrResult r_enum = g_nextEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
+        if (XR_SUCCEEDED(r_enum) && images && imageCapacityInput > 0) {
+            auto* realD3d = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+            for (uint32_t j = 0; j < imageCapacityInput; ++j) {
+                if (realD3d[j].texture) {
+                    VrsFoveatedD3D11::Instance().RegisterExcludedTexture(realD3d[j].texture);
+                }
+            }
+        }
+        return r_enum;
     }
 
     const auto& proxy = it->second;
@@ -729,6 +781,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
     for (uint32_t i = 0; i < (std::min)(imageCapacityInput, count); ++i) {
         d3dImgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
         d3dImgs[i].texture = proxy.appTextures[i].Get();
+        VrsFoveatedD3D11::Instance().RegisterExcludedTexture(proxy.appTextures[i].Get());
     }
     return XR_SUCCESS;
 }
@@ -799,7 +852,13 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
                        " Scale=" + std::to_string(g_cfg.upscaling.scale));
         }
 
-        if (g_vrsLastEnabled) { VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true); } VrsSuppressScope vrsSuppress; bool allSlicesOk = true; if (isSideBySide) {
+        if (g_vrsLastEnabled) {
+            VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true);
+        }
+        VrsSuppressScope vrsSuppress;
+        bool allSlicesOk = true;
+
+        if (isSideBySide) {
             const uint32_t halfAppW = proxy.appWidth / 2;
             const uint32_t halfRealW = proxy.realWidth / 2;
             for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -963,6 +1022,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     return res;
 }
 
+// [B5] Uses g_cfg.ffr.openxrEnabled
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
     if (!g_d3d11Device) {
         if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
@@ -987,7 +1047,45 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
         return g_nextEndFrame(session, frameEndInfo);
     }
 
-    if (g_d3d11Device && g_d3d11Context) { uint32_t projEyeW = 0; uint32_t projEyeH = 0; for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) { const auto* layer = frameEndInfo->layers[i]; if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) { const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(layer); if (proj->viewCount >= 2 && proj->views) { const int32_t extW = proj->views[0].subImage.imageRect.extent.width; const int32_t extH = proj->views[0].subImage.imageRect.extent.height; if (extW > 0 && extH > 0) { projEyeW = static_cast<uint32_t>(extW); projEyeH = static_cast<uint32_t>(extH); break; } } } } if (projEyeW > 0 && projEyeH > 0) { const bool ffrEnabled = g_cfg.ffr.enabled || (g_cfg.ffr.debugMode > 0); const int dbgMode = g_cfg.ffr.debugMode; if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) { LogMessage(LogLevel::Info, "VRS: OpenXR target eye " + std::to_string(projEyeW) + "x" + std::to_string(projEyeH) + " (from projection layer)"); } if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH || ffrEnabled != g_vrsLastEnabled || dbgMode != g_vrsLastDebugMode) { g_vrsTargetEyeW = projEyeW; g_vrsTargetEyeH = projEyeH; g_vrsLastEnabled = ffrEnabled; g_vrsLastDebugMode = dbgMode; VrsFoveatedD3D11::Instance().UpdateTarget(g_d3d11Device.Get(), g_d3d11Context.Get(), ffrEnabled, projEyeW, projEyeH, dbgMode); } } VrsFoveatedD3D11::Instance().EndFrame(); } std::vector<const XrCompositionLayerBaseHeader*> remapped(frameEndInfo->layerCount);
+    if (g_d3d11Device && g_d3d11Context) {
+        uint32_t projEyeW = 0;
+        uint32_t projEyeH = 0;
+        for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+            const auto* layer = frameEndInfo->layers[i];
+            if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                if (proj->viewCount >= 2 && proj->views) {
+                    const int32_t extW = proj->views[0].subImage.imageRect.extent.width;
+                    const int32_t extH = proj->views[0].subImage.imageRect.extent.height;
+                    if (extW > 0 && extH > 0) {
+                        projEyeW = static_cast<uint32_t>(extW);
+                        projEyeH = static_cast<uint32_t>(extH);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (projEyeW > 0 && projEyeH > 0) {
+            const bool ffrEnabled = g_cfg.ffr.openxrEnabled || (g_cfg.ffr.debugMode > 0);
+            const int dbgMode = g_cfg.ffr.debugMode;
+
+            if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) {
+                LogMessage(LogLevel::Info, "VRS: OpenXR target eye " + std::to_string(projEyeW) + "x" + std::to_string(projEyeH) + " (from projection layer)");
+            }
+
+            if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH || ffrEnabled != g_vrsLastEnabled || dbgMode != g_vrsLastDebugMode) {
+                g_vrsTargetEyeW = projEyeW;
+                g_vrsTargetEyeH = projEyeH;
+                g_vrsLastEnabled = ffrEnabled;
+                g_vrsLastDebugMode = dbgMode;
+                VrsFoveatedD3D11::Instance().UpdateTarget(g_d3d11Device.Get(), g_d3d11Context.Get(), ffrEnabled, projEyeW, projEyeH, dbgMode);
+            }
+        }
+        VrsFoveatedD3D11::Instance().EndFrame();
+    }
+
+    std::vector<const XrCompositionLayerBaseHeader*> remapped(frameEndInfo->layerCount);
     std::vector<XrCompositionLayerProjection> projCopies;
     std::vector<std::vector<XrCompositionLayerProjectionView>> viewsCopies;
     std::vector<XrCompositionLayerQuad> quadCopies;
@@ -1064,7 +1162,10 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrCreateSession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSession));
     g_nextDestroySession = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySession));
+    g_nextDestroyInstance = nullptr;
+    g_nextGetInstanceProcAddr(instance, "xrDestroyInstance", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroyInstance));
     g_nextGetInstanceProcAddr(instance, "xrEnumerateViewConfigurationViews", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateViewConfigurationViews));
+    g_nextCreateSwapchain = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrCreateSwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSwapchain));
     g_nextDestroySwapchain = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySwapchain));
@@ -1128,7 +1229,8 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCr
 XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function) {
     if (!name || !function) return XR_ERROR_VALIDATION_FAILURE;
 
-    if (strcmp(name, "xrCreateSession") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSession);
+    if (strcmp(name, "xrDestroyInstance") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroyInstance);
+    else if (strcmp(name, "xrCreateSession") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSession);
     else if (strcmp(name, "xrDestroySession") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroySession);
     else if (strcmp(name, "xrEnumerateViewConfigurationViews") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateViewConfigurationViews);
     else if (strcmp(name, "xrCreateSwapchain") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSwapchain);

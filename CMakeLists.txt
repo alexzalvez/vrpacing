@@ -59,6 +59,7 @@ if(WIN32)
 
   add_library(VRPacingLayer SHARED
     src/openxr/layer.cpp
+  src/openxr/layer_dllmain.cpp
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp

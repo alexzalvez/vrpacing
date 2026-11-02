@@ -46,6 +46,13 @@ void ToJson(json& j, const RuntimeConfig& cfg) {
             {"segments", cfg.mask.segments},
             {"flipWinding", cfg.mask.flipWinding}
         }},
+        {"ffr", {
+            {"enabled", cfg.ffr.enabled},
+            {"openxrEnabled", cfg.ffr.openxrEnabled},
+            {"innerRadius", cfg.ffr.innerRadius},
+            {"outerRadius", cfg.ffr.outerRadius},
+            {"debugMode", cfg.ffr.debugMode}
+        }},
         {"pacing", {
             {"enabled", cfg.pacing.enabled},
             {"offsetFps", cfg.pacing.offsetFps},
@@ -80,6 +87,14 @@ RuntimeConfig FromJson(const json& j) {
         cfg.mask.centerY = m.value("centerY", cfg.mask.centerY);
         cfg.mask.segments = m.value("segments", cfg.mask.segments);
         cfg.mask.flipWinding = m.value("flipWinding", cfg.mask.flipWinding);
+    }
+    if (j.contains("ffr")) {
+        const auto& f = j["ffr"];
+        cfg.ffr.enabled = f.value("enabled", cfg.ffr.enabled);
+        cfg.ffr.openxrEnabled = f.value("openxrEnabled", cfg.ffr.openxrEnabled);
+        cfg.ffr.innerRadius = f.value("innerRadius", cfg.ffr.innerRadius);
+        cfg.ffr.outerRadius = f.value("outerRadius", cfg.ffr.outerRadius);
+        cfg.ffr.debugMode = f.value("debugMode", cfg.ffr.debugMode);
     }
     if (j.contains("pacing")) {
         const auto& p = j["pacing"];

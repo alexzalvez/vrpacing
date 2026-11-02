@@ -24,7 +24,8 @@ struct MaskConfig {
 };
 
 struct FfrConfig {
-    bool enabled = false;
+    bool enabled = false;          // OpenVR / Oculus
+    bool openxrEnabled = false;    // [B5] OpenXR dedicado
     float innerRadius = 0.60f;
     int debugMode = 0;
     float outerRadius = 1.00f;

@@ -22,6 +22,9 @@ using Microsoft::WRL::ComPtr;
 
 namespace vrpacing {
 
+// [B4] Teardown atomic flag
+std::atomic<bool> g_vrsDetaching{ false };
+
 namespace {
 
 constexpr float kAspectTolerance = 0.01f;
@@ -31,7 +34,6 @@ constexpr float kSquareAspectTolerance = 0.02f;
 
 constexpr float kInnerRadius = 0.60f;
 constexpr float kMidRadius = 1.00f;
-constexpr size_t kMaxUniqueRtLogs = 48;
 constexpr uint32_t kMaxNvFailLogs = 5;
 constexpr UINT kMaxViewports = 16;
 
@@ -57,6 +59,7 @@ using OMSetRenderTargetsAndUAVsFn = void(STDMETHODCALLTYPE*)(
 OMSetRenderTargetsFn g_origOMSetRenderTargets = nullptr;
 OMSetRenderTargetsAndUAVsFn g_origOMSetRenderTargetsAndUAVs = nullptr;
 
+// [B4] Early exit if detaching or suppressed
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
     ID3D11DeviceContext* self,
     UINT numViews,
@@ -65,7 +68,7 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
     if (g_origOMSetRenderTargets) {
         g_origOMSetRenderTargets(self, numViews, ppRenderTargetViews, pDepthStencilView);
     }
-    if (g_inVrsHook || VrsFoveatedD3D11::IsSuppressed()) {
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook || VrsFoveatedD3D11::IsSuppressed()) {
         return;
     }
     g_inVrsHook = true;
@@ -88,7 +91,7 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargetsAndUAVs(
             self, numRTVs, ppRenderTargetViews, pDepthStencilView,
             uavStartSlot, numUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
     }
-    if (g_inVrsHook || VrsFoveatedD3D11::IsSuppressed()) {
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook || VrsFoveatedD3D11::IsSuppressed()) {
         return;
     }
     if (numRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
@@ -138,12 +141,38 @@ std::vector<uint8_t> CreateCenteredPattern(int tilesW, int tilesH, int rtW, int 
     return data;
 }
 
+// [B1.b] Whitelist on color texture formats
+bool IsWhitelistedColorFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// [B2] Hash with rtv format and dsv flag
 uint64_t HashRtCombo(uint32_t w,
                      uint32_t h,
                      uint32_t arr,
-                     DXGI_FORMAT fmt,
+                     DXGI_FORMAT texFmt,
+                     DXGI_FORMAT rtvFmt,
                      uint32_t ms,
                      D3D11_RTV_DIMENSION dim,
+                     bool hasDsv,
                      const char* res) {
     uint64_t hash = 14695981039346656037ULL;
     auto mix = [&hash](uint64_t v) {
@@ -153,9 +182,11 @@ uint64_t HashRtCombo(uint32_t w,
     mix(w);
     mix(h);
     mix(arr);
-    mix(static_cast<uint32_t>(fmt));
+    mix(static_cast<uint32_t>(texFmt));
+    mix(static_cast<uint32_t>(rtvFmt));
     mix(ms);
     mix(static_cast<uint32_t>(dim));
+    mix(hasDsv ? 1u : 0u);
     if (res) {
         for (const char* p = res; *p != '\0'; ++p) {
             mix(static_cast<uint8_t>(*p));
@@ -185,6 +216,29 @@ bool VrsFoveatedD3D11::IsSuppressed() noexcept {
     return g_vrsSuppressDepth > 0;
 }
 
+void VrsFoveatedD3D11::RegisterExcludedTexture(ID3D11Texture2D* tex) {
+    if (!tex) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto* p : excludedTextures_) {
+        if (p == tex) return;
+    }
+    excludedTextures_.push_back(tex);
+}
+
+void VrsFoveatedD3D11::UnregisterExcludedTexture(ID3D11Texture2D* tex) {
+    if (!tex) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = std::find(excludedTextures_.begin(), excludedTextures_.end(), tex);
+    if (it != excludedTextures_.end()) {
+        excludedTextures_.erase(it);
+    }
+}
+
+void VrsFoveatedD3D11::ClearExcludedTextures() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    excludedTextures_.clear();
+}
+
 void VrsFoveatedD3D11::LogNvapiFailureRateLimited(const char* opName, NvAPI_Status status) {
     nvFailCount_.fetch_add(1, std::memory_order_relaxed);
     if (nvFailLogCount_ < kMaxNvFailLogs) {
@@ -194,23 +248,28 @@ void VrsFoveatedD3D11::LogNvapiFailureRateLimited(const char* opName, NvAPI_Stat
     }
 }
 
+// [B2] Detailed logging format
 void VrsFoveatedD3D11::LogUniqueRenderTargetLocked(uint32_t w,
                                                    uint32_t h,
                                                    uint32_t arraySize,
-                                                   DXGI_FORMAT format,
+                                                   DXGI_FORMAT texFmt,
+                                                   DXGI_FORMAT rtvFmt,
                                                    uint32_t samples,
                                                    D3D11_RTV_DIMENSION rtvDim,
+                                                   bool hasDsv,
                                                    const char* resultLabel) {
     if (loggedUniqueRts_.size() >= kMaxUniqueRtLogs) {
         return;
     }
-    const uint64_t key = HashRtCombo(w, h, arraySize, format, samples, rtvDim, resultLabel);
+    const uint64_t key = HashRtCombo(w, h, arraySize, texFmt, rtvFmt, samples, rtvDim, hasDsv, resultLabel);
     if (loggedUniqueRts_.insert(key).second) {
         LogMessage(LogLevel::Info, "VRS: RT " + std::to_string(w) + "x" + std::to_string(h) +
                    " arr=" + std::to_string(arraySize) +
-                   " fmt=" + std::to_string(static_cast<uint32_t>(format)) +
+                   " fmt=" + std::to_string(static_cast<uint32_t>(texFmt)) +
+                   " rtvfmt=" + std::to_string(static_cast<uint32_t>(rtvFmt)) +
                    " ms=" + std::to_string(samples) +
                    " dim=" + std::to_string(static_cast<uint32_t>(rtvDim)) +
+                   " dsv=" + (hasDsv ? "1" : "0") +
                    " -> " + std::string(resultLabel));
     }
 }
@@ -270,9 +329,18 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
     return nvapiSupported_ && hooksInstalled_;
 }
 
+// [B3] Module pinning prior to installing hooks
 void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
     if (hooksInstalled_ || hookInstallAttempted_ || !ctx) return;
     hookInstallAttempted_ = true;
+
+    HMODULE hPin = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&Hooked_OMSetRenderTargets), &hPin) || !hPin) {
+        LogMessage(LogLevel::Error, "VRS: CRITICAL: Failed to pin module in memory. Hook installation aborted.");
+        return;
+    }
+    LogMessage(LogLevel::Info, "VRS: module pinned successfully in memory.");
 
     const MH_STATUS stInit = MH_Initialize();
     if (stInit != MH_OK && stInit != MH_ERROR_ALREADY_INITIALIZED) {
@@ -401,13 +469,17 @@ void VrsFoveatedD3D11::EndFrame() {
     }
 }
 
-void VrsFoveatedD3D11::Shutdown() {
+// [B4] Shutdown with reason
+void VrsFoveatedD3D11::Shutdown(const char* reason) {
     std::lock_guard<std::mutex> lock(mutex_);
+    LogMessage(LogLevel::Info, std::string("VRS: Shutdown (reason=") + (reason ? reason : "Unknown") + ")");
+
     if (context_) {
         DisableVRSLocked(context_.Get(), true);
     }
 
     ClearPatternCacheLocked();
+    excludedTextures_.clear();
 
     context_.Reset();
     device_.Reset();
@@ -425,11 +497,12 @@ void VrsFoveatedD3D11::DisableVRS(ID3D11DeviceContext* ctx, bool force) {
     DisableVRSLocked(ctx, force);
 }
 
+// [B1] Core Candidate Filtering
 void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     ID3D11DeviceContext* ctx,
     UINT numViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
-    ID3D11DepthStencilView* /*pDepthStencilView*/) {
+    ID3D11DepthStencilView* pDepthStencilView) {
     if (!fastEnabled_.load(std::memory_order_relaxed) &&
         !fastBound_.load(std::memory_order_relaxed)) {
         return;
@@ -460,7 +533,7 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(res.As(&tex)) || !tex) {
-        LogUniqueRenderTargetLocked(0, 0, 0, rtvDesc.Format, 0, rtvDesc.ViewDimension, "REJECT_DIM");
+        LogUniqueRenderTargetLocked(0, 0, 0, DXGI_FORMAT_UNKNOWN, rtvDesc.Format, 0, rtvDesc.ViewDimension, (pDepthStencilView != nullptr), "REJECT_DIM");
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -468,6 +541,9 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     D3D11_TEXTURE2D_DESC td{};
     tex->GetDesc(&td);
 
+    const bool hasDsv = (pDepthStencilView != nullptr);
+
+    // Dimension / Sample limits
     const bool validViewDim =
         (rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D ||
          rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ||
@@ -475,17 +551,18 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
          rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY);
 
     if (!validViewDim || td.Width == 0 || td.Height == 0 || td.ArraySize == 0 || td.ArraySize > 2) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_DIM");
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_DIM");
         DisableVRSLocked(ctx, false);
         return;
     }
 
+    // Aspect & Scale verification against eye resolution
     const float targetAspect = static_cast<float>(targetEyeWidth_) / static_cast<float>(targetEyeHeight_);
 
     if (std::abs(targetAspect - 1.0f) > kSquareAspectTolerance && td.Width == td.Height) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_SQUARE");
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SQUARE");
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -496,8 +573,8 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     const bool single = !doubleWide && (std::abs(a1 - targetAspect) <= kAspectTolerance);
 
     if (!doubleWide && !single) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_ASPECT");
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_ASPECT");
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -505,8 +582,59 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     const float eyeW = doubleWide ? (static_cast<float>(td.Width) * 0.5f) : static_cast<float>(td.Width);
     const float scale = eyeW / static_cast<float>(targetEyeWidth_);
     if (scale < kMinScale || scale > kMaxScale) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_SCALE");
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SCALE");
+        DisableVRSLocked(ctx, false);
+        return;
+    }
+
+    // [B1.a] Swapchain image exclusion check
+    for (auto* pExcl : excludedTextures_) {
+        if (pExcl == tex.Get()) {
+            LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                        td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SWAPCHAIN");
+            DisableVRSLocked(ctx, false);
+            return;
+        }
+    }
+
+    // [B1.b] Whitelist color texture formats
+    if (!IsWhitelistedColorFormat(td.Format)) {
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_FORMAT");
+        DisableVRSLocked(ctx, false);
+        return;
+    }
+
+    // [B1.c] Depth required: pDepthStencilView != nullptr with identical dimensions and samples
+    if (!pDepthStencilView) {
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, false, "REJECT_NODSV");
+        DisableVRSLocked(ctx, false);
+        return;
+    }
+
+    ComPtr<ID3D11Resource> dsvRes;
+    pDepthStencilView->GetResource(dsvRes.GetAddressOf());
+    ComPtr<ID3D11Texture2D> dsvTex;
+    if (!dsvRes || FAILED(dsvRes.As(&dsvTex)) || !dsvTex) {
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_NODSV");
+        DisableVRSLocked(ctx, false);
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC dsvDesc{};
+    dsvTex->GetDesc(&dsvDesc);
+
+    const bool dsvDimMatch = (dsvDesc.Width == td.Width &&
+                              dsvDesc.Height == td.Height &&
+                              dsvDesc.SampleDesc.Count == td.SampleDesc.Count);
+    const bool dsvArrayMatch = (!td.ArraySize || td.ArraySize < 2 || dsvDesc.ArraySize >= td.ArraySize);
+
+    if (!dsvDimMatch || !dsvArrayMatch) {
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_NODSV");
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -519,8 +647,8 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     }
 
     if (doubleWide && rtvSlices > 1) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, "REJECT_DIM");
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_DIM");
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -528,8 +656,8 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     const bool isArrayTarget = (!doubleWide && rtvSlices >= 2 && td.ArraySize >= 2);
     const char* resultLabel = doubleWide ? "DOUBLEWIDE" : (isArrayTarget ? "ARRAY" : "SINGLE");
 
-    LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format,
-                                td.SampleDesc.Count, rtvDesc.ViewDimension, resultLabel);
+    LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                td.SampleDesc.Count, rtvDesc.ViewDimension, true, resultLabel);
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
 
     if (debugMode_ == 1) {

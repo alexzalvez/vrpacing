@@ -4,44 +4,43 @@
 
 namespace vrpacing {
 
-constexpr const wchar_t* kAppVersionString = L"v0.8.0-beta";
-constexpr const char* kAppVersionAnsi = "v0.8.0-beta";
-constexpr const wchar_t* kSharedStateName = L"Local\\VRPacingShared_v6";
+constexpr wchar_t kSharedStateName[] = L"Local\\VRPacingSharedState";
+constexpr wchar_t kAppVersionString[] = L"v0.8.0-beta";
 
-#pragma pack(push, 1)
+constexpr uint32_t kFlagEnabled = 1 << 0;
+constexpr uint32_t kFlagUpscalingEnabled = 1 << 1;
+constexpr uint32_t kFlagPacingEnabled = 1 << 2;
+constexpr uint32_t kFlagTelemetryActive = 1 << 3;
+constexpr uint32_t kFlagFfrEnabled = 1 << 4;
+constexpr uint32_t kFlagMaskEnabled = 1 << 5;
+constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6; // [B5] Bandera dedicada para OpenXR FFR
+
 struct SharedState {
-    uint32_t version = 6;
-    uint32_t flags = 0;
-    uint32_t activePid = 0;
-    uint32_t openXrD3D11Pid = 0;
-    double frameGenDivisor = 1.0;
-    double offsetFps = 0.10;
-    double effectiveHz = 0.0;
-    double appliedCap = 0.0;
-    double avgFps = 0.0;
-    double onePercentLowFps = 0.0;
-    uint64_t frameCounter = 0;
-    wchar_t activeApi[32] = L"Idle";
+    uint32_t version;
+    uint32_t flags;
+    uint32_t activePid;
+    uint32_t openXrD3D11Pid;
 
-    // Lab telemetry
-    uint32_t inputWidth = 0;
-    uint32_t inputHeight = 0;
-    uint32_t outputWidth = 0;
-    uint32_t outputHeight = 0;
-    uint32_t dxgiFormat = 0;
-    int32_t upscaleStatus = 0; // 0=Idle/None, 1=Active OK, -1=Swapchain Fail, -2=Shader Init Fail, -3=UAV/SRV Fail
-    int32_t lastHResult = 0;
-    wchar_t hookedProcess[64] = L"None";
-};
-#pragma pack(pop)
+    wchar_t activeApi[64];
+    wchar_t hookedProcess[64];
 
-enum SharedFlags : uint32_t {
-    kFlagEnabled = 1 << 0,
-    kFlagUpscalingEnabled = 1 << 1,
-    kFlagMaskEnabled = 1 << 2,
-    kFlagPacingEnabled = 1 << 3,
-    kFlagTelemetryActive = 1 << 4,
-    kFlagFfrEnabled = 1 << 5,
+    double effectiveHz;
+    double appliedCap;
+    double frameGenDivisor;
+    double offsetFps;
+
+    uint32_t inputWidth;
+    uint32_t inputHeight;
+    uint32_t outputWidth;
+    uint32_t outputHeight;
+    uint32_t dxgiFormat;
+
+    int32_t upscaleStatus;
+    int32_t lastHResult;
+
+    double avgFps;
+    double onePercentLowFps;
+    uint64_t frameCounter;
 };
 
 } // namespace vrpacing
