@@ -11,6 +11,7 @@
 #include "gfx/vrs_foveated_d3d11.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -27,14 +28,11 @@ namespace vrpacing {
 
 namespace {
 
-// Verified 0-based vtable slots from Windows SDK d3d12.h (DirectX-Headers v1.614.1, commit 9c1eb4fc)
 constexpr uint32_t kSlot_Device_CreateRenderTargetView = 20;
 constexpr uint32_t kSlot_Device_CreateDepthStencilView = 21;
-constexpr uint32_t kSlot_CmdList_GetType               = 8;
 constexpr uint32_t kSlot_CmdList_OMSetRenderTargets    = 46;
 constexpr uint32_t kSlot_CmdList4_BeginRenderPass      = 68;
 
-// Streamline unwrap IID: {ADEC44E2-61F0-45C3-AD9F-1B37379284FF}
 struct __declspec(uuid("ADEC44E2-61F0-45C3-AD9F-1B37379284FF")) StreamlineRetrieveBaseInterface : IUnknown {};
 
 template <typename T>
@@ -45,7 +43,7 @@ T* UnwrapStreamlineObject(T* obj, const char* label) {
         if (baseObj != obj) {
             LogMessage(LogLevel::Info, std::string("VRS12: Streamline proxy unwrapped for ") + label);
         }
-        baseObj->Release(); // Keep non-owning raw pointer parity
+        baseObj->Release();
         return baseObj;
     }
     return obj;
@@ -108,6 +106,7 @@ void STDMETHODCALLTYPE Hooked_CreateDepthStencilView(
     VrsFoveatedD3D12::Instance().OnCreateDepthStencilView(self, pResource, pDesc, destDescriptor);
 }
 
+// [B7'] g_vrsDetaching -> thread_local reentrancy guard -> OnPostOMSetRenderTargets
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets12(
     ID3D12GraphicsCommandList* self,
     UINT numRenderTargetDescriptors,
@@ -149,18 +148,6 @@ uint32_t MapRtvDimension(D3D12_RTV_DIMENSION dim) {
     }
 }
 
-uint64_t HashRt12(uint32_t w, uint32_t h, uint32_t arr, DXGI_FORMAT rFmt, DXGI_FORMAT vFmt,
-                  uint32_t ms, uint32_t dim, bool dsv, bool sc, const char* label) {
-    uint64_t hash = 14695981039346656037ULL;
-    auto mix = [&hash](uint64_t v) { hash ^= v; hash *= 1099511628211ULL; };
-    mix(w); mix(h); mix(arr); mix(static_cast<uint32_t>(rFmt)); mix(static_cast<uint32_t>(vFmt));
-    mix(ms); mix(dim); mix(dsv ? 1u : 0u); mix(sc ? 1u : 0u);
-    if (label) {
-        for (const char* p = label; *p != '\0'; ++p) mix(static_cast<uint8_t>(*p));
-    }
-    return hash;
-}
-
 } // namespace
 
 VrsFoveatedD3D12& VrsFoveatedD3D12::Instance() {
@@ -183,13 +170,13 @@ void VrsFoveatedD3D12::ClearSwapchainTextures() {
     swapchainTextures_.clear();
 }
 
-// [B1] Anchor: check vendor id, D3D12_OPTIONS6, and install hooks if Tier >= 2
 void VrsFoveatedD3D12::OnSessionCreated(ID3D12Device* dev) {
     if (!dev) return;
     std::lock_guard<std::mutex> lock(mutex_);
 
     ID3D12Device* realDev = UnwrapStreamlineObject(dev, "ID3D12Device");
     device_ = realDev;
+    rtvDescriptorSize_ = realDev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     if (!capabilityChecked_) {
         capabilityChecked_ = true;
@@ -238,7 +225,6 @@ void VrsFoveatedD3D12::OnSessionCreated(ID3D12Device* dev) {
     }
 }
 
-// [B2] Install MinHook on Device and dummy DIRECT command list vtable targets
 void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
     if (hooksInstalled_ || !rawDevice) return;
 
@@ -247,7 +233,6 @@ void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
     void** devVtbl = *reinterpret_cast<void***>(rawDevice);
     if (!devVtbl) return;
 
-    // Create ONE dummy DIRECT command allocator + command list to read vtable
     ComPtr<ID3D12CommandAllocator> dummyAlloc;
     if (FAILED(rawDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(dummyAlloc.GetAddressOf())))) {
         LogMessage(LogLevel::Error, "VRS12: Failed to create dummy command allocator for vtable inspection.");
@@ -313,10 +298,8 @@ void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
                " BeginRP=" + (okBrp ? "OK" : "FAIL"));
 }
 
-// [B6] Build and upload R8_UINT VRS texture on our own direct queue + fence
-bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode) {
-    if (!device_ || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
-
+bool VrsFoveatedD3D12::EnsureUploadObjectsLocked() {
+    if (!device_) return false;
     if (!uploadQueue_) {
         D3D12_COMMAND_QUEUE_DESC qDesc{};
         qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -345,43 +328,62 @@ bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t ey
         }
         fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     }
+    return true;
+}
 
-    const uint32_t tilesW = (std::max)(1u, (eyeW + tileSize_ - 1) / tileSize_);
-    const uint32_t tilesH = (std::max)(1u, (eyeH + tileSize_ - 1) / tileSize_);
+// [C3, C4, B8'] Over-allocate capacity maxW=ceil(eyeW*1.5), maxH=ceil(eyeH*1.5) (= kVrsMaxScale 1.50f),
+// top-left anchored pattern, in-place re-upload on runtime mode switch, and strict fence completion check.
+bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace) {
+    if (!EnsureUploadObjectsLocked() || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
 
-    std::vector<uint8_t> pattern = CreateCenteredPatternD3D12(
-        static_cast<int>(eyeW), static_cast<int>(eyeH),
-        static_cast<int>(tileSize_), mode, additionalShadingRates_);
-    if (pattern.size() < static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH)) {
-        return false;
+    uint32_t capW = capPixelsW_.load(std::memory_order_relaxed);
+    uint32_t capH = capPixelsH_.load(std::memory_order_relaxed);
+    uint32_t tilesW = texTilesW_.load(std::memory_order_relaxed);
+    uint32_t tilesH = texTilesH_.load(std::memory_order_relaxed);
+
+    ID3D12Resource* targetTex = currentVrsTexture_;
+    const bool needNewAllocation = (!reuploadInPlace || !targetTex || eyeW > capW || eyeH > capH);
+
+    if (needNewAllocation) {
+        capW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * static_cast<double>(kVrsMaxScale)));
+        capH = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeH) * static_cast<double>(kVrsMaxScale)));
+        tilesW = (std::max)(1u, (capW + tileSize_ - 1) / tileSize_);
+        tilesH = (std::max)(1u, (capH + tileSize_ - 1) / tileSize_);
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        defaultHeap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        defaultHeap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        defaultHeap.CreationNodeMask = 1;
+        defaultHeap.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC texDesc{};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Alignment = 0;
+        texDesc.Width = tilesW;
+        texDesc.Height = tilesH;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R8_UINT;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.SampleDesc.Quality = 0;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        ID3D12Resource* newTex = nullptr;
+        HRESULT hr = device_->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newTex));
+        if (FAILED(hr) || !newTex) {
+            LogMessage(LogLevel::Error, "VRS12: Failed to create R8_UINT VRS texture. HR=" + std::to_string(hr));
+            return false;
+        }
+        targetTex = newTex;
     }
 
-    D3D12_HEAP_PROPERTIES defaultHeap{};
-    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    defaultHeap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    defaultHeap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    defaultHeap.CreationNodeMask = 1;
-    defaultHeap.VisibleNodeMask = 1;
-
-    D3D12_RESOURCE_DESC texDesc{};
-    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texDesc.Alignment = 0;
-    texDesc.Width = tilesW;
-    texDesc.Height = tilesH;
-    texDesc.DepthOrArraySize = 1;
-    texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_R8_UINT;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.SampleDesc.Quality = 0;
-    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-    ID3D12Resource* newTex = nullptr;
-    HRESULT hr = device_->CreateCommittedResource(
-        &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newTex));
-    if (FAILED(hr) || !newTex) {
-        LogMessage(LogLevel::Error, "VRS12: Failed to create R8_UINT VRS texture. HR=" + std::to_string(hr));
+    std::vector<uint8_t> pattern = CreateTopLeftAnchoredPatternD3D12(
+        eyeW, eyeH, tilesW, tilesH, tileSize_, mode, additionalShadingRates_);
+    if (pattern.size() < static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH)) {
         return false;
     }
 
@@ -409,11 +411,13 @@ bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t ey
     bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
     ID3D12Resource* uploadBuf = nullptr;
-    hr = device_->CreateCommittedResource(
+    HRESULT hr = device_->CreateCommittedResource(
         &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
     if (FAILED(hr) || !uploadBuf) {
-        leakedResources_.push_back(newTex);
+        if (needNewAllocation && targetTex) {
+            leakedResources_.push_back(targetTex);
+        }
         return false;
     }
 
@@ -431,8 +435,20 @@ bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t ey
     (void)uploadAlloc_->Reset();
     (void)uploadList_->Reset(uploadAlloc_, nullptr);
 
+    // [B8'] If re-uploading in place onto existing texture, transition SHADING_RATE_SOURCE -> COPY_DEST first
+    if (!needNewAllocation) {
+        D3D12_RESOURCE_BARRIER toCopy{};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        toCopy.Transition.pResource = targetTex;
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        uploadList_->ResourceBarrier(1, &toCopy);
+    }
+
     D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-    dstLoc.pResource = newTex;
+    dstLoc.pResource = targetTex;
     dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dstLoc.SubresourceIndex = 0;
 
@@ -448,14 +464,14 @@ bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t ey
 
     uploadList_->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier.Transition.pResource = newTex;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-    uploadList_->ResourceBarrier(1, &barrier);
+    D3D12_RESOURCE_BARRIER toSrs{};
+    toSrs.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toSrs.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    toSrs.Transition.pResource = targetTex;
+    toSrs.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toSrs.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toSrs.Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+    uploadList_->ResourceBarrier(1, &toSrs);
 
     (void)uploadList_->Close();
 
@@ -470,14 +486,36 @@ bool VrsFoveatedD3D12::BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t ey
     }
 
     leakedResources_.push_back(uploadBuf);
-    if (currentVrsTexture_) {
-        leakedResources_.push_back(currentVrsTexture_);
-        LogMessage(LogLevel::Info, "VRS12: Rebuilt VRS texture (old texture intentionally retained for process lifetime).");
+
+    // [C4] Verify fence actually completed before marking ready
+    if (uploadFence_->GetCompletedValue() < fenceValue_) {
+        LogMessage(LogLevel::Error, "VRS12: upload fence timeout");
+        if (needNewAllocation && targetTex) {
+            leakedResources_.push_back(targetTex);
+        }
+        return false;
     }
-    currentVrsTexture_ = newTex;
-    LogMessage(LogLevel::Info, "VRS12: Pattern texture ready (" + std::to_string(tilesW) + "x" +
-               std::to_string(tilesH) + " tiles for " + std::to_string(eyeW) + "x" +
-               std::to_string(eyeH) + ", mode=" + std::to_string(mode) + ").");
+
+    if (needNewAllocation) {
+        if (currentVrsTexture_ && currentVrsTexture_ != targetTex) {
+            leakedResources_.push_back(currentVrsTexture_);
+            LogMessage(LogLevel::Info, "VRS12: Rebuilt VRS capacity texture (old texture retained for process lifetime).");
+        }
+        currentVrsTexture_ = targetTex;
+        capPixelsW_.store(capW, std::memory_order_relaxed);
+        capPixelsH_.store(capH, std::memory_order_relaxed);
+        texTilesW_.store(tilesW, std::memory_order_relaxed);
+        texTilesH_.store(tilesH, std::memory_order_relaxed);
+    }
+
+    builtEyeW_ = eyeW;
+    builtEyeH_ = eyeH;
+    builtMode_ = mode;
+
+    LogMessage(LogLevel::Info, "VRS12: Pattern texture ready (texTiles=" + std::to_string(tilesW) + "x" +
+               std::to_string(tilesH) + " cap=" + std::to_string(capW) + "x" + std::to_string(capH) +
+               " eye=" + std::to_string(eyeW) + "x" + std::to_string(eyeH) +
+               " mode=" + std::to_string(mode) + ").");
     return true;
 }
 
@@ -486,21 +524,32 @@ void VrsFoveatedD3D12::UpdateTarget(ID3D12Device* dev,
                                     uint32_t eyeWidth,
                                     uint32_t eyeHeight,
                                     int debugMode) {
+    if (deviceRemovedLogged_.load(std::memory_order_relaxed)) {
+        enabled_.store(false, std::memory_order_relaxed);
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tier2Supported_ || !dev || eyeWidth == 0 || eyeHeight == 0) {
         enabled_.store(false, std::memory_order_relaxed);
         return;
     }
 
+    targetEyeW_.store(eyeWidth, std::memory_order_relaxed);
+    targetEyeH_.store(eyeHeight, std::memory_order_relaxed);
     debugMode_.store(debugMode, std::memory_order_relaxed);
 
-    if (targetEyeW_ != eyeWidth || targetEyeH_ != eyeHeight || builtMode_ != debugMode || !currentVrsTexture_) {
+    const uint32_t curCapW = capPixelsW_.load(std::memory_order_relaxed);
+    const uint32_t curCapH = capPixelsH_.load(std::memory_order_relaxed);
+    const bool exceedsCapacity = (!currentVrsTexture_ || eyeWidth > curCapW || eyeHeight > curCapH);
+    const bool needsPatternUpdate = (exceedsCapacity || builtEyeW_ != eyeWidth || builtEyeH_ != eyeHeight ||
+                                     builtMode_ != debugMode || !vrs12Ready_.load(std::memory_order_relaxed));
+
+    if (needsPatternUpdate) {
         vrs12Ready_.store(false, std::memory_order_relaxed);
-        targetEyeW_ = eyeWidth;
-        targetEyeH_ = eyeHeight;
-        builtMode_ = debugMode;
-        loggedDistinctRts_.clear();
-        if (BuildAndUploadVrsTextureLocked(eyeWidth, eyeHeight, debugMode)) {
+        loggedDistinctRtHandles_.clear();
+        distinctRtLogCount_.store(0, std::memory_order_relaxed);
+        if (AllocateAndUploadVrsTextureLocked(eyeWidth, eyeHeight, debugMode, !exceedsCapacity)) {
             vrs12Ready_.store(true, std::memory_order_release);
         }
     }
@@ -508,7 +557,6 @@ void VrsFoveatedD3D12::UpdateTarget(ID3D12Device* dev,
     enabled_.store(enabled, std::memory_order_relaxed);
 }
 
-// [B3] Record RTV descriptor metadata at creation time
 void VrsFoveatedD3D12::OnCreateRenderTargetView(
     ID3D12Device* /*dev*/,
     ID3D12Resource* pResource,
@@ -549,7 +597,6 @@ void VrsFoveatedD3D12::OnCreateRenderTargetView(
     rtvMap_[destDescriptor.ptr] = pod;
 }
 
-// [B3] Record DSV descriptor metadata at creation time
 void VrsFoveatedD3D12::OnCreateDepthStencilView(
     ID3D12Device* /*dev*/,
     ID3D12Resource* pResource,
@@ -581,24 +628,7 @@ void VrsFoveatedD3D12::OnBeginRenderPass() {
     beginRpCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void VrsFoveatedD3D12::LogDistinctRtLocked(const DescriptorPod& rt, bool hasDsv, const char* label) {
-    if (loggedDistinctRts_.size() >= kMaxDistinctRtLogs) return;
-    const uint64_t key = HashRt12(rt.w, rt.h, rt.arraySize, rt.resourceFmt, rt.viewFmt,
-                                  rt.samples, rt.dim, hasDsv, rt.isSwapchain, label);
-    if (loggedDistinctRts_.insert(key).second) {
-        LogMessage(LogLevel::Info, "VRS12: RT " + std::to_string(rt.w) + "x" + std::to_string(rt.h) +
-                   " arr=" + std::to_string(rt.arraySize) +
-                   " fmt=" + std::to_string(static_cast<uint32_t>(rt.resourceFmt)) +
-                   " rtvfmt=" + std::to_string(static_cast<uint32_t>(rt.viewFmt)) +
-                   " ms=" + std::to_string(rt.samples) +
-                   " dim=" + std::to_string(rt.dim) +
-                   " dsv=" + (hasDsv ? "1" : "0") +
-                   " sc=" + (rt.isSwapchain ? "1" : "0") +
-                   " -> " + std::string(label));
-    }
-}
-
-// [B3, B4, B7] Core OMSetRenderTargets logic for D3D12
+// [C1, C2, C5, B7'] Hot-path OMSetRenderTargets detour
 void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     ID3D12GraphicsCommandList* cmdList,
     UINT numRenderTargetDescriptors,
@@ -609,99 +639,122 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
 
     omsrtCount_.fetch_add(1, std::memory_order_relaxed);
 
+    // [B7'] Never touch bundles, compute, or copy command lists
     if (cmdList->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         return;
     }
     directCount_.fetch_add(1, std::memory_order_relaxed);
 
-    // [B7] QueryInterface ID3D12GraphicsCommandList5 cached per vtable
-    void** vtbl = *reinterpret_cast<void***>(cmdList);
-    bool useDirectCast = false;
-    bool supported5 = false;
-    {
-        std::shared_lock<std::shared_mutex> rLock(vtblCacheMutex_);
-        auto it = cmdList5VtblCache_.find(vtbl);
-        if (it != cmdList5VtblCache_.end() && it->second.checked) {
-            supported5 = it->second.supported;
-            useDirectCast = it->second.pointerEqualsThis;
-        }
-    }
-
-    if (!supported5) {
-        std::unique_lock<std::shared_mutex> wLock(vtblCacheMutex_);
-        auto& entry = cmdList5VtblCache_[vtbl];
-        if (!entry.checked) {
-            entry.checked = true;
-            ComPtr<ID3D12GraphicsCommandList5> tmp5;
-            if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(tmp5.GetAddressOf()))) && tmp5) {
-                entry.supported = true;
-                entry.pointerEqualsThis = (reinterpret_cast<void*>(tmp5.Get()) == reinterpret_cast<void*>(cmdList));
-                LogMessage(LogLevel::Info, std::string("VRS12: QI ID3D12GraphicsCommandList5 supported=1 pointerEqualsThis=") +
-                           (entry.pointerEqualsThis ? "1" : "0"));
-            } else {
-                entry.supported = false;
-                LogMessage(LogLevel::Warn, "VRS12: QI ID3D12GraphicsCommandList5 supported=0");
-            }
-        }
-        supported5 = entry.supported;
-        useDirectCast = entry.pointerEqualsThis;
-    }
-
-    if (!supported5) return;
-
     const int mode = debugMode_.load(std::memory_order_relaxed);
     const bool isEnabled = enabled_.load(std::memory_order_relaxed);
     const bool isReady = vrs12Ready_.load(std::memory_order_acquire);
+    const uint32_t eyeW = targetEyeW_.load(std::memory_order_relaxed);
+    const uint32_t eyeH = targetEyeH_.load(std::memory_order_relaxed);
 
-    auto applyOrReset = [&](bool isCandidate) {
-        if (mode == 1) {
-            return; // [B8] Mode 1 = passive: never call RS*
-        }
+    ID3D12GraphicsCommandList5* cl5 = nullptr;
+    ComPtr<ID3D12GraphicsCommandList5> qiList5;
 
-        ComPtr<ID3D12GraphicsCommandList5> qiList5;
-        ID3D12GraphicsCommandList5* list5 = nullptr;
-        if (useDirectCast) {
-            list5 = reinterpret_cast<ID3D12GraphicsCommandList5*>(cmdList);
-        } else {
-            if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(qiList5.GetAddressOf())))) {
-                list5 = qiList5.Get();
+    if (mode != 1) {
+        void** vtbl = *reinterpret_cast<void***>(cmdList);
+        bool useDirectCast = false;
+        bool supported5 = false;
+        {
+            std::shared_lock<std::shared_mutex> rLock(vtblCacheMutex_);
+            auto it = cmdList5VtblCache_.find(vtbl);
+            if (it != cmdList5VtblCache_.end() && it->second.checked) {
+                supported5 = it->second.supported;
+                useDirectCast = it->second.pointerEqualsThis;
             }
         }
-        if (!list5) return;
+        if (!supported5) {
+            std::unique_lock<std::shared_mutex> wLock(vtblCacheMutex_);
+            auto& entry = cmdList5VtblCache_[vtbl];
+            if (!entry.checked) {
+                entry.checked = true;
+                ComPtr<ID3D12GraphicsCommandList5> tmp5;
+                if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(tmp5.GetAddressOf()))) && tmp5) {
+                    entry.supported = true;
+                    entry.pointerEqualsThis = (reinterpret_cast<void*>(tmp5.Get()) == reinterpret_cast<void*>(cmdList));
+                    LogMessage(LogLevel::Info, std::string("VRS12: QI ID3D12GraphicsCommandList5 supported=1 pointerEqualsThis=") +
+                               (entry.pointerEqualsThis ? "1" : "0"));
+                } else {
+                    entry.supported = false;
+                    LogMessage(LogLevel::Warn, "VRS12: QI ID3D12GraphicsCommandList5 supported=0");
+                }
+            }
+            supported5 = entry.supported;
+            useDirectCast = entry.pointerEqualsThis;
+        }
+        if (supported5) {
+            if (useDirectCast) {
+                cl5 = reinterpret_cast<ID3D12GraphicsCommandList5*>(cmdList);
+            } else if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(qiList5.GetAddressOf())))) {
+                cl5 = qiList5.Get();
+            }
+        }
+    }
+
+    auto bindOrResetVrs = [&](bool isCandidate) {
+        // [B7'] If mode == 1 (passive), never invoke RS* methods
+        if (mode == 1 || !cl5) return;
 
         if (isCandidate && isEnabled && isReady && currentVrsTexture_) {
-            static const D3D12_SHADING_RATE_COMBINER kCombiners[D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT] = {
+            static const D3D12_SHADING_RATE_COMBINER c[D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT] = {
                 D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
                 D3D12_SHADING_RATE_COMBINER_OVERRIDE
             };
-            list5->RSSetShadingRateImage(currentVrsTexture_);
-            list5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, kCombiners);
+            cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
+            cl5->RSSetShadingRateImage(currentVrsTexture_);
             bindsCount_.fetch_add(1, std::memory_order_relaxed);
         } else {
-            list5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
+            cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
+            cl5->RSSetShadingRateImage(nullptr);
+            resetsCount_.fetch_add(1, std::memory_order_relaxed);
         }
     };
 
     if (numRenderTargetDescriptors == 0 || !pRenderTargetDescriptors) {
-        applyOrReset(false);
+        bindOrResetVrs(false);
         return;
     }
 
-    // [B3] Whether RTsSingleHandleToDescriptorRange is TRUE (contiguous range starting at [0])
-    // or FALSE (array of individual handles where [0] is RT0), RT0 is always pRenderTargetDescriptors[0].
-    const D3D12_CPU_DESCRIPTOR_HANDLE rt0Handle =
-        RTsSingleHandleToDescriptorRange ? pRenderTargetDescriptors[0] : pRenderTargetDescriptors[0];
+    const D3D12_CPU_DESCRIPTOR_HANDLE rt0Handle = pRenderTargetDescriptors[0];
 
     DescriptorPod rtPod{};
+    bool needDistinctLog = (distinctRtLogCount_.load(std::memory_order_relaxed) < kMaxDistinctRtLogs);
+    std::string mrtFormatsStr;
+
     {
         std::shared_lock<std::shared_mutex> rLock(rtvMapMutex_);
         auto it = rtvMap_.find(rt0Handle.ptr);
         if (it == rtvMap_.end()) {
             rtvUnknownCount_.fetch_add(1, std::memory_order_relaxed);
-            applyOrReset(false);
+            bindOrResetVrs(false);
             return;
         }
         rtPod = it->second;
+
+        // [C5] Collect MRT formats only if we still have distinct-RT log budget
+        if (needDistinctLog) {
+            const UINT mrtCount = (std::min)(numRenderTargetDescriptors, 8u);
+            mrtFormatsStr = " mrt=" + std::to_string(numRenderTargetDescriptors) + " f=[";
+            for (UINT i = 0; i < mrtCount; ++i) {
+                if (i > 0) mrtFormatsStr += ",";
+                D3D12_CPU_DESCRIPTOR_HANDLE h{};
+                if (RTsSingleHandleToDescriptorRange) {
+                    h.ptr = pRenderTargetDescriptors[0].ptr + static_cast<SIZE_T>(i) * rtvDescriptorSize_;
+                } else {
+                    h = pRenderTargetDescriptors[i];
+                }
+                auto itM = rtvMap_.find(h.ptr);
+                if (itM != rtvMap_.end()) {
+                    mrtFormatsStr += std::to_string(static_cast<uint32_t>(itM->second.resourceFmt));
+                } else {
+                    mrtFormatsStr += "?";
+                }
+            }
+            mrtFormatsStr += "]";
+        }
     }
 
     bool hasValidDsv = false;
@@ -715,7 +768,6 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         }
     }
 
-    // [B4] Evaluate candidate with shared pure filter: dim==TEXTURE2D(4)/TEXTURE2DMS(6), arraySize==1
     VrsFilterInput fIn{};
     fIn.rtW = rtPod.w;
     fIn.rtH = rtPod.h;
@@ -724,21 +776,36 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     fIn.rtResourceFormat = rtPod.resourceFmt;
     fIn.validViewDim = (rtPod.dim == 4u || rtPod.dim == 6u);
     fIn.rtvSlices = 1;
-    fIn.isExcludedSwapchain = false; // [B4] Do NOT reject on swapchain in D3D12
+    fIn.isExcludedSwapchain = false;
     fIn.hasDsv = hasValidDsv;
     fIn.dsvW = dsvPod.w;
     fIn.dsvH = dsvPod.h;
     fIn.dsvArraySize = dsvPod.arraySize;
     fIn.dsvSamples = dsvPod.samples;
-    fIn.targetEyeW = targetEyeW_;
-    fIn.targetEyeH = targetEyeH_;
+    fIn.targetEyeW = eyeW;
+    fIn.targetEyeH = eyeH;
     fIn.allowArrayAndDoubleWide = false;
 
     VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
-    {
+    // [C2] Non-candidate path takes ZERO mutex once distinctRtLogCount_ >= 32
+    if (needDistinctLog || fOut.accepted) {
         std::lock_guard<std::mutex> lock(mutex_);
-        LogDistinctRtLocked(rtPod, hasValidDsv, fOut.label);
+        if (loggedDistinctRtHandles_.size() < kMaxDistinctRtLogs) {
+            if (loggedDistinctRtHandles_.insert(rt0Handle.ptr).second) {
+                distinctRtLogCount_.store(loggedDistinctRtHandles_.size(), std::memory_order_relaxed);
+                LogMessage(LogLevel::Info, "VRS12: RT " + std::to_string(rtPod.w) + "x" + std::to_string(rtPod.h) +
+                           " arr=" + std::to_string(rtPod.arraySize) +
+                           " fmt=" + std::to_string(static_cast<uint32_t>(rtPod.resourceFmt)) +
+                           " rtvfmt=" + std::to_string(static_cast<uint32_t>(rtPod.viewFmt)) +
+                           " ms=" + std::to_string(rtPod.samples) +
+                           " dim=" + std::to_string(rtPod.dim) +
+                           " dsv=" + (hasValidDsv ? "1" : "0") +
+                           " sc=" + (rtPod.isSwapchain ? "1" : "0") +
+                           mrtFormatsStr +
+                           " -> " + std::string(fOut.label));
+            }
+        }
         if (fOut.accepted) {
             const HistKey12 hKey{
                 rtPod.w, rtPod.h,
@@ -758,23 +825,41 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         candidatesCount_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    applyOrReset(fOut.accepted);
+    bindOrResetVrs(fOut.accepted);
 }
 
-// [B9] Telemetry every 900 frames
+// [C7, B9'] Device health check and extended stats line every 900 frames
 void VrsFoveatedD3D12::EndFrame() {
     if (!tier2Supported_) return;
 
     const uint64_t frames = framesCount_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frames % 900 == 0) {
+        // [C7] Check GetDeviceRemovedReason() every 900 frames
+        if (device_ && !deviceRemovedLogged_.load(std::memory_order_relaxed)) {
+            const HRESULT hrRemoved = device_->GetDeviceRemovedReason();
+            if (hrRemoved != S_OK) {
+                if (!deviceRemovedLogged_.exchange(true, std::memory_order_relaxed)) {
+                    enabled_.store(false, std::memory_order_relaxed);
+                    char hrBuf[32]{};
+                    std::snprintf(hrBuf, sizeof(hrBuf), "0x%08X", static_cast<uint32_t>(hrRemoved));
+                    LogMessage(LogLevel::Error, std::string("VRS12: DEVICE_REMOVED hr=") + hrBuf);
+                }
+            }
+        }
+
         const uint64_t omsrt = omsrtCount_.load(std::memory_order_relaxed);
         const uint64_t direct = directCount_.load(std::memory_order_relaxed);
         const uint64_t candidates = candidatesCount_.load(std::memory_order_relaxed);
         const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
+        const uint64_t resets = resetsCount_.load(std::memory_order_relaxed);
         const uint64_t rtvUnk = rtvUnknownCount_.load(std::memory_order_relaxed);
         const uint64_t beginRp = beginRpCount_.load(std::memory_order_relaxed);
         const uint64_t visMask = visMaskCallsCount_.load(std::memory_order_relaxed);
         const int mode = debugMode_.load(std::memory_order_relaxed);
+        const uint32_t tW = texTilesW_.load(std::memory_order_relaxed);
+        const uint32_t tH = texTilesH_.load(std::memory_order_relaxed);
+        const uint32_t cW = capPixelsW_.load(std::memory_order_relaxed);
+        const uint32_t cH = capPixelsH_.load(std::memory_order_relaxed);
 
         std::string topStr;
         {
@@ -806,15 +891,17 @@ void VrsFoveatedD3D12::EndFrame() {
                    " direct=" + std::to_string(direct) +
                    " candidates=" + std::to_string(candidates) +
                    " binds=" + std::to_string(binds) +
+                   " resets=" + std::to_string(resets) +
                    " rtv_unknown=" + std::to_string(rtvUnk) +
                    " beginRP=" + std::to_string(beginRp) +
                    " visMask=" + std::to_string(visMask) +
                    " mode=" + std::to_string(mode) +
+                   " texTiles=" + std::to_string(tW) + "x" + std::to_string(tH) +
+                   " cap=" + std::to_string(cW) + "x" + std::to_string(cH) +
                    topStr);
     }
 }
 
-// [B10] Shutdown without releasing D3D12 resources
 void VrsFoveatedD3D12::Shutdown(const char* reason) {
     if (!capabilityChecked_) return;
     enabled_.store(false, std::memory_order_relaxed);

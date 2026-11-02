@@ -1,5 +1,5 @@
 #pragma once
-// [B5] Shared pure ring pattern generator for D3D11 and D3D12 VRS.
+// [B5, C3, B8'] Shared pure ring pattern generator for D3D11 and D3D12 VRS.
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +19,7 @@ enum class AbstractShadingRate : uint8_t {
     R4x4 = 4
 };
 
+// [B8'] Mode 2: all 1x1; Mode 3: middle ring 2x2, outer ring 4x4; Mode 0: normal (1x1, 2x1, 4x4)
 inline AbstractShadingRate DistanceToAbstractRate(float distance, int debugMode) {
     if (debugMode == 2) {
         return AbstractShadingRate::R1x1;
@@ -27,7 +28,7 @@ inline AbstractShadingRate DistanceToAbstractRate(float distance, int debugMode)
         return AbstractShadingRate::R1x1;
     }
     if (debugMode == 3) {
-        return AbstractShadingRate::R4x4;
+        return (distance < kVrsMidRadius) ? AbstractShadingRate::R2x2 : AbstractShadingRate::R4x4;
     }
     if (distance < kVrsMidRadius) {
         return AbstractShadingRate::R2x1;
@@ -35,7 +36,6 @@ inline AbstractShadingRate DistanceToAbstractRate(float distance, int debugMode)
     return AbstractShadingRate::R4x4;
 }
 
-// Legacy index mapping (0=1x1, 1=2x1, 2=4x4) used by D3D11 NVAPI shadingRateTable
 inline uint8_t AbstractRateToD3D11TableIndex(AbstractShadingRate r) {
     switch (r) {
         case AbstractShadingRate::R1x1: return 0;
@@ -56,7 +56,7 @@ inline uint8_t AbstractRateToD3D12Byte(AbstractShadingRate r, bool additionalSha
         case AbstractShadingRate::R2x2: return 0x5;
         case AbstractShadingRate::R4x4:
         default:
-            return additionalShadingRatesSupported ? 0xA : 0x5; // Clamp 4X4 -> 2X2 if !additionalRates
+            return additionalShadingRatesSupported ? 0xA : 0x5;
     }
 }
 
@@ -104,12 +104,35 @@ inline std::vector<uint8_t> CreateCenteredPatternD3D11(int tilesW, int tilesH, i
     return data;
 }
 
-inline std::vector<uint8_t> CreateCenteredPatternD3D12(
-    int eyeW, int eyeH, int tileSize, int debugMode, bool additionalShadingRatesSupported) {
-    std::vector<AbstractShadingRate> abs = GenerateAbstractVrsPattern(eyeW, eyeH, tileSize, tileSize, false, debugMode);
-    std::vector<uint8_t> data(abs.size(), 0);
-    for (size_t i = 0; i < abs.size(); ++i) {
-        data[i] = AbstractRateToD3D12Byte(abs[i], additionalShadingRatesSupported);
+// [C3] Top-left anchored pattern for D3D12 over-allocated capacity texture:
+// Pattern center = (eyeW/2, eyeH/2) in pixels; tiles beyond eyeW x eyeH receive outermost ring rate.
+inline std::vector<uint8_t> CreateTopLeftAnchoredPatternD3D12(
+    uint32_t eyeW, uint32_t eyeH, uint32_t texTilesW, uint32_t texTilesH,
+    uint32_t tileSize, int debugMode, bool additionalShadingRatesSupported) {
+    std::vector<uint8_t> data(static_cast<size_t>(texTilesW) * static_cast<size_t>(texTilesH), 0);
+    if (eyeW == 0 || eyeH == 0 || texTilesW == 0 || texTilesH == 0 || tileSize == 0) {
+        return data;
+    }
+
+    const float halfEyeW = static_cast<float>(eyeW) * 0.5f;
+    const float halfEyeH = static_cast<float>(eyeH) * 0.5f;
+    const uint8_t outerByte = AbstractRateToD3D12Byte(DistanceToAbstractRate(2.0f, debugMode), additionalShadingRatesSupported);
+
+    for (uint32_t ty = 0; ty < texTilesH; ++ty) {
+        const float py = (static_cast<float>(ty) + 0.5f) * static_cast<float>(tileSize);
+        for (uint32_t tx = 0; tx < texTilesW; ++tx) {
+            const float px = (static_cast<float>(tx) + 0.5f) * static_cast<float>(tileSize);
+            if (px >= static_cast<float>(eyeW) || py >= static_cast<float>(eyeH)) {
+                data[static_cast<size_t>(ty) * texTilesW + tx] = outerByte;
+            } else {
+                const float nx = (px - halfEyeW) / halfEyeW;
+                const float ny = (py - halfEyeH) / halfEyeH;
+                const float d = std::sqrt(nx * nx + ny * ny);
+                const AbstractShadingRate rate = DistanceToAbstractRate(d, debugMode);
+                data[static_cast<size_t>(ty) * texTilesW + tx] =
+                    AbstractRateToD3D12Byte(rate, additionalShadingRatesSupported);
+            }
+        }
     }
     return data;
 }

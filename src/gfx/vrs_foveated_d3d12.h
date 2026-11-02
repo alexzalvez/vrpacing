@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -31,7 +32,6 @@ public:
     void EndFrame();
     void Shutdown(const char* reason = "DestroySession");
 
-    // Detour callbacks
     void OnCreateRenderTargetView(ID3D12Device* dev,
                                   ID3D12Resource* pResource,
                                   const D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
@@ -54,7 +54,7 @@ private:
         DXGI_FORMAT resourceFmt = DXGI_FORMAT_UNKNOWN;
         DXGI_FORMAT viewFmt = DXGI_FORMAT_UNKNOWN;
         uint32_t samples = 1;
-        uint32_t dim = 0; // 4=TEX2D, 5=TEX2DARRAY, 6=TEX2DMS, 7=TEX2DMSARRAY
+        uint32_t dim = 0;
         uint32_t arraySize = 1;
         bool isSwapchain = false;
     };
@@ -96,8 +96,8 @@ private:
     ~VrsFoveatedD3D12() = default;
 
     void InstallHooksLocked(ID3D12Device* rawDevice);
-    bool BuildAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode);
-    void LogDistinctRtLocked(const DescriptorPod& rt, bool hasDsv, const char* label);
+    bool EnsureUploadObjectsLocked();
+    bool AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace);
 
     std::mutex mutex_;
     std::shared_mutex rtvMapMutex_;
@@ -109,21 +109,31 @@ private:
     std::unordered_set<ID3D12Resource*> swapchainTextures_;
     std::unordered_map<void**, CmdList5VtableEntry> cmdList5VtblCache_;
 
-    ID3D12Device* device_ = nullptr; // Leaked / non-releasing reference
+    ID3D12Device* device_ = nullptr;
+    uint32_t rtvDescriptorSize_ = 0;
     bool capabilityChecked_ = false;
     bool tier2Supported_ = false;
     bool hooksInstalled_ = false;
     uint32_t tileSize_ = 16;
     bool additionalShadingRates_ = false;
 
+    // [C1] All hot-path state variables are std::atomic
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
     std::atomic<int> debugMode_{ 1 };
-    uint32_t targetEyeW_ = 0;
-    uint32_t targetEyeH_ = 0;
+    std::atomic<uint32_t> targetEyeW_{ 0 };
+    std::atomic<uint32_t> targetEyeH_{ 0 };
+    std::atomic<uint32_t> capPixelsW_{ 0 };
+    std::atomic<uint32_t> capPixelsH_{ 0 };
+    std::atomic<uint32_t> texTilesW_{ 0 };
+    std::atomic<uint32_t> texTilesH_{ 0 };
+    std::atomic<size_t> distinctRtLogCount_{ 0 }; // [C2] Lock-free budget check
+    std::atomic<bool> deviceRemovedLogged_{ false }; // [C7]
+
+    uint32_t builtEyeW_ = 0;
+    uint32_t builtEyeH_ = 0;
     int builtMode_ = -1;
 
-    // Leaked process-lifetime D3D12 upload & VRS resources [B6]
     ID3D12CommandQueue* uploadQueue_ = nullptr;
     ID3D12CommandAllocator* uploadAlloc_ = nullptr;
     ID3D12GraphicsCommandList* uploadList_ = nullptr;
@@ -133,14 +143,17 @@ private:
     ID3D12Resource* currentVrsTexture_ = nullptr;
     std::vector<ID3D12Resource*> leakedResources_;
 
-    std::unordered_set<uint64_t> loggedDistinctRts_;
+    // [C5] Key distinct-RT by RT0 handle.ptr
+    std::unordered_set<size_t> loggedDistinctRtHandles_;
     std::unordered_map<HistKey12, uint64_t, HistKey12Hash> histogram_;
 
+    // [C2] All per-call counters are std::atomic<uint64_t>
     std::atomic<uint64_t> framesCount_{ 0 };
     std::atomic<uint64_t> omsrtCount_{ 0 };
     std::atomic<uint64_t> directCount_{ 0 };
     std::atomic<uint64_t> candidatesCount_{ 0 };
     std::atomic<uint64_t> bindsCount_{ 0 };
+    std::atomic<uint64_t> resetsCount_{ 0 };
     std::atomic<uint64_t> rtvUnknownCount_{ 0 };
     std::atomic<uint64_t> beginRpCount_{ 0 };
     std::atomic<uint64_t> visMaskCallsCount_{ 0 };

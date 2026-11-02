@@ -50,8 +50,14 @@ VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
 
+// C++ vtable ABI (RCX = self, RDX = hidden return struct ptr, R8 = eye, R9 = type)
 using GetHiddenAreaMeshFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, vr::HiddenAreaMesh_t*, vr::EVREye, vr::EHiddenAreaMeshType);
 using GetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, vr::HiddenAreaMesh_t*, vr::EVREye);
+
+// [P1] C FnTable ABI (no 'this' pointer: RCX = hidden return struct ptr, RDX = eye, R8 = type)
+using FnTableGetHiddenAreaMeshFn = vr::HiddenAreaMesh_t* (__fastcall*)(vr::HiddenAreaMesh_t*, vr::EVREye, vr::EHiddenAreaMeshType);
+using FnTableGetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t* (__fastcall*)(vr::HiddenAreaMesh_t*, vr::EVREye);
+
 using GetProjectionRawFn = void (__fastcall*)(void*, vr::EVREye, float*, float*, float*, float*);
 
 struct VtableSlotRecord {
@@ -76,6 +82,12 @@ HookSlotRegistry g_waitGetPosesReg{};
 HookSlotRegistry g_submitReg{};
 HookSlotRegistry g_hamReg{};
 
+// [P1] Active FnTable hook state
+void* g_fnTableHamTrampoline = nullptr;
+void* g_fnTableAssociatedCppIface = nullptr;
+bool g_fnTableHamHasType = true;
+std::string g_fnTableVersionStr;
+
 std::unordered_set<std::string> g_loggedDiagInterfaces;
 std::unordered_set<std::string> g_loggedUnsupportedVersions;
 std::atomic<bool> g_openVrHooksInstalled{ false };
@@ -97,6 +109,7 @@ int32_t g_lastHResult = 0;
 std::atomic<uint64_t> g_submitFrameCounter{ 0 };
 std::atomic<bool> g_phaseResetRequested{ false };
 std::atomic<int> g_hamEntryLogCount{ 0 };
+std::atomic<int> g_hamSmallTrisDumpCount{ 0 }; // [P2] First 2 calls with tris <= 4
 
 float g_projCenters[2][2] = { { 0.5f, 0.5f }, { 0.5f, 0.5f } };
 bool g_projCentersCalculated = false;
@@ -300,7 +313,6 @@ void CalculateOpenVRProjectionCenters() {
     g_projCentersCalculated = true;
 }
 
-// [Phase C Fix 1] Log mask.openvrMode at initialization
 void EnsureInit() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -317,59 +329,29 @@ void EnsureInit() {
     });
 }
 
-// [Phase C Fixes 2, 3, 4] Full diagnostic logging on Hooked_GetHiddenAreaMesh
-vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
-                                                          vr::HiddenAreaMesh_t* ret,
-                                                          vr::EVREye eye,
-                                                          vr::EHiddenAreaMeshType type) {
+// Shared handler for both C++ vtable and C FnTable GetHiddenAreaMesh detours
+vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
+    void* cppSelf,
+    vr::HiddenAreaMesh_t* ret,
+    vr::EVREye eye,
+    vr::EHiddenAreaMeshType effectiveType,
+    bool hamHasType,
+    const std::string& versionStr,
+    auto&& callOrigWithType) {
     EnsureInit();
-
-    VtableSlotRecord rec{};
-    auto origFn = ResolveSlotTrampoline<GetHiddenAreaMeshFn>(g_hamReg, self, &rec);
-    const vr::EHiddenAreaMeshType effectiveType = rec.hamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
     const int mode = g_cfg.mask.openvrMode;
 
-    // [Phase C Fix 2] Log first 8 entries into HAM hook regardless of mode
     const int entryNum = g_hamEntryLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
     if (entryNum <= 8) {
         LogMessage(LogLevel::Info, "OpenVR HAM entry#" + std::to_string(entryNum) +
-                   " [" + (rec.versionString.empty() ? "unresolved" : rec.versionString) +
+                   " [" + (versionStr.empty() ? "unresolved" : versionStr) +
                    "] eye=" + std::to_string(static_cast<int>(eye)) +
                    " type=" + std::to_string(static_cast<int>(effectiveType)) +
                    " mode=" + std::to_string(mode));
     }
 
-    if (!origFn) {
-        LogMessage(LogLevel::Warn, "OpenVR HAM return: unresolved trampoline for self=" + PtrToHex(self));
-        if (ret) {
-            ret->pVertexData = nullptr;
-            ret->unTriangleCount = 0;
-        }
-        return ret;
-    }
-
-    auto callOriginal = [&]() -> vr::HiddenAreaMesh_t* {
-        if (rec.hamHasType) {
-            return origFn(self, ret, eye, effectiveType);
-        }
-        auto origNoType = reinterpret_cast<GetHiddenAreaMeshNoTypeFn>(origFn);
-        return origNoType(self, ret, eye);
-    };
-
-    if (IsOpenXrSessionActiveAnyApi()) {
-        if (entryNum <= 8) {
-            LogMessage(LogLevel::Info, "OpenVR HAM return: passthrough (OpenXR session active)");
-        }
-        return callOriginal();
-    }
-
-    if (!ret) {
-        LogMessage(LogLevel::Warn, "OpenVR HAM return: ret pointer is null");
-        return callOriginal();
-    }
-
-    if (mode <= 0) {
-        return callOriginal();
+    if (IsOpenXrSessionActiveAnyApi() || !ret || mode <= 0) {
+        return callOrigWithType(ret, effectiveType);
     }
 
     const int eyeIdx = (eye == vr::Eye_Right) ? 1 : 0;
@@ -383,77 +365,93 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
         maskKind = VisibilityMaskKind::LineLoop;
     }
 
-    if (mode == 1) {
-        vr::HiddenAreaMesh_t* res = callOriginal();
-        std::lock_guard<std::mutex> lock(g_hamMutex);
-        if (!g_hamPassiveLogged[eyeIdx][typeIdx]) {
-            g_hamPassiveLogged[eyeIdx][typeIdx] = true;
-            const uint32_t tris = res ? res->unTriangleCount : 0;
-            const uint32_t vertCount = (effectiveType == vr::k_eHiddenAreaMesh_LineLoop) ? tris : (tris * 3);
-            float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f;
-            if (res && res->pVertexData && vertCount > 0) {
-                u0 = u1 = res->pVertexData[0].v[0];
-                v0 = v1 = res->pVertexData[0].v[1];
-                for (uint32_t i = 1; i < vertCount; ++i) {
-                    const float u = res->pVertexData[i].v[0];
-                    const float v = res->pVertexData[i].v[1];
-                    u0 = (std::min)(u0, u);
-                    u1 = (std::max)(u1, u);
-                    v0 = (std::min)(v0, v);
-                    v1 = (std::max)(v1, v);
-                }
+    // [P2] Dump vertices for the first 2 calls with tris <= 4 and probe type=2 (LineLoop)
+    auto inspectAndDumpOriginal = [&](vr::HiddenAreaMesh_t* origRes, bool logStandardLine) {
+        const uint32_t tris = origRes ? origRes->unTriangleCount : 0;
+        const uint32_t vertCount = (effectiveType == vr::k_eHiddenAreaMesh_LineLoop) ? tris : (tris * 3);
+        float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f;
+        if (origRes && origRes->pVertexData && vertCount > 0) {
+            u0 = u1 = origRes->pVertexData[0].v[0];
+            v0 = v1 = origRes->pVertexData[0].v[1];
+            for (uint32_t i = 1; i < vertCount; ++i) {
+                const float u = origRes->pVertexData[i].v[0];
+                const float v = origRes->pVertexData[i].v[1];
+                u0 = (std::min)(u0, u);
+                u1 = (std::max)(u1, u);
+                v0 = (std::min)(v0, v);
+                v1 = (std::max)(v1, v);
             }
+        }
+        if (logStandardLine) {
             char bboxBuf[128]{};
             std::snprintf(bboxBuf, sizeof(bboxBuf), "[%.4f,%.4f,%.4f,%.4f]", u0, v0, u1, v1);
-            LogMessage(LogLevel::Info, "OpenVR HAM [" + rec.versionString + "] eye=" + std::to_string(eyeIdx) +
+            LogMessage(LogLevel::Info, "OpenVR HAM [" + versionStr + "] eye=" + std::to_string(eyeIdx) +
                        " type=" + std::to_string(static_cast<int>(effectiveType)) +
                        " tris=" + std::to_string(tris) + " bbox=" + std::string(bboxBuf));
+        }
 
-            // [Phase C Fix 3] Dump vertices when tris <= 4 and also query LineLoop (type=2)
-            if (res && res->pVertexData && tris > 0 && tris <= 4) {
-                std::string vDump = "OpenVR HAM [" + rec.versionString + "] eye=" + std::to_string(eyeIdx) + " verts:";
+        if (origRes && origRes->pVertexData && tris <= 4) {
+            const int dumpIdx = g_hamSmallTrisDumpCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (dumpIdx <= 2) {
+                std::string vDump = "OpenVR HAM dump#" + std::to_string(dumpIdx) + " [" + versionStr +
+                                    "] eye=" + std::to_string(eyeIdx) + " tris=" + std::to_string(tris) + " verts:";
                 for (uint32_t i = 0; i < vertCount; ++i) {
                     char vBuf[64]{};
-                    std::snprintf(vBuf, sizeof(vBuf), " (%.4f,%.4f)", res->pVertexData[i].v[0], res->pVertexData[i].v[1]);
+                    std::snprintf(vBuf, sizeof(vBuf), " (%.4f,%.4f)", origRes->pVertexData[i].v[0], origRes->pVertexData[i].v[1]);
                     vDump += vBuf;
                 }
                 LogMessage(LogLevel::Info, vDump);
-            }
 
-            if (rec.hamHasType && effectiveType != vr::k_eHiddenAreaMesh_LineLoop) {
-                vr::HiddenAreaMesh_t loopMesh{};
-                origFn(self, &loopMesh, eye, vr::k_eHiddenAreaMesh_LineLoop);
-                float lu0 = 0.0f, lv0 = 0.0f, lu1 = 0.0f, lv1 = 0.0f;
-                if (loopMesh.pVertexData && loopMesh.unTriangleCount > 0) {
-                    lu0 = lu1 = loopMesh.pVertexData[0].v[0];
-                    lv0 = lv1 = loopMesh.pVertexData[0].v[1];
-                    for (uint32_t i = 1; i < loopMesh.unTriangleCount; ++i) {
-                        lu0 = (std::min)(lu0, loopMesh.pVertexData[i].v[0]);
-                        lu1 = (std::max)(lu1, loopMesh.pVertexData[i].v[0]);
-                        lv0 = (std::min)(lv0, loopMesh.pVertexData[i].v[1]);
-                        lv1 = (std::max)(lv1, loopMesh.pVertexData[i].v[1]);
+                if (hamHasType && effectiveType != vr::k_eHiddenAreaMesh_LineLoop) {
+                    vr::HiddenAreaMesh_t loopMesh{};
+                    callOrigWithType(&loopMesh, vr::k_eHiddenAreaMesh_LineLoop);
+                    float lu0 = 0.0f, lv0 = 0.0f, lu1 = 0.0f, lv1 = 0.0f;
+                    if (loopMesh.pVertexData && loopMesh.unTriangleCount > 0) {
+                        lu0 = lu1 = loopMesh.pVertexData[0].v[0];
+                        lv0 = lv1 = loopMesh.pVertexData[0].v[1];
+                        for (uint32_t i = 1; i < loopMesh.unTriangleCount; ++i) {
+                            lu0 = (std::min)(lu0, loopMesh.pVertexData[i].v[0]);
+                            lu1 = (std::max)(lu1, loopMesh.pVertexData[i].v[0]);
+                            lv0 = (std::min)(lv0, loopMesh.pVertexData[i].v[1]);
+                            lv1 = (std::max)(lv1, loopMesh.pVertexData[i].v[1]);
+                        }
                     }
+                    char lBbox[128]{};
+                    std::snprintf(lBbox, sizeof(lBbox), "[%.4f,%.4f,%.4f,%.4f]", lu0, lv0, lu1, lv1);
+                    LogMessage(LogLevel::Info, "OpenVR HAM probe LineLoop [" + versionStr + "] eye=" +
+                               std::to_string(eyeIdx) + " tris=" + std::to_string(loopMesh.unTriangleCount) +
+                               " bbox=" + std::string(lBbox));
                 }
-                char lBbox[128]{};
-                std::snprintf(lBbox, sizeof(lBbox), "[%.4f,%.4f,%.4f,%.4f]", lu0, lv0, lu1, lv1);
-                LogMessage(LogLevel::Info, "OpenVR HAM probe LineLoop [" + rec.versionString + "] eye=" +
-                           std::to_string(eyeIdx) + " count=" + std::to_string(loopMesh.unTriangleCount) +
-                           " bbox=" + std::string(lBbox));
             }
         }
+    };
+
+    if (mode == 1) {
+        vr::HiddenAreaMesh_t* res = callOrigWithType(ret, effectiveType);
+        std::lock_guard<std::mutex> lock(g_hamMutex);
+        const bool firstForPair = !g_hamPassiveLogged[eyeIdx][typeIdx];
+        g_hamPassiveLogged[eyeIdx][typeIdx] = true;
+        inspectAndDumpOriginal(res, firstForPair);
         return res;
     }
 
-    // [Phase C Fix 4] Mode 2: log every exit path explicitly
+    // Mode 2: also inspect original if we haven't dumped the first 2 small-tris calls yet
+    if (g_hamSmallTrisDumpCount.load(std::memory_order_relaxed) < 2) {
+        vr::HiddenAreaMesh_t origTmp{};
+        callOrigWithType(&origTmp, effectiveType);
+        std::lock_guard<std::mutex> lock(g_hamMutex);
+        inspectAndDumpOriginal(&origTmp, true);
+    }
+
     std::lock_guard<std::mutex> lock(g_hamMutex);
     if (!g_hamCache.built[eyeIdx][typeIdx]) {
         float l = -1.0f, r = 1.0f, t = -1.0f, b = 1.0f;
-        void** vtbl = *reinterpret_cast<void***>(self);
-        if (vtbl && vtbl[1]) {
-            auto getProjRaw = reinterpret_cast<GetProjectionRawFn>(vtbl[1]);
-            getProjRaw(self, eye, &l, &r, &t, &b);
-        } else {
-            LogMessage(LogLevel::Warn, "OpenVR HAM mode=2: vtbl[1] GetProjectionRaw unavailable, using default [-1,1] tangents.");
+        if (cppSelf) {
+            void** vtbl = *reinterpret_cast<void***>(cppSelf);
+            if (vtbl && vtbl[1]) {
+                auto getProjRaw = reinterpret_cast<GetProjectionRawFn>(vtbl[1]);
+                getProjRaw(cppSelf, eye, &l, &r, &t, &b);
+            }
         }
 
         uint32_t triCount = 0;
@@ -469,7 +467,7 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
 
     if (g_hamCache.verts[eyeIdx][typeIdx].empty()) {
         LogMessage(LogLevel::Warn, "OpenVR HAM mode=2 return: generated vertex cache is empty for eye=" + std::to_string(eyeIdx));
-        return callOriginal();
+        return callOrigWithType(ret, effectiveType);
     }
 
     ret->pVertexData = g_hamCache.verts[eyeIdx][typeIdx].data();
@@ -483,6 +481,59 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
     }
 
     return ret;
+}
+
+vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
+                                                          vr::HiddenAreaMesh_t* ret,
+                                                          vr::EVREye eye,
+                                                          vr::EHiddenAreaMeshType type) {
+    VtableSlotRecord rec{};
+    auto origFn = ResolveSlotTrampoline<GetHiddenAreaMeshFn>(g_hamReg, self, &rec);
+    if (!origFn) {
+        if (ret) {
+            ret->pVertexData = nullptr;
+            ret->unTriangleCount = 0;
+        }
+        return ret;
+    }
+
+    const vr::EHiddenAreaMeshType effectiveType = rec.hamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
+    auto callOrig = [&](vr::HiddenAreaMesh_t* outPtr, vr::EHiddenAreaMeshType t) -> vr::HiddenAreaMesh_t* {
+        if (rec.hamHasType) {
+            return origFn(self, outPtr, eye, t);
+        }
+        auto origNoType = reinterpret_cast<GetHiddenAreaMeshNoTypeFn>(origFn);
+        return origNoType(self, outPtr, eye);
+    };
+
+    return HandleHiddenAreaMeshShared(self, ret, eye, effectiveType, rec.hamHasType, rec.versionString, callOrig);
+}
+
+// [P1] Separate detour for C FnTable ABI (no 'this' parameter) sharing the same handler
+vr::HiddenAreaMesh_t* __fastcall Hooked_FnTable_GetHiddenAreaMesh(vr::HiddenAreaMesh_t* ret,
+                                                                  vr::EVREye eye,
+                                                                  vr::EHiddenAreaMeshType type) {
+    void* tramp = g_fnTableHamTrampoline;
+    if (!tramp) {
+        if (ret) {
+            ret->pVertexData = nullptr;
+            ret->unTriangleCount = 0;
+        }
+        return ret;
+    }
+
+    const vr::EHiddenAreaMeshType effectiveType = g_fnTableHamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
+    auto callOrig = [&](vr::HiddenAreaMesh_t* outPtr, vr::EHiddenAreaMeshType t) -> vr::HiddenAreaMesh_t* {
+        if (g_fnTableHamHasType) {
+            auto fn = reinterpret_cast<FnTableGetHiddenAreaMeshFn>(tramp);
+            return fn(outPtr, eye, t);
+        }
+        auto fnNoType = reinterpret_cast<FnTableGetHiddenAreaMeshNoTypeFn>(tramp);
+        return fnNoType(outPtr, eye);
+    };
+
+    return HandleHiddenAreaMeshShared(g_fnTableAssociatedCppIface, ret, eye, effectiveType,
+                                      g_fnTableHamHasType, g_fnTableVersionStr, callOrig);
 }
 
 vr::EVRCompositorError HookedWaitGetPoses(void* self,
@@ -914,6 +965,61 @@ void HookSystemInstance(const char* name, void* iface) {
                                     entry->hamHasType);
 }
 
+// [P1] Probe and hook FnTable:IVRSystem_NNN at the same slot index as the C++ vtable
+void HookSystemFnTableInstance(const char* cppName, void* fnTablePtr, void* cppIface) {
+    if (!cppName || !fnTablePtr) return;
+    const OpenVrSlotEntry* entry = LookupOpenVrSlots(cppName);
+    if (!entry || entry->hamSlot < 0) {
+        LogUnsupportedOnce(cppName);
+        return;
+    }
+
+    const uint32_t slotIdx = static_cast<uint32_t>(entry->hamSlot);
+    void** fnTable = reinterpret_cast<void**>(fnTablePtr);
+    void* fnTarget = fnTable[slotIdx];
+
+    void* vtblTarget = nullptr;
+    if (cppIface) {
+        void** vtbl = *reinterpret_cast<void***>(cppIface);
+        if (vtbl) {
+            vtblTarget = vtbl[slotIdx];
+        }
+    }
+
+    LogMessage(LogLevel::Info, "FnTable " + std::string(cppName) + " GHAM=" + PtrToHex(fnTarget) +
+               " vtblTarget=" + PtrToHex(vtblTarget));
+
+    if (!fnTarget) return;
+
+    if (fnTarget == vtblTarget) {
+        LogMessage(LogLevel::Info, "FnTable " + std::string(cppName) + " shared");
+        return;
+    }
+
+    std::lock_guard<std::mutex> installLock(g_installMutex);
+    MH_Initialize();
+
+    if (g_fnTableHamTrampoline != nullptr) {
+        return;
+    }
+
+    g_fnTableAssociatedCppIface = cppIface;
+    g_fnTableHamHasType = entry->hamHasType;
+    g_fnTableVersionStr = std::string("FnTable:") + cppName;
+
+    void* tramp = nullptr;
+    if (MH_CreateHook(fnTarget, reinterpret_cast<void*>(&Hooked_FnTable_GetHiddenAreaMesh), &tramp) == MH_OK && tramp) {
+        if (MH_EnableHook(fnTarget) == MH_OK) {
+            g_fnTableHamTrampoline = tramp;
+            LogMessage(LogLevel::Info, "OpenVR Hook installed: FnTable:" + std::string(cppName) +
+                       "::GetHiddenAreaMesh [slot[" + std::to_string(slotIdx) + "]=" + PtrToHex(fnTarget) +
+                       ", trampoline=" + PtrToHex(tramp) + "]");
+        } else {
+            MH_RemoveHook(fnTarget);
+        }
+    }
+}
+
 void* HookedVRGetGenericInterface(const char* name, int* error) {
     void* iface = g_origGetGenericInterface(name, error);
     if (!name) {
@@ -959,6 +1065,7 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
         if (cppIface) {
             HookSystemInstance(cppName, cppIface);
         }
+        HookSystemFnTableInstance(cppName, iface, cppIface);
     }
     return iface;
 }
