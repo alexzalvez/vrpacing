@@ -15,7 +15,7 @@ struct UpscalingConfig {
 
 struct MaskConfig {
     bool enabled = true;
-    int openvrMode = 1; // [C5] 0=off, 1=passive (default for Phase C build), 2=replace
+    int openvrMode = 1;
     float radiusX = 1.0f;
     float radiusY = 1.0f;
     float centerX = 0.0f;
@@ -30,6 +30,11 @@ struct FfrConfig {
     float innerRadius = 0.60f;
     int debugMode = 0;
     float outerRadius = 1.00f;
+};
+
+// [B8] D3D12 VRS configuration (default debugMode = 1 passive for B0 build)
+struct Vrs12Config {
+    int debugMode = 1;
 };
 
 struct PacingConfig {
@@ -49,6 +54,7 @@ struct RuntimeConfig {
     UpscalingConfig upscaling;
     MaskConfig mask;
     FfrConfig ffr;
+    Vrs12Config vrs12;
     PacingConfig pacing;
     LoggingConfig logging;
 };

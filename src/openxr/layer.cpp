@@ -9,8 +9,12 @@
 #include <windows.h>
 #include <unknwn.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <wrl/client.h>
 
+#ifndef XR_USE_GRAPHICS_API_D3D12
+#define XR_USE_GRAPHICS_API_D3D12
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
@@ -34,6 +38,7 @@
 #include "common/visibility_mask.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "gfx/vrs_foveated_d3d11.h"
+#include "gfx/vrs_foveated_d3d12.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 
@@ -110,6 +115,7 @@ SharedMemoryClient g_shm;
 
 ComPtr<ID3D11Device> g_d3d11Device;
 ComPtr<ID3D11DeviceContext> g_d3d11Context;
+ComPtr<ID3D12Device> g_d3d12Device; // [B1]
 
 uint32_t g_lastInW = 0;
 uint32_t g_lastInH = 0;
@@ -124,6 +130,8 @@ uint32_t g_vrsTargetEyeW = 0;
 uint32_t g_vrsTargetEyeH = 0;
 bool g_vrsLastEnabled = false;
 int g_vrsLastDebugMode = -1;
+
+std::atomic<uint64_t> g_visMaskCallsD3D11{ 0 }; // [B9]
 
 bool IsCurrentProcessBlacklisted() {
     static int s_cached = -1;
@@ -239,7 +247,6 @@ void PopulateTangentsIfNeeded(XrSession session, XrViewConfigurationType viewCon
     }
 }
 
-// [C4] Calls shared pure visibility_mask generator with identical numerical output
 XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     XrSession session,
     XrViewConfigurationType viewConfigurationType,
@@ -248,6 +255,13 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     XrVisibilityMaskKHR* visibilityMask) {
     EnsureInit();
     if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
+
+    // [B9] Count xrGetVisibilityMaskKHR calls per session type
+    if (g_d3d12Device) {
+        VrsFoveatedD3D12::Instance().RecordVisibilityMaskCall();
+    } else {
+        g_visMaskCallsD3D11.fetch_add(1, std::memory_order_relaxed);
+    }
 
     g_shm.SyncConfig(g_cfg);
 
@@ -414,12 +428,14 @@ XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eve
     return g_nextPollEvent ? g_nextPollEvent(instance, eventData) : XR_EVENT_UNAVAILABLE;
 }
 
+// [B1] Capture XrGraphicsBindingD3D12KHR while keeping Pure VDXR Bridge standby intact
 XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
     EnsureInit();
     if (!createInfo || !session) return XR_ERROR_VALIDATION_FAILURE;
 
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
+    g_d3d12Device.Reset();
     g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
     g_vdxrBridgeActive.store(false, std::memory_order_relaxed);
     g_vdxrWarmupFrames.store(0, std::memory_order_relaxed);
@@ -437,6 +453,16 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
                     g_openXrD3D11Active.store(true, std::memory_order_relaxed);
                     g_shm.OpenOrCreate();
                     g_shm.SetOpenXrD3D11Pid(GetCurrentProcessId());
+                }
+            }
+            break;
+        } else if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+            const auto* d3d12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(next);
+            if (d3d12->device) {
+                g_d3d12Device = d3d12->device;
+                LogMessage(LogLevel::Info, "OpenXR Layer: Captured ID3D12Device in xrCreateSession.");
+                if (!IsCurrentProcessBlacklisted()) {
+                    VrsFoveatedD3D12::Instance().OnSessionCreated(g_d3d12Device.Get());
                 }
             }
             break;
@@ -472,6 +498,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     return res;
 }
 
+// [B10] Shutdown D3D12 VRS on DestroySession
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
@@ -480,6 +507,10 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
         }
         VrsFoveatedD3D11::Instance().Shutdown("DestroySession");
         VrsFoveatedD3D11::Instance().ClearExcludedTextures();
+    }
+    if (g_d3d12Device && !IsCurrentProcessBlacklisted()) {
+        VrsFoveatedD3D12::Instance().Shutdown("DestroySession");
+        VrsFoveatedD3D12::Instance().ClearSwapchainTextures();
     }
     g_vrsTargetEyeW = 0;
     g_vrsTargetEyeH = 0;
@@ -506,6 +537,9 @@ XrResult XRAPI_CALL Impl_xrDestroyInstance(XrInstance instance) {
     }
     VrsFoveatedD3D11::Instance().Shutdown("DestroyInstance");
     VrsFoveatedD3D11::Instance().ClearExcludedTextures();
+    if (g_d3d12Device) {
+        VrsFoveatedD3D12::Instance().Shutdown("DestroyInstance");
+    }
     if (g_nextDestroyInstance) {
         return g_nextDestroyInstance(instance);
     }
@@ -697,16 +731,26 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainFormats(XrSession session, uint32_t
     return g_nextEnumerateSwapchainFormats(session, formatCapacityInput, formatCountOutput, formats);
 }
 
+// [B4] Collect XrSwapchainImageD3D12KHR::texture for sc histogram field
 XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t imageCapacityInput, uint32_t* imageCountOutput, XrSwapchainImageBaseHeader* images) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
         XrResult r_enum = g_nextEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
         if (XR_SUCCEEDED(r_enum) && images && imageCapacityInput > 0) {
-            auto* realD3d = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
-            for (uint32_t j = 0; j < imageCapacityInput; ++j) {
-                if (realD3d[j].texture) {
-                    VrsFoveatedD3D11::Instance().RegisterExcludedTexture(realD3d[j].texture);
+            if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
+                auto* realD3d = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+                for (uint32_t j = 0; j < imageCapacityInput; ++j) {
+                    if (realD3d[j].texture) {
+                        VrsFoveatedD3D11::Instance().RegisterExcludedTexture(realD3d[j].texture);
+                    }
+                }
+            } else if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) {
+                auto* realD3d12 = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+                for (uint32_t j = 0; j < imageCapacityInput; ++j) {
+                    if (realD3d12[j].texture) {
+                        VrsFoveatedD3D12::Instance().RegisterSwapchainTexture(realD3d12[j].texture);
+                    }
                 }
             }
         }
@@ -963,8 +1007,44 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     return res;
 }
 
+// [B1, B9] Extract eye size from projection layer for D3D12 sessions as well
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
     if (!g_d3d11Device) {
+        if (g_d3d12Device && !IsCurrentProcessBlacklisted() && frameEndInfo && frameEndInfo->layerCount > 0 && frameEndInfo->layers) {
+            uint32_t projEyeW = 0;
+            uint32_t projEyeH = 0;
+            for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                const auto* layer = frameEndInfo->layers[i];
+                if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                    const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                    if (proj->viewCount >= 2 && proj->views) {
+                        const int32_t extW = proj->views[0].subImage.imageRect.extent.width;
+                        const int32_t extH = proj->views[0].subImage.imageRect.extent.height;
+                        if (extW > 0 && extH > 0) {
+                            projEyeW = static_cast<uint32_t>(extW);
+                            projEyeH = static_cast<uint32_t>(extH);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (projEyeW > 0 && projEyeH > 0) {
+                const bool ffr12Enabled = g_cfg.ffr.openxrEnabled || (g_cfg.vrs12.debugMode > 0);
+                const int dbg12 = g_cfg.vrs12.debugMode;
+                if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) {
+                    LogMessage(LogLevel::Info, "VRS12: OpenXR target eye " + std::to_string(projEyeW) + "x" + std::to_string(projEyeH) + " (from projection layer)");
+                }
+                if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH || ffr12Enabled != g_vrsLastEnabled || dbg12 != g_vrsLastDebugMode) {
+                    g_vrsTargetEyeW = projEyeW;
+                    g_vrsTargetEyeH = projEyeH;
+                    g_vrsLastEnabled = ffr12Enabled;
+                    g_vrsLastDebugMode = dbg12;
+                    VrsFoveatedD3D12::Instance().UpdateTarget(g_d3d12Device.Get(), ffr12Enabled, projEyeW, projEyeH, dbg12);
+                }
+            }
+            VrsFoveatedD3D12::Instance().EndFrame();
+        }
+
         if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
             const uint32_t frames = g_vdxrWarmupFrames.fetch_add(1, std::memory_order_relaxed) + 1;
             if (frames >= 60) {

@@ -17,6 +17,8 @@
 
 #include "minhook/include/MinHook.h"
 #include "common/logging_win.h"
+#include "common/vrs_filter.h"
+#include "common/vrs_pattern.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -26,13 +28,6 @@ std::atomic<bool> g_vrsDetaching{ false };
 
 namespace {
 
-constexpr float kAspectTolerance = 0.01f;
-constexpr float kMinScale = 0.75f;
-constexpr float kMaxScale = 1.50f;
-constexpr float kSquareAspectTolerance = 0.02f;
-
-constexpr float kInnerRadius = 0.60f;
-constexpr float kMidRadius = 1.00f;
 constexpr uint32_t kMaxNvFailLogs = 5;
 constexpr UINT kMaxViewports = 16;
 
@@ -97,67 +92,6 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargetsAndUAVs(
         VrsFoveatedD3D11::Instance().OnPostOMSetRenderTargets(
             self, numRTVs, ppRenderTargetViews, pDepthStencilView);
         g_inVrsHook = false;
-    }
-}
-
-uint8_t DistanceToVRSLevel(float distance) {
-    if (distance < kInnerRadius) {
-        return 0;
-    }
-    if (distance < kMidRadius) {
-        return 1;
-    }
-    return 2;
-}
-
-std::vector<uint8_t> CreateCenteredPattern(int tilesW, int tilesH, int rtW, int rtH, bool doubleWide) {
-    std::vector<uint8_t> data(static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH), 0);
-    if (rtW <= 0 || rtH <= 0 || tilesW <= 0 || tilesH <= 0) {
-        return data;
-    }
-
-    const float eyeW = doubleWide ? (static_cast<float>(rtW) * 0.5f) : static_cast<float>(rtW);
-    const float fRtH = static_cast<float>(rtH);
-    if (eyeW <= 0.0f || fRtH <= 0.0f) {
-        return data;
-    }
-
-    for (int y = 0; y < tilesH; ++y) {
-        const float py = (std::min)((static_cast<float>(y) + 0.5f) * static_cast<float>(NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT),
-                                    static_cast<float>(rtH - 1));
-        const float ny = (py / fRtH) * 2.0f - 1.0f;
-
-        for (int x = 0; x < tilesW; ++x) {
-            const float px = (std::min)((static_cast<float>(x) + 0.5f) * static_cast<float>(NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH),
-                                        static_cast<float>(rtW - 1));
-            const float localX = (doubleWide && px >= eyeW) ? (px - eyeW) : px;
-            const float nx = (localX / eyeW) * 2.0f - 1.0f;
-            const float d = std::sqrt(nx * nx + ny * ny);
-            data[static_cast<size_t>(y) * static_cast<size_t>(tilesW) + static_cast<size_t>(x)] = DistanceToVRSLevel(d);
-        }
-    }
-    return data;
-}
-
-bool IsWhitelistedColorFormat(DXGI_FORMAT fmt) {
-    switch (fmt) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        case DXGI_FORMAT_R10G10B10A2_UNORM:
-        case DXGI_FORMAT_R11G11B10_FLOAT:
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        case DXGI_FORMAT_R16G16B16A16_UNORM:
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        case DXGI_FORMAT_R32G32B32A32_FLOAT:
-            return true;
-        default:
-            return false;
     }
 }
 
@@ -576,89 +510,24 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
          rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS ||
          rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY);
 
-    if (!validViewDim || td.Width == 0 || td.Height == 0 || td.ArraySize == 0 || td.ArraySize > 2) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_DIM");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
-    const float targetAspect = static_cast<float>(targetEyeWidth_) / static_cast<float>(targetEyeHeight_);
-
-    if (std::abs(targetAspect - 1.0f) > kSquareAspectTolerance && td.Width == td.Height) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SQUARE");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
-    const float a1 = static_cast<float>(td.Width) / static_cast<float>(td.Height);
-    const float a2 = (static_cast<float>(td.Width) * 0.5f) / static_cast<float>(td.Height);
-    const bool doubleWide = std::abs(a2 - targetAspect) <= kAspectTolerance;
-    const bool single = !doubleWide && (std::abs(a1 - targetAspect) <= kAspectTolerance);
-
-    if (!doubleWide && !single) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_ASPECT");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
-    const float eyeW = doubleWide ? (static_cast<float>(td.Width) * 0.5f) : static_cast<float>(td.Width);
-    const float scale = eyeW / static_cast<float>(targetEyeWidth_);
-    if (scale < kMinScale || scale > kMaxScale) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SCALE");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
+    bool isExcl = false;
     for (auto* pExcl : excludedTextures_) {
         if (pExcl == tex.Get()) {
-            LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                        td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_SWAPCHAIN");
-            DisableVRSLocked(ctx, false);
-            return;
+            isExcl = true;
+            break;
         }
     }
 
-    if (!IsWhitelistedColorFormat(td.Format)) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_FORMAT");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
-    if (!pDepthStencilView) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, false, "REJECT_NODSV");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
-    ComPtr<ID3D11Resource> dsvRes;
-    pDepthStencilView->GetResource(dsvRes.GetAddressOf());
-    ComPtr<ID3D11Texture2D> dsvTex;
-    if (!dsvRes || FAILED(dsvRes.As(&dsvTex)) || !dsvTex) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_NODSV");
-        DisableVRSLocked(ctx, false);
-        return;
-    }
-
+    bool validDsvTex = false;
     D3D11_TEXTURE2D_DESC dsvDesc{};
-    dsvTex->GetDesc(&dsvDesc);
-
-    const bool dsvDimMatch = (dsvDesc.Width == td.Width &&
-                              dsvDesc.Height == td.Height &&
-                              dsvDesc.SampleDesc.Count == td.SampleDesc.Count);
-    const bool dsvArrayMatch = (!td.ArraySize || td.ArraySize < 2 || dsvDesc.ArraySize >= td.ArraySize);
-
-    if (!dsvDimMatch || !dsvArrayMatch) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_NODSV");
-        DisableVRSLocked(ctx, false);
-        return;
+    if (pDepthStencilView) {
+        ComPtr<ID3D11Resource> dsvRes;
+        pDepthStencilView->GetResource(dsvRes.GetAddressOf());
+        ComPtr<ID3D11Texture2D> dsvTex;
+        if (dsvRes && SUCCEEDED(dsvRes.As(&dsvTex)) && dsvTex) {
+            dsvTex->GetDesc(&dsvDesc);
+            validDsvTex = true;
+        }
     }
 
     uint32_t rtvSlices = 1;
@@ -668,18 +537,34 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         rtvSlices = rtvDesc.Texture2DMSArray.ArraySize;
     }
 
-    if (doubleWide && rtvSlices > 1) {
-        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                    td.SampleDesc.Count, rtvDesc.ViewDimension, true, "REJECT_DIM");
+    VrsFilterInput fIn{};
+    fIn.rtW = td.Width;
+    fIn.rtH = td.Height;
+    fIn.rtArraySize = td.ArraySize;
+    fIn.rtSamples = td.SampleDesc.Count;
+    fIn.rtResourceFormat = td.Format;
+    fIn.validViewDim = validViewDim;
+    fIn.rtvSlices = rtvSlices;
+    fIn.isExcludedSwapchain = isExcl;
+    fIn.hasDsv = validDsvTex;
+    fIn.dsvW = dsvDesc.Width;
+    fIn.dsvH = dsvDesc.Height;
+    fIn.dsvArraySize = dsvDesc.ArraySize;
+    fIn.dsvSamples = dsvDesc.SampleDesc.Count;
+    fIn.targetEyeW = targetEyeWidth_;
+    fIn.targetEyeH = targetEyeHeight_;
+    fIn.allowArrayAndDoubleWide = true;
+
+    VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
+
+    LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, fOut.label);
+
+    if (!fOut.accepted) {
         DisableVRSLocked(ctx, false);
         return;
     }
 
-    const bool isArrayTarget = (!doubleWide && rtvSlices >= 2 && td.ArraySize >= 2);
-    const char* resultLabel = doubleWide ? "DOUBLEWIDE" : (isArrayTarget ? "ARRAY" : "SINGLE");
-
-    LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                td.SampleDesc.Count, rtvDesc.ViewDimension, true, resultLabel);
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
 
     const RtHistogramKey histKey{ td.Width, td.Height, static_cast<uint32_t>(td.Format), td.SampleDesc.Count, td.ArraySize };
@@ -692,9 +577,9 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    const VrsLayout layout = doubleWide ? VrsLayout::Combined
-                                        : (isArrayTarget ? VrsLayout::Array : VrsLayout::SingleEye);
-    const char* viewLabel = doubleWide ? "Combined" : (isArrayTarget ? "Array" : "SingleEye");
+    const VrsLayout layout = fOut.doubleWide ? VrsLayout::Combined
+                                             : (fOut.isArray ? VrsLayout::Array : VrsLayout::SingleEye);
+    const char* viewLabel = fOut.doubleWide ? "Combined" : (fOut.isArray ? "Array" : "SingleEye");
 
     ID3D11NvShadingRateResourceView* srrv =
         GetOrCreatePatternLocked(layout, static_cast<int>(td.Width), static_cast<int>(td.Height));
@@ -824,7 +709,9 @@ ID3D11NvShadingRateResourceView* VrsFoveatedD3D11::GetOrCreatePatternLocked(
 
     const bool doubleWide = (layout == VrsLayout::Combined);
     const bool isArray = (layout == VrsLayout::Array);
-    std::vector<uint8_t> patternData = CreateCenteredPattern(tilesW, tilesH, rtWidth, rtHeight, doubleWide);
+    std::vector<uint8_t> patternData = CreateCenteredPatternD3D11(
+        tilesW, tilesH, rtWidth, rtHeight, doubleWide,
+        NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH, NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = static_cast<UINT>(tilesW);

@@ -54,6 +54,9 @@ void ToJson(json& j, const RuntimeConfig& cfg) {
             {"outerRadius", cfg.ffr.outerRadius},
             {"debugMode", cfg.ffr.debugMode}
         }},
+        {"vrs12", {
+            {"debugMode", cfg.vrs12.debugMode}
+        }},
         {"pacing", {
             {"enabled", cfg.pacing.enabled},
             {"offsetFps", cfg.pacing.offsetFps},
@@ -97,6 +100,10 @@ RuntimeConfig FromJson(const json& j) {
         cfg.ffr.innerRadius = f.value("innerRadius", cfg.ffr.innerRadius);
         cfg.ffr.outerRadius = f.value("outerRadius", cfg.ffr.outerRadius);
         cfg.ffr.debugMode = f.value("debugMode", cfg.ffr.debugMode);
+    }
+    if (j.contains("vrs12")) {
+        const auto& v12 = j["vrs12"];
+        cfg.vrs12.debugMode = v12.value("debugMode", cfg.vrs12.debugMode);
     }
     if (j.contains("pacing")) {
         const auto& p = j["pacing"];
