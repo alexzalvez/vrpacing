@@ -22,7 +22,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace vrpacing {
 
-// [B4] Teardown atomic flag
 std::atomic<bool> g_vrsDetaching{ false };
 
 namespace {
@@ -59,7 +58,6 @@ using OMSetRenderTargetsAndUAVsFn = void(STDMETHODCALLTYPE*)(
 OMSetRenderTargetsFn g_origOMSetRenderTargets = nullptr;
 OMSetRenderTargetsAndUAVsFn g_origOMSetRenderTargetsAndUAVs = nullptr;
 
-// [B4] Early exit if detaching or suppressed
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
     ID3D11DeviceContext* self,
     UINT numViews,
@@ -141,7 +139,6 @@ std::vector<uint8_t> CreateCenteredPattern(int tilesW, int tilesH, int rtW, int 
     return data;
 }
 
-// [B1.b] Whitelist on color texture formats
 bool IsWhitelistedColorFormat(DXGI_FORMAT fmt) {
     switch (fmt) {
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
@@ -164,7 +161,6 @@ bool IsWhitelistedColorFormat(DXGI_FORMAT fmt) {
     }
 }
 
-// [B2] Hash with rtv format and dsv flag
 uint64_t HashRtCombo(uint32_t w,
                      uint32_t h,
                      uint32_t arr,
@@ -248,7 +244,6 @@ void VrsFoveatedD3D11::LogNvapiFailureRateLimited(const char* opName, NvAPI_Stat
     }
 }
 
-// [B2] Detailed logging format
 void VrsFoveatedD3D11::LogUniqueRenderTargetLocked(uint32_t w,
                                                    uint32_t h,
                                                    uint32_t arraySize,
@@ -283,6 +278,8 @@ void VrsFoveatedD3D11::ClearPatternCacheLocked() {
         patternCache_[i].clear();
     }
     cacheFullLogged_ = false;
+    lastBoundView_ = nullptr;
+    lastBoundDebugMode_ = -1;
 }
 
 bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
@@ -293,6 +290,7 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
         vrsCurrentlyBound_ = false;
         fastBound_.store(false, std::memory_order_relaxed);
         loggedUniqueRts_.clear();
+        rtHistogram_.clear();
 
         device_ = dev;
         context_ = ctx;
@@ -329,7 +327,6 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
     return nvapiSupported_ && hooksInstalled_;
 }
 
-// [B3] Module pinning prior to installing hooks
 void VrsFoveatedD3D11::InstallContextHooksLocked(ID3D11DeviceContext* ctx) {
     if (hooksInstalled_ || hookInstallAttempted_ || !ctx) return;
     hookInstallAttempted_ = true;
@@ -437,12 +434,14 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
         targetEyeWidth_ = eyeWidth;
         targetEyeHeight_ = eyeHeight;
         loggedUniqueRts_.clear();
+        rtHistogram_.clear();
     }
 
     enabled_ = true;
     fastEnabled_.store(true, std::memory_order_relaxed);
 }
 
+// [P1] & [P3] Telemetry stats line with nvbinds and histogram top-3
 void VrsFoveatedD3D11::EndFrame() {
     if (!fastEnabled_.load(std::memory_order_relaxed) &&
         !fastBound_.load(std::memory_order_relaxed)) {
@@ -452,26 +451,55 @@ void VrsFoveatedD3D11::EndFrame() {
     const uint64_t frames = framesCount_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frames % 900 == 0) {
         const uint64_t candidates = candidateBinds_.load(std::memory_order_relaxed);
+        const uint64_t nvbinds = actualNvapiBinds_.load(std::memory_order_relaxed);
         const uint64_t enables = enableCount_.load(std::memory_order_relaxed);
         const uint64_t disables = disableCount_.load(std::memory_order_relaxed);
         const uint64_t nvfail = nvFailCount_.load(std::memory_order_relaxed);
         int mode = 0;
+        std::string topStr;
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
             mode = debugMode_;
+
+            // Sort top entries from the histogram
+            std::vector<std::pair<RtHistogramKey, uint64_t>> sortedEntries(rtHistogram_.begin(), rtHistogram_.end());
+            std::sort(sortedEntries.begin(), sortedEntries.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            if (!sortedEntries.empty()) {
+                topStr = " top=";
+                const size_t limit = (std::min)(size_t(3), sortedEntries.size());
+                for (size_t i = 0; i < limit; ++i) {
+                    if (i > 0) topStr += " ";
+                    const auto& k = sortedEntries[i].first;
+                    topStr += std::to_string(k.w) + "x" + std::to_string(k.h) +
+                              "/f" + std::to_string(k.fmt) +
+                              "/ms" + std::to_string(k.ms) +
+                              ":" + std::to_string(sortedEntries[i].second);
+                }
+            }
+            rtHistogram_.clear();
         }
+
         LogMessage(LogLevel::Info, "VRS: stats frames=" + std::to_string(frames) +
                    " candidates=" + std::to_string(candidates) +
+                   " nvbinds=" + std::to_string(nvbinds) +
                    " enables=" + std::to_string(enables) +
                    " disables=" + std::to_string(disables) +
                    " nvfail=" + std::to_string(nvfail) +
-                   " mode=" + std::to_string(mode));
+                   " mode=" + std::to_string(mode) +
+                   topStr);
     }
 }
 
-// [B4] Shutdown with reason
+// [P2] Idempotent Shutdown: do nothing if device_ is null
 void VrsFoveatedD3D11::Shutdown(const char* reason) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!device_ && !context_ && !nvapiSupported_) {
+        return;
+    }
+
     LogMessage(LogLevel::Info, std::string("VRS: Shutdown (reason=") + (reason ? reason : "Unknown") + ")");
 
     if (context_) {
@@ -480,6 +508,7 @@ void VrsFoveatedD3D11::Shutdown(const char* reason) {
 
     ClearPatternCacheLocked();
     excludedTextures_.clear();
+    rtHistogram_.clear();
 
     context_.Reset();
     device_.Reset();
@@ -487,6 +516,8 @@ void VrsFoveatedD3D11::Shutdown(const char* reason) {
     vrsCurrentlyBound_ = false;
     targetEyeWidth_ = 0;
     targetEyeHeight_ = 0;
+    lastBoundView_ = nullptr;
+    lastBoundDebugMode_ = -1;
     loggedUniqueRts_.clear();
     fastEnabled_.store(false, std::memory_order_relaxed);
     fastBound_.store(false, std::memory_order_relaxed);
@@ -497,7 +528,6 @@ void VrsFoveatedD3D11::DisableVRS(ID3D11DeviceContext* ctx, bool force) {
     DisableVRSLocked(ctx, force);
 }
 
-// [B1] Core Candidate Filtering
 void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     ID3D11DeviceContext* ctx,
     UINT numViews,
@@ -543,7 +573,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     const bool hasDsv = (pDepthStencilView != nullptr);
 
-    // Dimension / Sample limits
     const bool validViewDim =
         (rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D ||
          rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ||
@@ -557,7 +586,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    // Aspect & Scale verification against eye resolution
     const float targetAspect = static_cast<float>(targetEyeWidth_) / static_cast<float>(targetEyeHeight_);
 
     if (std::abs(targetAspect - 1.0f) > kSquareAspectTolerance && td.Width == td.Height) {
@@ -588,7 +616,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    // [B1.a] Swapchain image exclusion check
     for (auto* pExcl : excludedTextures_) {
         if (pExcl == tex.Get()) {
             LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
@@ -598,7 +625,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         }
     }
 
-    // [B1.b] Whitelist color texture formats
     if (!IsWhitelistedColorFormat(td.Format)) {
         LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
                                     td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, "REJECT_FORMAT");
@@ -606,7 +632,6 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    // [B1.c] Depth required: pDepthStencilView != nullptr with identical dimensions and samples
     if (!pDepthStencilView) {
         LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
                                     td.SampleDesc.Count, rtvDesc.ViewDimension, false, "REJECT_NODSV");
@@ -659,6 +684,11 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
                                 td.SampleDesc.Count, rtvDesc.ViewDimension, true, resultLabel);
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
+
+    // [P3] Registrar en el histograma acotado de RTs aceptados
+    if (rtHistogram_.size() < kMaxHistogramEntries || rtHistogram_.find({ td.Width, td.Height, td.Format, td.SampleDesc.Count, td.ArraySize }) != rtHistogram_.end()) {
+        rtHistogram_[{ td.Width, td.Height, td.Format, td.SampleDesc.Count, td.ArraySize }]++;
+    }
 
     if (debugMode_ == 1) {
         DisableVRSLocked(ctx, false);
@@ -742,17 +772,29 @@ void VrsFoveatedD3D11::DisableVRSLocked(ID3D11DeviceContext* ctx, bool force) {
 
     disableCount_.fetch_add(1, std::memory_order_relaxed);
     vrsCurrentlyBound_ = false;
+    lastBoundView_ = nullptr; // [P1] Limpiar vista enlazada al desactivar
+    lastBoundDebugMode_ = -1;
     fastBound_.store(false, std::memory_order_relaxed);
 }
 
+// [P1] Redundant Binds Skip
 void VrsFoveatedD3D11::ApplyVRSViewLocked(ID3D11DeviceContext* ctx,
                                           ID3D11NvShadingRateResourceView* view,
                                           const char* label) {
     if (!view) return;
+
+    // Si ya esta enlazado exactamente este SRRV y el debugMode no cambio, omitir ambas llamadas
+    if (vrsCurrentlyBound_ && lastBoundView_ == view && lastBoundDebugMode_ == debugMode_) {
+        return;
+    }
+
     const NvAPI_Status st = NvAPI_D3D11_RSSetShadingRateResourceView(ctx, view);
     if (st == NVAPI_OK) {
         vrsCurrentlyBound_ = true;
+        lastBoundView_ = view;
+        lastBoundDebugMode_ = debugMode_;
         fastBound_.store(true, std::memory_order_relaxed);
+        actualNvapiBinds_.fetch_add(1, std::memory_order_relaxed);
         EnableVRS(ctx);
     } else {
         std::string op = std::string("NvAPI_D3D11_RSSetShadingRateResourceView(") + label + ")";

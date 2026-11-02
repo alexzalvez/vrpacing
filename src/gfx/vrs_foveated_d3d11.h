@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -19,7 +20,6 @@ enum class VrsTextureMode {
     TextureArray
 };
 
-// [B4] Global process detach flag set by DllMain
 extern std::atomic<bool> g_vrsDetaching;
 
 class VrsFoveatedD3D11 {
@@ -44,7 +44,6 @@ public:
         UpdateTarget(dev, ctx, enabled, eyeWidth, eyeHeight, 0);
     }
 
-    // [B1] Swapchain image exclusion registration
     void RegisterExcludedTexture(ID3D11Texture2D* tex);
     void UnregisterExcludedTexture(ID3D11Texture2D* tex);
     void ClearExcludedTextures();
@@ -77,8 +76,34 @@ private:
         Microsoft::WRL::ComPtr<ID3D11NvShadingRateResourceView> view;
     };
 
+    // [P3] Estructura clave para el histograma de RTs aceptados
+    struct RtHistogramKey {
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint32_t fmt = 0;
+        uint32_t ms = 0;
+        uint32_t arr = 0;
+
+        bool operator==(const RtHistogramKey& o) const {
+            return w == o.w && h == o.h && fmt == o.fmt && ms == o.ms && arr == o.arr;
+        }
+    };
+
+    struct RtHistogramKeyHash {
+        size_t operator()(const RtHistogramKey& k) const {
+            size_t h = 14695981039346656037ULL;
+            auto mix = [&h](uint32_t v) {
+                h ^= v;
+                h *= 1099511628211ULL;
+            };
+            mix(k.w); mix(k.h); mix(k.fmt); mix(k.ms); mix(k.arr);
+            return h;
+        }
+    };
+
     static constexpr size_t kMaxPatternsPerLayout = 4;
-    static constexpr size_t kMaxUniqueRtLogs = 64; // [B2]
+    static constexpr size_t kMaxUniqueRtLogs = 64;
+    static constexpr size_t kMaxHistogramEntries = 8; // [P3]
 
     VrsFoveatedD3D11() = default;
     ~VrsFoveatedD3D11() = default;
@@ -98,7 +123,6 @@ private:
     void EnableVRS(ID3D11DeviceContext* ctx);
     void DisableVRSLocked(ID3D11DeviceContext* ctx, bool force = false);
 
-    // [B2] Log with tex format, rtv format, and dsv flag
     void LogUniqueRenderTargetLocked(uint32_t w,
                                      uint32_t h,
                                      uint32_t arraySize,
@@ -126,18 +150,26 @@ private:
     uint32_t targetEyeWidth_ = 0;
     uint32_t targetEyeHeight_ = 0;
 
+    // [P1] Puntero crudo de la ultima vista enlazada para evitar llamadas redundantes
+    ID3D11NvShadingRateResourceView* lastBoundView_ = nullptr;
+    int lastBoundDebugMode_ = -1;
+
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
 
     std::vector<PatternEntry> patternCache_[static_cast<size_t>(VrsLayout::Count)];
     bool cacheFullLogged_ = false;
 
-    // [B1] Non-owning excluded textures vector
     std::vector<ID3D11Texture2D*> excludedTextures_;
 
     std::unordered_set<uint64_t> loggedUniqueRts_;
+
+    // [P3] Histograma acotado de asignaciones aceptadas
+    std::unordered_map<RtHistogramKey, uint64_t, RtHistogramKeyHash> rtHistogram_;
+
     std::atomic<uint64_t> framesCount_{ 0 };
     std::atomic<uint64_t> candidateBinds_{ 0 };
+    std::atomic<uint64_t> actualNvapiBinds_{ 0 }; // [P1] Contador real de llamadas a NVAPI
     std::atomic<uint64_t> enableCount_{ 0 };
     std::atomic<uint64_t> disableCount_{ 0 };
     std::atomic<uint64_t> nvFailCount_{ 0 };
