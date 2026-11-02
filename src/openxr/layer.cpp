@@ -431,7 +431,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     EnsureInit();
     if (!createInfo || !session) return XR_ERROR_VALIDATION_FAILURE;
 
-    g_cfg = LoadConfig(); // Reload disk config to pick up vrs12.debugMode and vrs12.extraFormats
+    g_cfg = LoadConfig();
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
     g_d3d12Device.Reset();
@@ -1150,7 +1150,7 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
                 qCopy.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.x * sx));
                 qCopy.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.y * sy));
                 qCopy.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.width * sx));
-                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.height * sy));
+                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.height * sy));
                 quadCopies.push_back(qCopy);
                 remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadCopies.back());
             } else {
