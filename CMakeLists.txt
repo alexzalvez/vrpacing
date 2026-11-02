@@ -37,9 +37,10 @@ add_library(vrpacing_core STATIC
   src/core/mask_geometry.cpp
   src/core/frame_limiter_math.cpp
   src/core/hz_tracker.cpp
+  src/common/visibility_mask.cpp
 )
 
-target_include_directories(vrpacing_core PUBLIC include)
+target_include_directories(vrpacing_core PUBLIC include src)
 
 if(WIN32)
   add_library(minhook STATIC
@@ -59,19 +60,16 @@ if(WIN32)
 
   add_library(VRPacingLayer SHARED
     src/openxr/layer.cpp
-  src/openxr/layer_dllmain.cpp
+    src/openxr/layer_dllmain.cpp
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
   target_link_directories(VRPacingLayer PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64"
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi"
-)
-
-target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi
-  minhook
-  nvapi64)
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi"
+  )
+  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi minhook nvapi64)
   target_compile_definitions(VRPacingLayer PRIVATE XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11)
   set_target_properties(VRPacingLayer PROPERTIES OUTPUT_NAME "VRPacingLayer")
 
@@ -81,7 +79,6 @@ target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3
     src/oculus/hook_oculus.cpp
     src/gfx/d3d11_helper.cpp
     src/gfx/nis_upscaler_d3d11.cpp
-    src/gfx/vrs_foveated_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
   target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)

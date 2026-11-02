@@ -36,6 +36,30 @@ using Microsoft::WRL::ComPtr;
 namespace vrpacing {
 namespace {
 
+// [C6] Minimal local ABI structs for ovr_GetFovStencil from OVR_CAPI.h
+struct ovrVector2f_Local {
+    float x;
+    float y;
+};
+
+struct ovrFovStencilDesc_Local {
+    int StencilType;
+    int Eye;
+    int StencilFlags;
+    ovrFovPort FovPort;
+};
+
+struct ovrFovStencilMeshBuffer_Local {
+    int AllocVertexCount;
+    int UsedVertexCount;
+    ovrVector2f_Local* VertexBuffer;
+    int AllocIndexCount;
+    int UsedIndexCount;
+    uint16_t* IndexBuffer;
+};
+
+using ovrGetFovStencilFn = ovrResult(__cdecl*)(ovrSession, const ovrFovStencilDesc_Local*, ovrFovStencilMeshBuffer_Local*);
+
 using ovrInitializeFn = ovrResult(__cdecl*)(const ovrInitParams*);
 using ovrSubmitFrameFn = ovrResult(__cdecl*)(ovrSession, long long, const ovrViewScaleDesc*, ovrLayerHeader const* const*, unsigned int);
 using ovrWaitToBeginFrameFn = ovrResult(__cdecl*)(ovrSession, long long);
@@ -56,6 +80,7 @@ ovrSubmitFrameFn g_origSubmit2 = nullptr;
 ovrSubmitFrameFn g_origEndFrame = nullptr;
 ovrWaitToBeginFrameFn g_origWaitToBeginFrame = nullptr;
 ovrGetFovTextureSizeFn g_origGetFovTextureSize = nullptr;
+ovrGetFovStencilFn g_origGetFovStencil = nullptr;
 ovrGetPredictedDisplayTimeFn g_ovrGetPredictedDisplayTime = nullptr;
 
 ovrCreateTextureSwapChainDXFn g_ovrCreateTextureSwapChainDX = nullptr;
@@ -68,6 +93,7 @@ ovrDestroyTextureSwapChainFn g_ovrDestroyTextureSwapChain = nullptr;
 
 uint32_t g_oculusVersion = 0;
 std::atomic<bool> g_waitToBeginCalled{ false };
+std::atomic<int> g_fovStencilLogCount{ 0 };
 FrameLimiterWin g_limiter;
 HzTracker g_hzTracker;
 RuntimeConfig g_cfg;
@@ -152,6 +178,39 @@ void EnsureInit() {
         g_limiter.Initialize();
         LogMessage(LogLevel::Info, "Oculus LibOVR Hook initialized.");
     });
+}
+
+// [C6] Passive hook for ovr_GetFovStencil: always passes through, logs first 4 calls
+ovrResult __cdecl Hooked_ovrGetFovStencil(ovrSession session,
+                                          const ovrFovStencilDesc_Local* fovStencilDesc,
+                                          ovrFovStencilMeshBuffer_Local* meshBuffer) {
+    ovrResult res = g_origGetFovStencil ? g_origGetFovStencil(session, fovStencilDesc, meshBuffer) : -1;
+    const int idx = g_fovStencilLogCount.fetch_add(1, std::memory_order_relaxed);
+    if (idx < 4) {
+        EnsureInit();
+        const int sType = fovStencilDesc ? fovStencilDesc->StencilType : -1;
+        const int sEye = fovStencilDesc ? fovStencilDesc->Eye : -1;
+        const int sFlags = fovStencilDesc ? fovStencilDesc->StencilFlags : -1;
+        const float uTan = fovStencilDesc ? fovStencilDesc->FovPort.UpTan : 0.0f;
+        const float dTan = fovStencilDesc ? fovStencilDesc->FovPort.DownTan : 0.0f;
+        const float lTan = fovStencilDesc ? fovStencilDesc->FovPort.LeftTan : 0.0f;
+        const float rTan = fovStencilDesc ? fovStencilDesc->FovPort.RightTan : 0.0f;
+        const int allocV = meshBuffer ? meshBuffer->AllocVertexCount : -1;
+        const int usedV = meshBuffer ? meshBuffer->UsedVertexCount : -1;
+        const int allocI = meshBuffer ? meshBuffer->AllocIndexCount : -1;
+        const int usedI = meshBuffer ? meshBuffer->UsedIndexCount : -1;
+
+        LogMessage(LogLevel::Info, "Oculus [ovr_GetFovStencil] call#" + std::to_string(idx + 1) +
+                   " type=" + std::to_string(sType) +
+                   " eye=" + std::to_string(sEye) +
+                   " flags=" + std::to_string(sFlags) +
+                   " FovPort(U=" + std::to_string(uTan) + ",D=" + std::to_string(dTan) +
+                   ",L=" + std::to_string(lTan) + ",R=" + std::to_string(rTan) + ")" +
+                   " Verts(Alloc=" + std::to_string(allocV) + ",Used=" + std::to_string(usedV) + ")" +
+                   " Idx(Alloc=" + std::to_string(allocI) + ",Used=" + std::to_string(usedI) + ")" +
+                   " res=" + std::to_string(res));
+    }
+    return res;
 }
 
 bool IsLegacyOculusLayer(const ovrLayerHeader* header) {
@@ -828,6 +887,7 @@ void InstallOculusHooks() {
     auto endFrame = reinterpret_cast<ovrSubmitFrameFn>(GetProcAddress(mod, "ovr_EndFrame"));
     auto waitBegin = reinterpret_cast<ovrWaitToBeginFrameFn>(GetProcAddress(mod, "ovr_WaitToBeginFrame"));
     auto getSize = reinterpret_cast<ovrGetFovTextureSizeFn>(GetProcAddress(mod, "ovr_GetFovTextureSize"));
+    auto getStencil = reinterpret_cast<ovrGetFovStencilFn>(GetProcAddress(mod, "ovr_GetFovStencil"));
 
     MH_Initialize();
 
@@ -861,7 +921,13 @@ void InstallOculusHooks() {
         MH_EnableHook(reinterpret_cast<void*>(getSize));
     }
 
-    LogMessage(LogLevel::Info, "Oculus LibOVR hooks installed with full D3D11 NIS support (SubmitFrame, SubmitFrame2, EndFrame).");
+    // [C6] Hook ovr_GetFovStencil passively
+    if (getStencil) {
+        MH_CreateHook(reinterpret_cast<void*>(getStencil), reinterpret_cast<void*>(&Hooked_ovrGetFovStencil), reinterpret_cast<void**>(&g_origGetFovStencil));
+        MH_EnableHook(reinterpret_cast<void*>(getStencil));
+    }
+
+    LogMessage(LogLevel::Info, "Oculus LibOVR hooks installed with full D3D11 NIS support (SubmitFrame, SubmitFrame2, EndFrame, GetFovStencil).");
 }
 
 } // namespace vrpacing

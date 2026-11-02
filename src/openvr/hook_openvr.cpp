@@ -21,17 +21,20 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "minhook/include/MinHook.h"
 #include "common/config_json.h"
 #include "common/frame_limiter_win.h"
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
+#include "common/visibility_mask.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 #include "openvr/hook_openvr.h"
+#include "openvr/openvr_slots.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -47,25 +50,36 @@ VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
 
+// [C3] MSVC x64 ABI hidden return pointer signature for 16-byte struct return
+using GetHiddenAreaMeshFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, vr::HiddenAreaMesh_t*, vr::EVREye, vr::EHiddenAreaMeshType);
+using GetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, vr::HiddenAreaMesh_t*, vr::EVREye);
+using GetProjectionRawFn = void (__fastcall*)(void*, vr::EVREye, float*, float*, float*, float*);
+
+// [C2] Per-vtable slot registry entry
+struct VtableSlotRecord {
+    uint32_t slot = 0;
+    void* target = nullptr;
+    void* trampoline = nullptr;
+    bool hamHasType = true;
+    std::string versionString;
+};
+
 struct HookSlotRegistry {
-    uint32_t verifiedSlotIdx = 0;
+    std::unordered_map<void**, VtableSlotRecord> vtableToRecord;
     std::unordered_map<void*, void*> targetToTrampoline;
     std::unordered_map<void*, void*> instanceToTarget;
 };
 
-// Separacion de cerrojos:
-// - g_installMutex: serializa la instalacion en MinHook (adquirido en InstallOpenVRHooksWithStatus y
-//   en HookCompositorInstance desde HookedVRGetGenericInterface; nunca adquirido en los callbacks por frame HookedWaitGetPoses/HookedSubmit).
-// - g_registryMutex: protege solo lecturas/escrituras en memoria de HookSlotRegistry y
-//   g_loggedDiagInterfaces (nunca mantenido durante llamadas a MinHook, D3D11 ni LogMessage).
-// - g_gfxMutex: protege la inicializacion de recursos D3D11 en HookedSubmit.
 std::mutex g_installMutex;
 std::mutex g_registryMutex;
 std::mutex g_gfxMutex;
 
-HookSlotRegistry g_waitGetPosesReg{ 2, {}, {} };
-HookSlotRegistry g_submitReg{ 5, {}, {} };
+HookSlotRegistry g_waitGetPosesReg{};
+HookSlotRegistry g_submitReg{};
+HookSlotRegistry g_hamReg{};
+
 std::unordered_set<std::string> g_loggedDiagInterfaces;
+std::unordered_set<std::string> g_loggedUnsupportedVersions;
 std::atomic<bool> g_openVrHooksInstalled{ false };
 
 RuntimeConfig g_cfg;
@@ -103,22 +117,22 @@ struct OpenVRContext {
 
 OpenVRContext g_ovrCtx;
 
+// [C4] Per-eye, per-type static buffers built once, never freed
+struct StaticHamCache {
+    bool built[2][3]{};
+    std::vector<vr::HmdVector2_t> verts[2][3];
+    uint32_t triCounts[2][3]{};
+};
+
+StaticHamCache g_hamCache;
+std::mutex g_hamMutex;
+bool g_hamPassiveLogged[2][3]{};
+bool g_hamReplaceLogged[2][3]{};
+
 std::string PtrToHex(const void* ptr) {
     char buf[32]{};
     std::snprintf(buf, sizeof(buf), "0x%p", ptr);
     return std::string(buf);
-}
-
-// Lista explicita de versiones de IVRCompositor verificadas (vtbl[2] = WaitGetPoses, vtbl[5] = Submit).
-bool GetVerifiedCompositorSlots(const char* name, uint32_t& outWaitSlot, uint32_t& outSubmitSlot) {
-    if (!name) return false;
-    if (std::strcmp(name, "IVRCompositor_022") == 0 ||
-        std::strcmp(name, "IVRCompositor_026") == 0) {
-        outWaitSlot = 2;
-        outSubmitSlot = 5;
-        return true;
-    }
-    return false;
 }
 
 bool IsOpenXrLayerHandlingD3D11() {
@@ -133,7 +147,6 @@ bool IsOpenXrLayerHandlingD3D11() {
     return g_shm.IsOpenXrD3D11ActiveForCurrentProcess();
 }
 
-// [A0] Generalized OpenXR session check covering D3D11, D3D12, and Vulkan sessions
 bool IsOpenXrSessionActiveAnyApi() {
     HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
     if (hLayer) {
@@ -146,11 +159,22 @@ bool IsOpenXrSessionActiveAnyApi() {
     return IsOpenXrLayerHandlingD3D11();
 }
 
+// [C2] Per-vtable slot resolution: looks up *(void**)self in vtableToRecord,
+// and falls back to instanceToTarget without ever reading an unrecorded vtable slot.
 template <typename FnType>
-FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self) {
+FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self, VtableSlotRecord* outRec = nullptr) {
     if (!self) return nullptr;
 
     std::lock_guard<std::mutex> lock(g_registryMutex);
+
+    void** vtbl = *reinterpret_cast<void***>(self);
+    if (vtbl) {
+        auto itVtbl = reg.vtableToRecord.find(vtbl);
+        if (itVtbl != reg.vtableToRecord.end()) {
+            if (outRec) *outRec = itVtbl->second;
+            return reinterpret_cast<FnType>(itVtbl->second.trampoline);
+        }
+    }
 
     auto itInst = reg.instanceToTarget.find(self);
     if (itInst != reg.instanceToTarget.end()) {
@@ -160,26 +184,17 @@ FnType ResolveSlotTrampoline(const HookSlotRegistry& reg, void* self) {
         }
     }
 
-    void** vtbl = *reinterpret_cast<void***>(self);
-    if (vtbl) {
-        void* candidateTarget = vtbl[reg.verifiedSlotIdx];
-        auto itTramp = reg.targetToTrampoline.find(candidateTarget);
-        if (itTramp != reg.targetToTrampoline.end()) {
-            return reinterpret_cast<FnType>(itTramp->second);
-        }
-    }
-
     return nullptr;
 }
 
-// Requiere que el llamador mantenga g_installMutex.
-// Nunca mantiene g_registryMutex durante MH_CreateHook, MH_EnableHook, MH_RemoveHook ni LogMessage.
+// [C2] Deduplicated MinHook registration by target address and per-vtable recording
 bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
                                      const char* ifaceName,
                                      const char* methodName,
                                      void* iface,
                                      uint32_t slotIdx,
-                                     void* detourFn) {
+                                     void* detourFn,
+                                     bool hamHasType = true) {
     if (!iface || !detourFn) return false;
 
     void** vtbl = *reinterpret_cast<void***>(iface);
@@ -194,8 +209,9 @@ bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
         auto itExisting = reg.targetToTrampoline.find(targetFn);
         if (itExisting != reg.targetToTrampoline.end()) {
             existingTrampoline = itExisting->second;
-            newlyAssociated = (reg.instanceToTarget.find(iface) == reg.instanceToTarget.end());
+            newlyAssociated = (reg.vtableToRecord.find(vtbl) == reg.vtableToRecord.end());
             reg.instanceToTarget[iface] = targetFn;
+            reg.vtableToRecord[vtbl] = VtableSlotRecord{ slotIdx, targetFn, existingTrampoline, hamHasType, std::string(ifaceName) };
         }
     }
 
@@ -219,9 +235,9 @@ bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
 
     {
         std::lock_guard<std::mutex> regLock(g_registryMutex);
-        reg.verifiedSlotIdx = slotIdx;
         reg.targetToTrampoline[targetFn] = trampoline;
         reg.instanceToTarget[iface] = targetFn;
+        reg.vtableToRecord[vtbl] = VtableSlotRecord{ slotIdx, targetFn, trampoline, hamHasType, std::string(ifaceName) };
     }
 
     const MH_STATUS stEnable = MH_EnableHook(targetFn);
@@ -230,6 +246,7 @@ bool RegisterAndEnableSlotHookLocked(HookSlotRegistry& reg,
             std::lock_guard<std::mutex> regLock(g_registryMutex);
             reg.targetToTrampoline.erase(targetFn);
             reg.instanceToTarget.erase(iface);
+            reg.vtableToRecord.erase(vtbl);
         }
         MH_RemoveHook(targetFn);
         LogMessage(LogLevel::Error, "OpenVR Hook: MH_EnableHook failed for " + std::string(ifaceName) + "::" + methodName +
@@ -304,6 +321,115 @@ void EnsureInit() {
     });
 }
 
+// [C3, C4, C5] IVRSystem::GetHiddenAreaMesh hook with MSVC x64 hidden return pointer ABI
+vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
+                                                          vr::HiddenAreaMesh_t* ret,
+                                                          vr::EVREye eye,
+                                                          vr::EHiddenAreaMeshType type) {
+    VtableSlotRecord rec{};
+    auto origFn = ResolveSlotTrampoline<GetHiddenAreaMeshFn>(g_hamReg, self, &rec);
+    if (!origFn) {
+        if (ret) {
+            ret->pVertexData = nullptr;
+            ret->unTriangleCount = 0;
+        }
+        return ret;
+    }
+
+    const vr::EHiddenAreaMeshType effectiveType = rec.hamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
+
+    auto callOriginal = [&]() -> vr::HiddenAreaMesh_t* {
+        if (rec.hamHasType) {
+            return origFn(self, ret, eye, effectiveType);
+        }
+        auto origNoType = reinterpret_cast<GetHiddenAreaMeshNoTypeFn>(origFn);
+        return origNoType(self, ret, eye);
+    };
+
+    if (IsOpenXrSessionActiveAnyApi() || !ret) {
+        return callOriginal();
+    }
+
+    EnsureInit();
+    const int mode = g_cfg.mask.openvrMode;
+    if (mode <= 0) {
+        return callOriginal();
+    }
+
+    const int eyeIdx = (eye == vr::Eye_Right) ? 1 : 0;
+    int typeIdx = 0;
+    VisibilityMaskKind maskKind = VisibilityMaskKind::HiddenTriangles;
+    if (effectiveType == vr::k_eHiddenAreaMesh_Inverse) {
+        typeIdx = 1;
+        maskKind = VisibilityMaskKind::VisibleTriangles;
+    } else if (effectiveType == vr::k_eHiddenAreaMesh_LineLoop) {
+        typeIdx = 2;
+        maskKind = VisibilityMaskKind::LineLoop;
+    }
+
+    if (mode == 1) {
+        vr::HiddenAreaMesh_t* res = callOriginal();
+        std::lock_guard<std::mutex> lock(g_hamMutex);
+        if (!g_hamPassiveLogged[eyeIdx][typeIdx]) {
+            g_hamPassiveLogged[eyeIdx][typeIdx] = true;
+            const uint32_t tris = res ? res->unTriangleCount : 0;
+            const uint32_t vertCount = (effectiveType == vr::k_eHiddenAreaMesh_LineLoop) ? tris : (tris * 3);
+            float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f;
+            if (res && res->pVertexData && vertCount > 0) {
+                u0 = u1 = res->pVertexData[0].v[0];
+                v0 = v1 = res->pVertexData[0].v[1];
+                for (uint32_t i = 1; i < vertCount; ++i) {
+                    const float u = res->pVertexData[i].v[0];
+                    const float v = res->pVertexData[i].v[1];
+                    u0 = (std::min)(u0, u);
+                    u1 = (std::max)(u1, u);
+                    v0 = (std::min)(v0, v);
+                    v1 = (std::max)(v1, v);
+                }
+            }
+            char bboxBuf[128]{};
+            std::snprintf(bboxBuf, sizeof(bboxBuf), "[%.4f,%.4f,%.4f,%.4f]", u0, v0, u1, v1);
+            LogMessage(LogLevel::Info, "OpenVR HAM [" + rec.versionString + "] eye=" + std::to_string(eyeIdx) +
+                       " type=" + std::to_string(static_cast<int>(effectiveType)) +
+                       " tris=" + std::to_string(tris) + " bbox=" + std::string(bboxBuf));
+        }
+        return res;
+    }
+
+    // Mode 2: Replace with circular mask mapped to UV space using GetProjectionRaw (slot 1 across all IVRSystem versions)
+    std::lock_guard<std::mutex> lock(g_hamMutex);
+    if (!g_hamCache.built[eyeIdx][typeIdx]) {
+        float l = -1.0f, r = 1.0f, t = -1.0f, b = 1.0f;
+        void** vtbl = *reinterpret_cast<void***>(self);
+        if (vtbl && vtbl[1]) {
+            auto getProjRaw = reinterpret_cast<GetProjectionRawFn>(vtbl[1]);
+            getProjRaw(self, eye, &l, &r, &t, &b);
+        }
+
+        uint32_t triCount = 0;
+        std::vector<MaskVec2> uvVerts = GenerateOpenVrFlatTriangleVerticesUV(maskKind, l, r, t, b, 256, triCount);
+        g_hamCache.verts[eyeIdx][typeIdx].resize(uvVerts.size());
+        for (size_t i = 0; i < uvVerts.size(); ++i) {
+            g_hamCache.verts[eyeIdx][typeIdx][i].v[0] = uvVerts[i].x;
+            g_hamCache.verts[eyeIdx][typeIdx][i].v[1] = uvVerts[i].y;
+        }
+        g_hamCache.triCounts[eyeIdx][typeIdx] = triCount;
+        g_hamCache.built[eyeIdx][typeIdx] = true;
+    }
+
+    ret->pVertexData = g_hamCache.verts[eyeIdx][typeIdx].empty() ? nullptr : g_hamCache.verts[eyeIdx][typeIdx].data();
+    ret->unTriangleCount = g_hamCache.triCounts[eyeIdx][typeIdx];
+
+    if (!g_hamReplaceLogged[eyeIdx][typeIdx]) {
+        g_hamReplaceLogged[eyeIdx][typeIdx] = true;
+        LogMessage(LogLevel::Info, "OpenVR HAM replaced eye=" + std::to_string(eyeIdx) +
+                   " type=" + std::to_string(static_cast<int>(effectiveType)) +
+                   " tris=" + std::to_string(ret->unTriangleCount));
+    }
+
+    return ret;
+}
+
 vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          vr::TrackedDevicePose_t* pRenderPoseArray,
                                          uint32_t unRenderPoseArrayCount,
@@ -319,7 +445,6 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         return vr::VRCompositorError_RequestFailed;
     }
 
-    // [A0] Bypass OpenVR hooks during any active OpenXR session
     if (IsOpenXrSessionActiveAnyApi()) {
         return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
@@ -484,7 +609,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
         return vr::VRCompositorError_RequestFailed;
     }
 
-    // [A0] Bypass OpenVR hooks during any active OpenXR session
     if (IsOpenXrSessionActiveAnyApi()) {
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
     }
@@ -542,7 +666,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     const uint32_t fullEyeW = isSideBySide ? (inDesc.Width / 2) : inDesc.Width;
     const uint32_t fullEyeH = inDesc.Height;
 
-    // Ignorar mini-buffers de pantallas de carga (< 1000px) para evitar realocar VRAM
     if (fullEyeW < 1000 || fullEyeH < 1000 || cropW < 600 || cropH < 600) {
         inSubmit = false;
         return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
@@ -563,7 +686,6 @@ vr::EVRCompositorError HookedSubmit(void* self,
     g_lastInH = cropH;
 
     CalculateOpenVRProjectionCenters();
-    // [A4] & [F1] Simplified centered-pattern UpdateTarget call
     VrsFoveatedD3D11::Instance().UpdateTarget(
         g_ovrCtx.device.Get(),
         g_ovrCtx.context.Get(),
@@ -685,24 +807,58 @@ vr::EVRCompositorError HookedSubmit(void* self,
     return res;
 }
 
+void LogUnsupportedOnce(const char* cleanName) {
+    if (!cleanName) return;
+    bool shouldLog = false;
+    {
+        std::lock_guard<std::mutex> lock(g_registryMutex);
+        if (g_loggedUnsupportedVersions.insert(cleanName).second) {
+            shouldLog = true;
+        }
+    }
+    if (shouldLog) {
+        LogMessage(LogLevel::Warn, "OpenVR: " + std::string(cleanName) + " not in slot table, passthrough");
+    }
+}
+
+// [C2] Hook IVRCompositor using script-verified table lookup
 void HookCompositorInstance(const char* name, void* iface) {
     if (!iface || !name) return;
-
-    uint32_t waitSlot = 0;
-    uint32_t submitSlot = 0;
-    if (!GetVerifiedCompositorSlots(name, waitSlot, submitSlot)) {
-        LogMessage(LogLevel::Warn, "OpenVR Hook: Unverified IVRCompositor version \"" +
-                   std::string(name) + "\". Leaving in passthrough.");
+    const char* cleanName = StripFnTablePrefix(name);
+    const OpenVrSlotEntry* entry = LookupOpenVrSlots(cleanName);
+    if (!entry || entry->waitSlot < 0 || entry->submitSlot < 0) {
+        LogUnsupportedOnce(cleanName);
         return;
     }
 
     std::lock_guard<std::mutex> installLock(g_installMutex);
     MH_Initialize();
 
-    RegisterAndEnableSlotHookLocked(g_waitGetPosesReg, name, "WaitGetPoses", iface, waitSlot,
+    RegisterAndEnableSlotHookLocked(g_waitGetPosesReg, cleanName, "WaitGetPoses", iface,
+                                    static_cast<uint32_t>(entry->waitSlot),
                                     reinterpret_cast<void*>(&HookedWaitGetPoses));
-    RegisterAndEnableSlotHookLocked(g_submitReg, name, "Submit", iface, submitSlot,
+    RegisterAndEnableSlotHookLocked(g_submitReg, cleanName, "Submit", iface,
+                                    static_cast<uint32_t>(entry->submitSlot),
                                     reinterpret_cast<void*>(&HookedSubmit));
+}
+
+// [C3] Hook IVRSystem::GetHiddenAreaMesh using script-verified table lookup
+void HookSystemInstance(const char* name, void* iface) {
+    if (!iface || !name) return;
+    const char* cleanName = StripFnTablePrefix(name);
+    const OpenVrSlotEntry* entry = LookupOpenVrSlots(cleanName);
+    if (!entry || entry->hamSlot < 0) {
+        LogUnsupportedOnce(cleanName);
+        return;
+    }
+
+    std::lock_guard<std::mutex> installLock(g_installMutex);
+    MH_Initialize();
+
+    RegisterAndEnableSlotHookLocked(g_hamReg, cleanName, "GetHiddenAreaMesh", iface,
+                                    static_cast<uint32_t>(entry->hamSlot),
+                                    reinterpret_cast<void*>(&Hooked_GetHiddenAreaMesh),
+                                    entry->hamHasType);
 }
 
 void* HookedVRGetGenericInterface(const char* name, int* error) {
@@ -740,6 +896,15 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
         void* cppIface = g_origGetGenericInterface(cppName, &dummyErr);
         if (cppIface) {
             HookCompositorInstance(cppName, cppIface);
+        }
+    } else if (sName.rfind("IVRSystem_", 0) == 0) {
+        HookSystemInstance(name, iface);
+    } else if (sName.rfind("FnTable:IVRSystem_", 0) == 0) {
+        const char* cppName = name + 8;
+        int dummyErr = 0;
+        void* cppIface = g_origGetGenericInterface(cppName, &dummyErr);
+        if (cppIface) {
+            HookSystemInstance(cppName, cppIface);
         }
     }
     return iface;
@@ -793,8 +958,12 @@ bool InstallOpenVRHooksWithStatus() {
     }
 
     g_openVrHooksInstalled.store(true, std::memory_order_release);
+    // [C5] Log hook install time (QPC ticks) to correlate with interface acquisition order
+    LARGE_INTEGER qpcNow{};
+    QueryPerformanceCounter(&qpcNow);
     LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed [target=" +
-               PtrToHex(reinterpret_cast<const void*>(fn)) + ", trampoline=" + PtrToHex(origFn) + "].");
+               PtrToHex(reinterpret_cast<const void*>(fn)) + ", trampoline=" + PtrToHex(origFn) +
+               ", qpc=" + std::to_string(qpcNow.QuadPart) + "].");
     return true;
 }
 

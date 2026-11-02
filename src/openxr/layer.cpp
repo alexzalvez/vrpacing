@@ -31,6 +31,7 @@
 #include "common/frame_limiter_win.h"
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
+#include "common/visibility_mask.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
@@ -238,6 +239,7 @@ void PopulateTangentsIfNeeded(XrSession session, XrViewConfigurationType viewCon
     }
 }
 
+// [C4] Calls shared pure visibility_mask generator with identical numerical output
 XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     XrSession session,
     XrViewConfigurationType viewConfigurationType,
@@ -267,6 +269,18 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     float minX = -0.85f, maxX = 0.85f, minY = -0.85f, maxY = 0.85f;
     PopulateTangentsIfNeeded(session, viewConfigurationType, viewIndex, minX, maxX, minY, maxY);
 
+    VisibilityMaskKind kind{};
+    bool validKind = true;
+    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
+        kind = VisibilityMaskKind::VisibleTriangles;
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
+        kind = VisibilityMaskKind::HiddenTriangles;
+    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
+        kind = VisibilityMaskKind::LineLoop;
+    } else {
+        validKind = false;
+    }
+
     if (!g_cfg.mask.enabled) {
         if (!g_maskWasActiveInSession.load(std::memory_order_relaxed)) {
             if (g_nextGetVisibilityMaskKHR) {
@@ -277,49 +291,36 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
             return XR_SUCCESS;
         }
 
-        if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
-            visibilityMask->vertexCountOutput = 4;
-            visibilityMask->indexCountOutput = 6;
-            if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
-                !visibilityMask->vertices || !visibilityMask->indices) {
-                return XR_SUCCESS;
-            }
-            if (visibilityMask->vertexCapacityInput < 4 || visibilityMask->indexCapacityInput < 6) {
-                return XR_ERROR_SIZE_INSUFFICIENT;
-            }
-            visibilityMask->vertices[0] = { minX * 1.2f, minY * 1.2f };
-            visibilityMask->vertices[1] = { maxX * 1.2f, minY * 1.2f };
-            visibilityMask->vertices[2] = { maxX * 1.2f, maxY * 1.2f };
-            visibilityMask->vertices[3] = { minX * 1.2f, maxY * 1.2f };
-            visibilityMask->indices[0] = 0;
-            visibilityMask->indices[1] = 1;
-            visibilityMask->indices[2] = 2;
-            visibilityMask->indices[3] = 0;
-            visibilityMask->indices[4] = 2;
-            visibilityMask->indices[5] = 3;
-            return XR_SUCCESS;
-        } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
-            visibilityMask->vertexCountOutput = 3;
-            visibilityMask->indexCountOutput = 3;
-            if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
-                !visibilityMask->vertices || !visibilityMask->indices) {
-                return XR_SUCCESS;
-            }
-            if (visibilityMask->vertexCapacityInput < 3 || visibilityMask->indexCapacityInput < 3) {
-                return XR_ERROR_SIZE_INSUFFICIENT;
-            }
-            visibilityMask->vertices[0] = { minX * 2.0f, minY * 2.0f };
-            visibilityMask->vertices[1] = { minX * 2.0f, minY * 2.0f };
-            visibilityMask->vertices[2] = { minX * 2.0f, minY * 2.0f };
-            visibilityMask->indices[0] = 0;
-            visibilityMask->indices[1] = 1;
-            visibilityMask->indices[2] = 2;
-            return XR_SUCCESS;
-        } else {
+        if (!validKind || kind == VisibilityMaskKind::LineLoop) {
             visibilityMask->vertexCountOutput = 0;
             visibilityMask->indexCountOutput = 0;
             return XR_SUCCESS;
         }
+
+        GeneratedVisibilityMask resetMask = GenerateResetMaskTangentSpace(kind, minX, maxX, minY, maxY);
+        visibilityMask->vertexCountOutput = static_cast<uint32_t>(resetMask.vertices.size());
+        visibilityMask->indexCountOutput = static_cast<uint32_t>(resetMask.indices.size());
+        if (visibilityMask->vertexCapacityInput == 0 || visibilityMask->indexCapacityInput == 0 ||
+            !visibilityMask->vertices || !visibilityMask->indices) {
+            return XR_SUCCESS;
+        }
+        if (visibilityMask->vertexCapacityInput < visibilityMask->vertexCountOutput ||
+            visibilityMask->indexCapacityInput < visibilityMask->indexCountOutput) {
+            return XR_ERROR_SIZE_INSUFFICIENT;
+        }
+        for (size_t i = 0; i < resetMask.vertices.size(); ++i) {
+            visibilityMask->vertices[i] = { resetMask.vertices[i].x, resetMask.vertices[i].y };
+        }
+        for (size_t i = 0; i < resetMask.indices.size(); ++i) {
+            visibilityMask->indices[i] = resetMask.indices[i];
+        }
+        return XR_SUCCESS;
+    }
+
+    if (!validKind) {
+        visibilityMask->vertexCountOutput = 0;
+        visibilityMask->indexCountOutput = 0;
+        return XR_SUCCESS;
     }
 
     g_maskWasActiveInSession.store(true, std::memory_order_relaxed);
@@ -327,21 +328,7 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     constexpr uint32_t kSeg = 256;
     uint32_t reqVerts = 0;
     uint32_t reqIndices = 0;
-
-    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
-        reqVerts = kSeg + 1;
-        reqIndices = kSeg * 3;
-    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
-        reqVerts = kSeg * 2;
-        reqIndices = kSeg * 6;
-    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
-        reqVerts = kSeg;
-        reqIndices = kSeg;
-    } else {
-        visibilityMask->vertexCountOutput = 0;
-        visibilityMask->indexCountOutput = 0;
-        return XR_SUCCESS;
-    }
+    GetCircularMaskCounts(kind, kSeg, reqVerts, reqIndices);
 
     visibilityMask->vertexCountOutput = reqVerts;
     visibilityMask->indexCountOutput = reqIndices;
@@ -355,54 +342,12 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
-    const float cx = 0.5f * (minX + maxX);
-    const float cy = 0.5f * (minY + maxY);
-    const float rx = 0.5f * (maxX - minX);
-    const float ry = 0.5f * (maxY - minY);
-    constexpr float kTwoPi = 6.283185307179586f;
-
-    if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
-        visibilityMask->vertices[0] = { cx, cy };
-        for (uint32_t i = 0; i < kSeg; ++i) {
-            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
-            visibilityMask->vertices[i + 1] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
-            const uint32_t next = ((i + 1) % kSeg) + 1;
-            const uint32_t base = i * 3;
-            visibilityMask->indices[base + 0] = 0;
-            visibilityMask->indices[base + 1] = i + 1;
-            visibilityMask->indices[base + 2] = next;
-        }
-    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR) {
-        for (uint32_t i = 0; i < kSeg; ++i) {
-            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
-            const float ca = std::cos(a);
-            const float sa = std::sin(a);
-            const float maxComp = (std::max)(std::abs(ca), std::abs(sa));
-            const float outerScale = (maxComp > 0.0001f) ? (1.5f / maxComp) : 2.0f;
-
-            visibilityMask->vertices[i * 2 + 0] = { cx + rx * ca, cy + ry * sa };
-            visibilityMask->vertices[i * 2 + 1] = { cx + rx * outerScale * ca, cy + ry * outerScale * sa };
-
-            const uint32_t next = (i + 1) % kSeg;
-            const uint32_t i0 = i * 2;
-            const uint32_t i1 = i * 2 + 1;
-            const uint32_t n0 = next * 2;
-            const uint32_t n1 = next * 2 + 1;
-            const uint32_t base = i * 6;
-
-            visibilityMask->indices[base + 0] = i0;
-            visibilityMask->indices[base + 1] = i1;
-            visibilityMask->indices[base + 2] = n0;
-            visibilityMask->indices[base + 3] = n0;
-            visibilityMask->indices[base + 4] = i1;
-            visibilityMask->indices[base + 5] = n1;
-        }
-    } else if (visibilityMaskType == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) {
-        for (uint32_t i = 0; i < kSeg; ++i) {
-            const float a = (static_cast<float>(i) / static_cast<float>(kSeg)) * kTwoPi;
-            visibilityMask->vertices[i] = { cx + rx * std::cos(a), cy + ry * std::sin(a) };
-            visibilityMask->indices[i] = i;
-        }
+    GeneratedVisibilityMask gen = GenerateCircularMaskTangentSpace(kind, minX, maxX, minY, maxY, kSeg);
+    for (size_t i = 0; i < gen.vertices.size(); ++i) {
+        visibilityMask->vertices[i] = { gen.vertices[i].x, gen.vertices[i].y };
+    }
+    for (size_t i = 0; i < gen.indices.size(); ++i) {
+        visibilityMask->indices[i] = gen.indices[i];
     }
 
     static std::atomic<bool> s_loggedEye[2]{ false, false };
@@ -527,7 +472,6 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     return res;
 }
 
-// [B4] Clean shutdown with explicit reason
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
@@ -556,7 +500,6 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     return g_nextDestroySession(session);
 }
 
-// [B4] Hook for xrDestroyInstance to guarantee teardown safety
 XrResult XRAPI_CALL Impl_xrDestroyInstance(XrInstance instance) {
     if (g_d3d11Context) {
         VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true);
@@ -734,7 +677,6 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     return XR_SUCCESS;
 }
 
-// [B1.a] Unregister excluded textures when swapchain is destroyed
 XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
@@ -755,7 +697,6 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainFormats(XrSession session, uint32_t
     return g_nextEnumerateSwapchainFormats(session, formatCapacityInput, formatCountOutput, formats);
 }
 
-// [B1.a] Register swapchain textures as excluded from VRS
 XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t imageCapacityInput, uint32_t* imageCountOutput, XrSwapchainImageBaseHeader* images) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
@@ -1022,7 +963,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     return res;
 }
 
-// [B5] Uses g_cfg.ffr.openxrEnabled
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
     if (!g_d3d11Device) {
         if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {

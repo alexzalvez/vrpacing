@@ -15,6 +15,7 @@ struct UpscalingConfig {
 
 struct MaskConfig {
     bool enabled = true;
+    int openvrMode = 1; // [C5] 0=off, 1=passive (default for Phase C build), 2=replace
     float radiusX = 1.0f;
     float radiusY = 1.0f;
     float centerX = 0.0f;
@@ -24,8 +25,8 @@ struct MaskConfig {
 };
 
 struct FfrConfig {
-    bool enabled = false;          // OpenVR / Oculus
-    bool openxrEnabled = false;    // [B5] OpenXR dedicado
+    bool enabled = false;
+    bool openxrEnabled = false;
     float innerRadius = 0.60f;
     int debugMode = 0;
     float outerRadius = 1.00f;
