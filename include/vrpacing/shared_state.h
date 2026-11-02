@@ -6,6 +6,7 @@ namespace vrpacing {
 
 constexpr wchar_t kSharedStateName[] = L"Local\\VRPacingSharedState";
 constexpr wchar_t kAppVersionString[] = L"v0.8.0-beta";
+constexpr char kAppVersionAnsi[] = "v0.8.0-beta";
 
 constexpr uint32_t kFlagEnabled = 1 << 0;
 constexpr uint32_t kFlagUpscalingEnabled = 1 << 1;
@@ -13,7 +14,7 @@ constexpr uint32_t kFlagPacingEnabled = 1 << 2;
 constexpr uint32_t kFlagTelemetryActive = 1 << 3;
 constexpr uint32_t kFlagFfrEnabled = 1 << 4;
 constexpr uint32_t kFlagMaskEnabled = 1 << 5;
-constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6; // [B5] Bandera dedicada para OpenXR FFR
+constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6;
 
 struct SharedState {
     uint32_t version;
