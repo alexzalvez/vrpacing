@@ -32,9 +32,10 @@ struct FfrConfig {
     float outerRadius = 1.00f;
 };
 
-// [B8] D3D12 VRS configuration (default debugMode = 1 passive for B0 build)
+// [B8, F8] D3D12 VRS configuration
 struct Vrs12Config {
     int debugMode = 1;
+    std::string extraFormats = ""; // [F8] Comma-separated list of DXGI_FORMAT ints (default empty)
 };
 
 struct PacingConfig {

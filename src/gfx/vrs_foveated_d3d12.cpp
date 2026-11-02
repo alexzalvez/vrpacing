@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -106,7 +107,6 @@ void STDMETHODCALLTYPE Hooked_CreateDepthStencilView(
     VrsFoveatedD3D12::Instance().OnCreateDepthStencilView(self, pResource, pDesc, destDescriptor);
 }
 
-// [B7'] g_vrsDetaching -> thread_local reentrancy guard -> OnPostOMSetRenderTargets
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets12(
     ID3D12GraphicsCommandList* self,
     UINT numRenderTargetDescriptors,
@@ -170,13 +170,50 @@ void VrsFoveatedD3D12::ClearSwapchainTextures() {
     swapchainTextures_.clear();
 }
 
-void VrsFoveatedD3D12::OnSessionCreated(ID3D12Device* dev) {
+// [F8] Parse comma-separated list of DXGI format ints and log at init
+void VrsFoveatedD3D12::ParseExtraFormatsLocked(const std::string& csv) {
+    uint32_t count = 0;
+    size_t pos = 0;
+    while (pos < csv.size() && count < 16) {
+        size_t comma = csv.find(',', pos);
+        if (comma == std::string::npos) comma = csv.size();
+        std::string token = csv.substr(pos, comma - pos);
+        char* endPtr = nullptr;
+        long val = std::strtol(token.c_str(), &endPtr, 10);
+        if (endPtr != token.c_str() && val > 0) {
+            extraFormats_[count++] = static_cast<DXGI_FORMAT>(val);
+        }
+        pos = comma + 1;
+    }
+    extraFormatsCount_.store(count, std::memory_order_release);
+
+    std::string logList = "[";
+    for (uint32_t i = 0; i < count; ++i) {
+        if (i > 0) logList += ",";
+        logList += std::to_string(static_cast<uint32_t>(extraFormats_[i]));
+    }
+    logList += "]";
+    LogMessage(LogLevel::Info, "VRS12: extraFormats=" + logList + " (raw=\"" + csv + "\")");
+}
+
+bool VrsFoveatedD3D12::IsExtraFormatAllowed(DXGI_FORMAT fmt) const noexcept {
+    const uint32_t n = extraFormatsCount_.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (extraFormats_[i] == fmt) return true;
+    }
+    return false;
+}
+
+void VrsFoveatedD3D12::OnSessionCreated(ID3D12Device* dev, const std::string& extraFormatsCsv) {
     if (!dev) return;
     std::lock_guard<std::mutex> lock(mutex_);
 
+    shutdownLogged_.store(false, std::memory_order_relaxed);
     ID3D12Device* realDev = UnwrapStreamlineObject(dev, "ID3D12Device");
     device_ = realDev;
     rtvDescriptorSize_ = realDev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    ParseExtraFormatsLocked(extraFormatsCsv);
 
     if (!capabilityChecked_) {
         capabilityChecked_ = true;
@@ -331,8 +368,6 @@ bool VrsFoveatedD3D12::EnsureUploadObjectsLocked() {
     return true;
 }
 
-// [C3, C4, B8'] Over-allocate capacity maxW=ceil(eyeW*1.5), maxH=ceil(eyeH*1.5) (= kVrsMaxScale 1.50f),
-// top-left anchored pattern, in-place re-upload on runtime mode switch, and strict fence completion check.
 bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace) {
     if (!EnsureUploadObjectsLocked() || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
 
@@ -435,7 +470,6 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
     (void)uploadAlloc_->Reset();
     (void)uploadList_->Reset(uploadAlloc_, nullptr);
 
-    // [B8'] If re-uploading in place onto existing texture, transition SHADING_RATE_SOURCE -> COPY_DEST first
     if (!needNewAllocation) {
         D3D12_RESOURCE_BARRIER toCopy{};
         toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -487,7 +521,6 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
 
     leakedResources_.push_back(uploadBuf);
 
-    // [C4] Verify fence actually completed before marking ready
     if (uploadFence_->GetCompletedValue() < fenceValue_) {
         LogMessage(LogLevel::Error, "VRS12: upload fence timeout");
         if (needNewAllocation && targetTex) {
@@ -628,7 +661,6 @@ void VrsFoveatedD3D12::OnBeginRenderPass() {
     beginRpCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
-// [C1, C2, C5, B7'] Hot-path OMSetRenderTargets detour
 void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     ID3D12GraphicsCommandList* cmdList,
     UINT numRenderTargetDescriptors,
@@ -639,7 +671,6 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
 
     omsrtCount_.fetch_add(1, std::memory_order_relaxed);
 
-    // [B7'] Never touch bundles, compute, or copy command lists
     if (cmdList->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         return;
     }
@@ -695,7 +726,6 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     }
 
     auto bindOrResetVrs = [&](bool isCandidate) {
-        // [B7'] If mode == 1 (passive), never invoke RS* methods
         if (mode == 1 || !cl5) return;
 
         if (isCandidate && isEnabled && isReady && currentVrsTexture_) {
@@ -734,7 +764,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         }
         rtPod = it->second;
 
-        // [C5] Collect MRT formats only if we still have distinct-RT log budget
+        // [F7] Verified MRT format collection: walks handle + i*rtvDescriptorSize_ when RTsSingleHandleToDescriptorRange==TRUE
         if (needDistinctLog) {
             const UINT mrtCount = (std::min)(numRenderTargetDescriptors, 8u);
             mrtFormatsStr = " mrt=" + std::to_string(numRenderTargetDescriptors) + " f=[";
@@ -774,6 +804,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     fIn.rtArraySize = rtPod.arraySize;
     fIn.rtSamples = rtPod.samples;
     fIn.rtResourceFormat = rtPod.resourceFmt;
+    fIn.isExtraFormatAllowed = IsExtraFormatAllowed(rtPod.resourceFmt); // [F8]
     fIn.validViewDim = (rtPod.dim == 4u || rtPod.dim == 6u);
     fIn.rtvSlices = 1;
     fIn.isExcludedSwapchain = false;
@@ -788,7 +819,6 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
 
     VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
-    // [C2] Non-candidate path takes ZERO mutex once distinctRtLogCount_ >= 32
     if (needDistinctLog || fOut.accepted) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (loggedDistinctRtHandles_.size() < kMaxDistinctRtLogs) {
@@ -828,13 +858,11 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     bindOrResetVrs(fOut.accepted);
 }
 
-// [C7, B9'] Device health check and extended stats line every 900 frames
 void VrsFoveatedD3D12::EndFrame() {
     if (!tier2Supported_) return;
 
     const uint64_t frames = framesCount_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frames % 900 == 0) {
-        // [C7] Check GetDeviceRemovedReason() every 900 frames
         if (device_ && !deviceRemovedLogged_.load(std::memory_order_relaxed)) {
             const HRESULT hrRemoved = device_->GetDeviceRemovedReason();
             if (hrRemoved != S_OK) {
@@ -905,7 +933,17 @@ void VrsFoveatedD3D12::EndFrame() {
 void VrsFoveatedD3D12::Shutdown(const char* reason) {
     if (!capabilityChecked_) return;
     enabled_.store(false, std::memory_order_relaxed);
+    shutdownLogged_.store(true, std::memory_order_relaxed);
     LogMessage(LogLevel::Info, std::string("VRS12: Shutdown (reason=") + (reason ? reason : "DestroySession") + ")");
+}
+
+// [F9] Process detach fallback log when game exits without calling xrDestroySession / xrDestroyInstance
+void VrsFoveatedD3D12::ShutdownOnProcessDetach() {
+    if (!capabilityChecked_) return;
+    if (!shutdownLogged_.exchange(true, std::memory_order_relaxed)) {
+        enabled_.store(false, std::memory_order_relaxed);
+        LogMessage(LogLevel::Info, "VRS12: Shutdown (reason=ProcessDetach)");
+    }
 }
 
 } // namespace vrpacing

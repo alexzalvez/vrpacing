@@ -55,7 +55,8 @@ void ToJson(json& j, const RuntimeConfig& cfg) {
             {"debugMode", cfg.ffr.debugMode}
         }},
         {"vrs12", {
-            {"debugMode", cfg.vrs12.debugMode}
+            {"debugMode", cfg.vrs12.debugMode},
+            {"extraFormats", cfg.vrs12.extraFormats}
         }},
         {"pacing", {
             {"enabled", cfg.pacing.enabled},
@@ -104,6 +105,7 @@ RuntimeConfig FromJson(const json& j) {
     if (j.contains("vrs12")) {
         const auto& v12 = j["vrs12"];
         cfg.vrs12.debugMode = v12.value("debugMode", cfg.vrs12.debugMode);
+        cfg.vrs12.extraFormats = v12.value("extraFormats", cfg.vrs12.extraFormats);
     }
     if (j.contains("pacing")) {
         const auto& p = j["pacing"];

@@ -1,5 +1,5 @@
 #pragma once
-// [B4] Shared pure candidate filter for D3D11 and D3D12 VRS.
+// [B4, F8] Shared pure candidate filter for D3D11 and D3D12 VRS.
 
 #include <dxgiformat.h>
 #include <cmath>
@@ -40,6 +40,7 @@ struct VrsFilterInput {
     uint32_t rtArraySize = 0;
     uint32_t rtSamples = 0;
     DXGI_FORMAT rtResourceFormat = DXGI_FORMAT_UNKNOWN;
+    bool isExtraFormatAllowed = false; // [F8] Optional extra formats list
     bool validViewDim = false;
     uint32_t rtvSlices = 1;
     bool isExcludedSwapchain = false;
@@ -104,7 +105,8 @@ inline VrsFilterOutput EvaluateVrsCandidate(const VrsFilterInput& in) {
         return out;
     }
 
-    if (!IsWhitelistedVrsColorFormat(in.rtResourceFormat)) {
+    // [F8] Check standard whitelist or extraFormats
+    if (!IsWhitelistedVrsColorFormat(in.rtResourceFormat) && !in.isExtraFormatAllowed) {
         out.label = "REJECT_FORMAT";
         return out;
     }

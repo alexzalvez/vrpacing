@@ -115,7 +115,7 @@ SharedMemoryClient g_shm;
 
 ComPtr<ID3D11Device> g_d3d11Device;
 ComPtr<ID3D11DeviceContext> g_d3d11Context;
-ComPtr<ID3D12Device> g_d3d12Device; // [B1]
+ComPtr<ID3D12Device> g_d3d12Device;
 
 uint32_t g_lastInW = 0;
 uint32_t g_lastInH = 0;
@@ -131,7 +131,7 @@ uint32_t g_vrsTargetEyeH = 0;
 bool g_vrsLastEnabled = false;
 int g_vrsLastDebugMode = -1;
 
-std::atomic<uint64_t> g_visMaskCallsD3D11{ 0 }; // [B9]
+std::atomic<uint64_t> g_visMaskCallsD3D11{ 0 };
 
 bool IsCurrentProcessBlacklisted() {
     static int s_cached = -1;
@@ -256,7 +256,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
     EnsureInit();
     if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
 
-    // [B9] Count xrGetVisibilityMaskKHR calls per session type
     if (g_d3d12Device) {
         VrsFoveatedD3D12::Instance().RecordVisibilityMaskCall();
     } else {
@@ -428,11 +427,11 @@ XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eve
     return g_nextPollEvent ? g_nextPollEvent(instance, eventData) : XR_EVENT_UNAVAILABLE;
 }
 
-// [B1] Capture XrGraphicsBindingD3D12KHR while keeping Pure VDXR Bridge standby intact
 XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
     EnsureInit();
     if (!createInfo || !session) return XR_ERROR_VALIDATION_FAILURE;
 
+    g_cfg = LoadConfig(); // Reload disk config to pick up vrs12.debugMode and vrs12.extraFormats
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
     g_d3d12Device.Reset();
@@ -462,7 +461,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
                 g_d3d12Device = d3d12->device;
                 LogMessage(LogLevel::Info, "OpenXR Layer: Captured ID3D12Device in xrCreateSession.");
                 if (!IsCurrentProcessBlacklisted()) {
-                    VrsFoveatedD3D12::Instance().OnSessionCreated(g_d3d12Device.Get());
+                    VrsFoveatedD3D12::Instance().OnSessionCreated(g_d3d12Device.Get(), g_cfg.vrs12.extraFormats);
                 }
             }
             break;
@@ -498,7 +497,6 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     return res;
 }
 
-// [B10] Shutdown D3D12 VRS on DestroySession
 XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
@@ -731,7 +729,6 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainFormats(XrSession session, uint32_t
     return g_nextEnumerateSwapchainFormats(session, formatCapacityInput, formatCountOutput, formats);
 }
 
-// [B4] Collect XrSwapchainImageD3D12KHR::texture for sc histogram field
 XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t imageCapacityInput, uint32_t* imageCountOutput, XrSwapchainImageBaseHeader* images) {
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
@@ -1007,7 +1004,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     return res;
 }
 
-// [B1, B9] Extract eye size from projection layer for D3D12 sessions as well
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
     if (!g_d3d11Device) {
         if (g_d3d12Device && !IsCurrentProcessBlacklisted() && frameEndInfo && frameEndInfo->layerCount > 0 && frameEndInfo->layers) {
@@ -1154,7 +1150,7 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
                 qCopy.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.x * sx));
                 qCopy.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.y * sy));
                 qCopy.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.width * sx));
-                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.height * sy));
+                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.height * sy));
                 quadCopies.push_back(qCopy);
                 remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadCopies.back());
             } else {

@@ -20,7 +20,7 @@ class VrsFoveatedD3D12 {
 public:
     static VrsFoveatedD3D12& Instance();
 
-    void OnSessionCreated(ID3D12Device* dev);
+    void OnSessionCreated(ID3D12Device* dev, const std::string& extraFormatsCsv = "");
     void UpdateTarget(ID3D12Device* dev,
                       bool enabled,
                       uint32_t eyeWidth,
@@ -31,6 +31,7 @@ public:
     void RecordVisibilityMaskCall();
     void EndFrame();
     void Shutdown(const char* reason = "DestroySession");
+    void ShutdownOnProcessDetach(); // [F9] Fallback log when process exits without xrDestroySession
 
     void OnCreateRenderTargetView(ID3D12Device* dev,
                                   ID3D12Resource* pResource,
@@ -98,6 +99,8 @@ private:
     void InstallHooksLocked(ID3D12Device* rawDevice);
     bool EnsureUploadObjectsLocked();
     bool AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace);
+    void ParseExtraFormatsLocked(const std::string& csv);
+    bool IsExtraFormatAllowed(DXGI_FORMAT fmt) const noexcept;
 
     std::mutex mutex_;
     std::shared_mutex rtvMapMutex_;
@@ -109,6 +112,10 @@ private:
     std::unordered_set<ID3D12Resource*> swapchainTextures_;
     std::unordered_map<void**, CmdList5VtableEntry> cmdList5VtblCache_;
 
+    // [F8] Lock-free fixed array of extra allowed formats populated at init
+    DXGI_FORMAT extraFormats_[16]{};
+    std::atomic<uint32_t> extraFormatsCount_{ 0 };
+
     ID3D12Device* device_ = nullptr;
     uint32_t rtvDescriptorSize_ = 0;
     bool capabilityChecked_ = false;
@@ -117,9 +124,9 @@ private:
     uint32_t tileSize_ = 16;
     bool additionalShadingRates_ = false;
 
-    // [C1] All hot-path state variables are std::atomic
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
+    std::atomic<bool> shutdownLogged_{ false }; // [F9]
     std::atomic<int> debugMode_{ 1 };
     std::atomic<uint32_t> targetEyeW_{ 0 };
     std::atomic<uint32_t> targetEyeH_{ 0 };
@@ -127,8 +134,8 @@ private:
     std::atomic<uint32_t> capPixelsH_{ 0 };
     std::atomic<uint32_t> texTilesW_{ 0 };
     std::atomic<uint32_t> texTilesH_{ 0 };
-    std::atomic<size_t> distinctRtLogCount_{ 0 }; // [C2] Lock-free budget check
-    std::atomic<bool> deviceRemovedLogged_{ false }; // [C7]
+    std::atomic<size_t> distinctRtLogCount_{ 0 };
+    std::atomic<bool> deviceRemovedLogged_{ false };
 
     uint32_t builtEyeW_ = 0;
     uint32_t builtEyeH_ = 0;
@@ -143,11 +150,9 @@ private:
     ID3D12Resource* currentVrsTexture_ = nullptr;
     std::vector<ID3D12Resource*> leakedResources_;
 
-    // [C5] Key distinct-RT by RT0 handle.ptr
     std::unordered_set<size_t> loggedDistinctRtHandles_;
     std::unordered_map<HistKey12, uint64_t, HistKey12Hash> histogram_;
 
-    // [C2] All per-call counters are std::atomic<uint64_t>
     std::atomic<uint64_t> framesCount_{ 0 };
     std::atomic<uint64_t> omsrtCount_{ 0 };
     std::atomic<uint64_t> directCount_{ 0 };
