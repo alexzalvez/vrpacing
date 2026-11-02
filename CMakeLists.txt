@@ -63,7 +63,12 @@ if(WIN32)
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
-  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi
+  target_link_directories(VRPacingLayer PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64"
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi"
+)
+
+target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3dcompiler dxgi
   minhook
   nvapi64)
   target_compile_definitions(VRPacingLayer PRIVATE XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11)
