@@ -58,15 +58,12 @@ PFN_xrDestroyInstance g_nextDestroyInstance = nullptr;
 PFN_xrEnumerateViewConfigurationViews g_nextEnumerateViewConfigurationViews = nullptr;
 PFN_xrCreateSwapchain g_nextCreateSwapchain = nullptr;
 PFN_xrDestroySwapchain g_nextDestroySwapchain = nullptr;
-PFN_xrEnumerateSwapchainFormats g_nextEnumerateSwapchainFormats = nullptr;
 PFN_xrEnumerateSwapchainImages g_nextEnumerateSwapchainImages = nullptr;
 PFN_xrAcquireSwapchainImage g_nextAcquireSwapchainImage = nullptr;
 PFN_xrWaitSwapchainImage g_nextWaitSwapchainImage = nullptr;
 PFN_xrReleaseSwapchainImage g_nextReleaseSwapchainImage = nullptr;
 PFN_xrEndFrame g_nextEndFrame = nullptr;
 PFN_xrWaitFrame g_nextWaitFrame = nullptr;
-PFN_xrGetSystemProperties g_nextGetSystemProperties = nullptr;
-PFN_xrEnumerateInstanceExtensionProperties g_nextEnumerateInstanceExtensionProperties = nullptr;
 PFN_xrGetVisibilityMaskKHR g_nextGetVisibilityMaskKHR = nullptr;
 PFN_xrLocateViews g_nextLocateViews = nullptr;
 PFN_xrPollEvent g_nextPollEvent = nullptr;
@@ -380,6 +377,7 @@ XrResult XRAPI_CALL Impl_xrLocateViews(
     uint32_t viewCapacityInput,
     uint32_t* viewCountOutput,
     XrView* views) {
+    if (!g_nextLocateViews) return XR_ERROR_HANDLE_INVALID;
     XrResult res = g_nextLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
     if (XR_SUCCEEDED(res) && views && viewCountOutput && !IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
         const uint32_t count = (std::min)(*viewCountOutput, 2u);
@@ -429,7 +427,7 @@ XrResult XRAPI_CALL Impl_xrPollEvent(XrInstance instance, XrEventDataBuffer* eve
 
 XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
     EnsureInit();
-    if (!createInfo || !session) return XR_ERROR_VALIDATION_FAILURE;
+    if (!createInfo || !session || !g_nextCreateSession) return XR_ERROR_VALIDATION_FAILURE;
 
     g_cfg = LoadConfig();
     g_d3d11Device.Reset();
@@ -526,7 +524,7 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
     if (g_activeSession == session) {
         g_activeSession = XR_NULL_HANDLE;
     }
-    return g_nextDestroySession(session);
+    return g_nextDestroySession ? g_nextDestroySession(session) : XR_SUCCESS;
 }
 
 XrResult XRAPI_CALL Impl_xrDestroyInstance(XrInstance instance) {
@@ -552,6 +550,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
     uint32_t* viewCountOutput,
     XrViewConfigurationView* views) {
     EnsureInit();
+    if (!g_nextEnumerateViewConfigurationViews) return XR_ERROR_HANDLE_INVALID;
     XrResult res = g_nextEnumerateViewConfigurationViews(instance, systemId, viewConfigurationType, viewCapacityInput, viewCountOutput, views);
     if (XR_FAILED(res) || !views || viewCapacityInput == 0) return res;
 
@@ -576,7 +575,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateViewConfigurationViews(
 
 XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo* createInfo, XrSwapchain* swapchain) {
     EnsureInit();
-    if (!createInfo || !swapchain) return XR_ERROR_VALIDATION_FAILURE;
+    if (!createInfo || !swapchain || !g_nextCreateSwapchain) return XR_ERROR_VALIDATION_FAILURE;
 
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
@@ -722,14 +721,11 @@ XrResult XRAPI_CALL Impl_xrDestroySwapchain(XrSwapchain swapchain) {
         g_swapchains.erase(it);
     }
     g_upscaler.ClearCache();
-    return g_nextDestroySwapchain(swapchain);
-}
-
-XrResult XRAPI_CALL Impl_xrEnumerateSwapchainFormats(XrSession session, uint32_t formatCapacityInput, uint32_t* formatCountOutput, int64_t* formats) {
-    return g_nextEnumerateSwapchainFormats(session, formatCapacityInput, formatCountOutput, formats);
+    return g_nextDestroySwapchain ? g_nextDestroySwapchain(swapchain) : XR_SUCCESS;
 }
 
 XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t imageCapacityInput, uint32_t* imageCountOutput, XrSwapchainImageBaseHeader* images) {
+    if (!g_nextEnumerateSwapchainImages) return XR_ERROR_HANDLE_INVALID;
     std::lock_guard<std::mutex> lock(g_layerMutex);
     auto it = g_swapchains.find(swapchain);
     if (it == g_swapchains.end()) {
@@ -769,6 +765,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
 }
 
 XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageAcquireInfo* acquireInfo, uint32_t* index) {
+    if (!g_nextAcquireSwapchainImage) return XR_ERROR_HANDLE_INVALID;
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextAcquireSwapchainImage(swapchain, acquireInfo, index);
     }
@@ -789,6 +786,7 @@ XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const Xr
 }
 
 XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageWaitInfo* waitInfo) {
+    if (!g_nextWaitSwapchainImage) return XR_ERROR_HANDLE_INVALID;
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextWaitSwapchainImage(swapchain, waitInfo);
     }
@@ -802,6 +800,7 @@ XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwa
 }
 
 XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageReleaseInfo* releaseInfo) {
+    if (!g_nextReleaseSwapchainImage) return XR_ERROR_HANDLE_INVALID;
     if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
         return g_nextReleaseSwapchainImage(swapchain, releaseInfo);
     }
@@ -888,6 +887,7 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 
 XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* info, XrFrameState* state) {
     EnsureInit();
+    if (!g_nextWaitFrame) return XR_ERROR_HANDLE_INVALID;
 
     if (IsCurrentProcessBlacklisted()) {
         return g_nextWaitFrame(session, info, state);
@@ -1005,6 +1005,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 }
 
 XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
+    if (!g_nextEndFrame) return XR_ERROR_HANDLE_INVALID;
     if (!g_d3d11Device) {
         if (g_d3d12Device && !IsCurrentProcessBlacklisted() && frameEndInfo && frameEndInfo->layerCount > 0 && frameEndInfo->layers) {
             uint32_t projEyeW = 0;
@@ -1166,27 +1167,20 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
     return g_nextEndFrame(session, &modified);
 }
 
-XrResult XRAPI_CALL Impl_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
-    return g_nextGetSystemProperties(instance, systemId, properties);
-}
-
-XrResult XRAPI_CALL Impl_xrEnumerateInstanceExtensionProperties(const char* layerName, uint32_t propertyCapacityInput, uint32_t* propertyCountOutput, XrExtensionProperties* properties) {
-    return g_nextEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
-}
-
 void ResolveProcPointers(XrInstance instance) {
+    if (!g_nextGetInstanceProcAddr || instance == XR_NULL_HANDLE) return;
+    g_nextCreateSession = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrCreateSession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSession));
     g_nextDestroySession = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySession));
     g_nextDestroyInstance = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroyInstance", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroyInstance));
+    g_nextEnumerateViewConfigurationViews = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateViewConfigurationViews", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateViewConfigurationViews));
     g_nextCreateSwapchain = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrCreateSwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextCreateSwapchain));
     g_nextDestroySwapchain = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrDestroySwapchain", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextDestroySwapchain));
-    g_nextEnumerateSwapchainFormats = nullptr;
-    g_nextGetInstanceProcAddr(instance, "xrEnumerateSwapchainFormats", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateSwapchainFormats));
     g_nextEnumerateSwapchainImages = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrEnumerateSwapchainImages", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateSwapchainImages));
     g_nextAcquireSwapchainImage = nullptr;
@@ -1199,10 +1193,6 @@ void ResolveProcPointers(XrInstance instance) {
     g_nextGetInstanceProcAddr(instance, "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEndFrame));
     g_nextWaitFrame = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrWaitFrame", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextWaitFrame));
-    g_nextGetSystemProperties = nullptr;
-    g_nextGetInstanceProcAddr(instance, "xrGetSystemProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetSystemProperties));
-    g_nextEnumerateInstanceExtensionProperties = nullptr;
-    g_nextGetInstanceProcAddr(instance, "xrEnumerateInstanceExtensionProperties", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextEnumerateInstanceExtensionProperties));
     g_nextGetVisibilityMaskKHR = nullptr;
     g_nextGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&g_nextGetVisibilityMaskKHR));
     g_nextLocateViews = nullptr;
@@ -1234,36 +1224,48 @@ XRAPI_ATTR XrResult XRAPI_CALL Layer_xrCreateApiLayerInstance(const XrInstanceCr
         return nextInfo->nextCreateApiLayerInstance(info, &localLayerInfo, instance);
     }
 
+    // Store nextGetInstanceProcAddr BEFORE calling nextCreateApiLayerInstance so any downstream
+    // queries during instance creation never see a null g_nextGetInstanceProcAddr.
+    g_nextGetInstanceProcAddr = nextInfo->nextGetInstanceProcAddr;
+
     XrResult res = nextInfo->nextCreateApiLayerInstance(info, &localLayerInfo, instance);
     if (XR_FAILED(res)) return res;
 
-    g_nextGetInstanceProcAddr = nextInfo->nextGetInstanceProcAddr;
-    ResolveProcPointers(*instance);
+    if (instance && *instance != XR_NULL_HANDLE) {
+        ResolveProcPointers(*instance);
+    }
     return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function) {
     if (!name || !function) return XR_ERROR_VALIDATION_FAILURE;
 
-    if (strcmp(name, "xrDestroyInstance") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroyInstance);
-    else if (strcmp(name, "xrCreateSession") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSession);
-    else if (strcmp(name, "xrDestroySession") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroySession);
-    else if (strcmp(name, "xrEnumerateViewConfigurationViews") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateViewConfigurationViews);
-    else if (strcmp(name, "xrCreateSwapchain") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSwapchain);
-    else if (strcmp(name, "xrDestroySwapchain") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroySwapchain);
-    else if (strcmp(name, "xrEnumerateSwapchainFormats") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateSwapchainFormats);
-    else if (strcmp(name, "xrEnumerateSwapchainImages") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateSwapchainImages);
-    else if (strcmp(name, "xrAcquireSwapchainImage") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrAcquireSwapchainImage);
-    else if (strcmp(name, "xrWaitSwapchainImage") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitSwapchainImage);
-    else if (strcmp(name, "xrReleaseSwapchainImage") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrReleaseSwapchainImage);
-    else if (strcmp(name, "xrEndFrame") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEndFrame);
-    else if (strcmp(name, "xrWaitFrame") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitFrame);
-    else if (strcmp(name, "xrGetSystemProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetSystemProperties);
-    else if (strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateInstanceExtensionProperties);
+    // For pre-instance calls (instance == XR_NULL_HANDLE), always delegate to the runtime
+    if (instance == XR_NULL_HANDLE) {
+        return g_nextGetInstanceProcAddr ? g_nextGetInstanceProcAddr(instance, name, function) : XR_ERROR_HANDLE_INVALID;
+    }
+
+    // Lazily resolve if the application queries instance functions before our table is populated
+    if (!g_nextCreateSession && g_nextGetInstanceProcAddr) {
+        ResolveProcPointers(instance);
+    }
+
+    if (strcmp(name, "xrDestroyInstance") == 0 && g_nextDestroyInstance) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroyInstance);
+    else if (strcmp(name, "xrCreateSession") == 0 && g_nextCreateSession) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSession);
+    else if (strcmp(name, "xrDestroySession") == 0 && g_nextDestroySession) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroySession);
+    else if (strcmp(name, "xrEnumerateViewConfigurationViews") == 0 && g_nextEnumerateViewConfigurationViews) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateViewConfigurationViews);
+    else if (strcmp(name, "xrCreateSwapchain") == 0 && g_nextCreateSwapchain) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrCreateSwapchain);
+    else if (strcmp(name, "xrDestroySwapchain") == 0 && g_nextDestroySwapchain) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrDestroySwapchain);
+    else if (strcmp(name, "xrEnumerateSwapchainImages") == 0 && g_nextEnumerateSwapchainImages) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEnumerateSwapchainImages);
+    else if (strcmp(name, "xrAcquireSwapchainImage") == 0 && g_nextAcquireSwapchainImage) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrAcquireSwapchainImage);
+    else if (strcmp(name, "xrWaitSwapchainImage") == 0 && g_nextWaitSwapchainImage) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitSwapchainImage);
+    else if (strcmp(name, "xrReleaseSwapchainImage") == 0 && g_nextReleaseSwapchainImage) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrReleaseSwapchainImage);
+    else if (strcmp(name, "xrEndFrame") == 0 && g_nextEndFrame) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrEndFrame);
+    else if (strcmp(name, "xrWaitFrame") == 0 && g_nextWaitFrame) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrWaitFrame);
     else if (strcmp(name, "xrGetVisibilityMaskKHR") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrGetVisibilityMaskKHR);
-    else if (strcmp(name, "xrLocateViews") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrLocateViews);
-    else if (strcmp(name, "xrPollEvent") == 0) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrPollEvent);
-    else return g_nextGetInstanceProcAddr(instance, name, function);
+    else if (strcmp(name, "xrLocateViews") == 0 && g_nextLocateViews) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrLocateViews);
+    else if (strcmp(name, "xrPollEvent") == 0 && g_nextPollEvent) *function = reinterpret_cast<PFN_xrVoidFunction>(Impl_xrPollEvent);
+    else return g_nextGetInstanceProcAddr ? g_nextGetInstanceProcAddr(instance, name, function) : XR_ERROR_FUNCTION_UNSUPPORTED;
 
     return XR_SUCCESS;
 }
