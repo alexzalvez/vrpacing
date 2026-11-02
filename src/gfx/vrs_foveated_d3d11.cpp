@@ -441,7 +441,6 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
     fastEnabled_.store(true, std::memory_order_relaxed);
 }
 
-// [P1] & [P3] Telemetry stats line with nvbinds and histogram top-3
 void VrsFoveatedD3D11::EndFrame() {
     if (!fastEnabled_.load(std::memory_order_relaxed) &&
         !fastBound_.load(std::memory_order_relaxed)) {
@@ -462,7 +461,6 @@ void VrsFoveatedD3D11::EndFrame() {
             std::lock_guard<std::mutex> lock(mutex_);
             mode = debugMode_;
 
-            // Sort top entries from the histogram
             std::vector<std::pair<RtHistogramKey, uint64_t>> sortedEntries(rtHistogram_.begin(), rtHistogram_.end());
             std::sort(sortedEntries.begin(), sortedEntries.end(),
                       [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -493,7 +491,6 @@ void VrsFoveatedD3D11::EndFrame() {
     }
 }
 
-// [P2] Idempotent Shutdown: do nothing if device_ is null
 void VrsFoveatedD3D11::Shutdown(const char* reason) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!device_ && !context_ && !nvapiSupported_) {
@@ -685,9 +682,9 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
                                 td.SampleDesc.Count, rtvDesc.ViewDimension, true, resultLabel);
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
 
-    // [P3] Registrar en el histograma acotado de RTs aceptados
-    if (rtHistogram_.size() < kMaxHistogramEntries || rtHistogram_.find({ td.Width, td.Height, td.Format, td.SampleDesc.Count, td.ArraySize }) != rtHistogram_.end()) {
-        rtHistogram_[{ td.Width, td.Height, td.Format, td.SampleDesc.Count, td.ArraySize }]++;
+    const RtHistogramKey histKey{ td.Width, td.Height, static_cast<uint32_t>(td.Format), td.SampleDesc.Count, td.ArraySize };
+    if (rtHistogram_.size() < kMaxHistogramEntries || rtHistogram_.find(histKey) != rtHistogram_.end()) {
+        rtHistogram_[histKey]++;
     }
 
     if (debugMode_ == 1) {
@@ -772,18 +769,16 @@ void VrsFoveatedD3D11::DisableVRSLocked(ID3D11DeviceContext* ctx, bool force) {
 
     disableCount_.fetch_add(1, std::memory_order_relaxed);
     vrsCurrentlyBound_ = false;
-    lastBoundView_ = nullptr; // [P1] Limpiar vista enlazada al desactivar
+    lastBoundView_ = nullptr;
     lastBoundDebugMode_ = -1;
     fastBound_.store(false, std::memory_order_relaxed);
 }
 
-// [P1] Redundant Binds Skip
 void VrsFoveatedD3D11::ApplyVRSViewLocked(ID3D11DeviceContext* ctx,
                                           ID3D11NvShadingRateResourceView* view,
                                           const char* label) {
     if (!view) return;
 
-    // Si ya esta enlazado exactamente este SRRV y el debugMode no cambio, omitir ambas llamadas
     if (vrsCurrentlyBound_ && lastBoundView_ == view && lastBoundDebugMode_ == debugMode_) {
         return;
     }
