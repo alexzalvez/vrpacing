@@ -25,7 +25,8 @@ public:
                       bool enabled,
                       uint32_t eyeWidth,
                       uint32_t eyeHeight,
-                      int debugMode);
+                      int debugMode,
+                      bool debugLogging = false);
     void RegisterSwapchainTexture(ID3D12Resource* tex);
     void ClearSwapchainTextures();
     void RecordVisibilityMaskCall();
@@ -78,51 +79,56 @@ private:
     struct HistKey12Hash {
         size_t operator()(const HistKey12& k) const {
             size_t h = 14695981039346656037ULL;
-            auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
-            mix(k.w); mix(k.h); mix(k.fRt); mix(k.fView); mix(k.ms); mix(k.dsv); mix(k.sc);
+            auto mix = [&h](uint32_t v) {
+                h ^= v;
+                h *= 1099511628211ULL;
+            };
+            mix(k.w); mix(k.h); mix(k.fRt); mix(k.fView); mix(k.ms);
+            mix(k.dsv); mix(k.sc);
             return h;
         }
     };
 
-    struct CmdList5VtableEntry {
-        bool checked = false;
-        bool supported = false;
-        bool pointerEqualsThis = false;
-    };
-
-    static constexpr size_t kMaxDistinctRtLogs = 32;
-    static constexpr size_t kMaxHistEntries = 16;
+    static constexpr size_t kMaxDistinctRtLogs = 64;
+    static constexpr size_t kMaxHistEntries = 8;
+    static constexpr float kVrsAspectTolerance = 0.05f;
 
     VrsFoveatedD3D12() = default;
     ~VrsFoveatedD3D12() = default;
 
-    void InstallHooksLocked(ID3D12Device* rawDevice);
-    bool EnsureUploadObjectsLocked();
-    bool AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace);
-    void ParseExtraFormatsLocked(const std::string& csv);
-    bool IsExtraFormatAllowed(DXGI_FORMAT fmt) const noexcept;
+    VrsFoveatedD3D12(const VrsFoveatedD3D12&) = delete;
+    VrsFoveatedD3D12& operator=(const VrsFoveatedD3D12&) = delete;
+
+    bool QueryTier2SupportLocked(ID3D12Device* dev);
+    void InstallDeviceHooksLocked(ID3D12Device* dev);
+    void InstallCommandListHooksLocked(ID3D12GraphicsCommandList* cmdList);
+
+    bool AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuseExisting);
+    void ReleasePatternResourcesLocked();
+
+    bool IsExtraFormatAllowed(DXGI_FORMAT fmt) const;
+    void ParseExtraFormatsCsv(const std::string& csv);
 
     std::mutex mutex_;
     std::shared_mutex rtvMapMutex_;
     std::shared_mutex dsvMapMutex_;
-    std::shared_mutex vtblCacheMutex_;
 
-    std::unordered_map<size_t, DescriptorPod> rtvMap_;
-    std::unordered_map<size_t, DescriptorPod> dsvMap_;
+    std::unordered_map<SIZE_T, DescriptorPod> rtvMap_;
+    std::unordered_map<SIZE_T, DescriptorPod> dsvMap_;
     std::unordered_set<ID3D12Resource*> swapchainTextures_;
-    std::unordered_map<void**, CmdList5VtableEntry> cmdList5VtblCache_;
+    std::unordered_set<uint32_t> extraAllowedFormats_;
 
-    DXGI_FORMAT extraFormats_[16]{};
-    std::atomic<uint32_t> extraFormatsCount_{ 0 };
+    Microsoft::WRL::ComPtr<ID3D12Device> device_;
+    UINT rtvDescriptorSize_ = 0;
+    UINT dsvDescriptorSize_ = 0;
 
-    ID3D12Device* device_ = nullptr;
-    uint32_t rtvDescriptorSize_ = 0;
     bool capabilityChecked_ = false;
     bool tier2Supported_ = false;
     bool hooksInstalled_ = false;
     uint32_t tileSize_ = 16;
     bool additionalShadingRates_ = false;
 
+    std::atomic<bool> debugLogging_{ false };
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
     std::atomic<bool> shutdownLogged_{ false };
