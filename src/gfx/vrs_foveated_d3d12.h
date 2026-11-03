@@ -25,8 +25,7 @@ public:
                       bool enabled,
                       uint32_t eyeWidth,
                       uint32_t eyeHeight,
-                      int debugMode,
-                      bool debugLogging = false);
+                      int debugMode);
     void RegisterSwapchainTexture(ID3D12Resource* tex);
     void ClearSwapchainTextures();
     void RecordVisibilityMaskCall();
@@ -124,7 +123,6 @@ private:
     uint32_t tileSize_ = 16;
     bool additionalShadingRates_ = false;
 
-    std::atomic<bool> debugLogging_{ false };
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
     std::atomic<bool> shutdownLogged_{ false };
