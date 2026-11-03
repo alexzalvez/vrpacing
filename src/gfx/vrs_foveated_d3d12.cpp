@@ -170,7 +170,6 @@ void VrsFoveatedD3D12::ClearSwapchainTextures() {
     swapchainTextures_.clear();
 }
 
-// [F8] Parse comma-separated list of DXGI format ints and log at init
 void VrsFoveatedD3D12::ParseExtraFormatsLocked(const std::string& csv) {
     uint32_t count = 0;
     size_t pos = 0;
@@ -368,6 +367,7 @@ bool VrsFoveatedD3D12::EnsureUploadObjectsLocked() {
     return true;
 }
 
+// [C3, C4, Z1] Allocate and upload both SingleEye and DoubleWide pattern textures on our internal queue
 bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace) {
     if (!EnsureUploadObjectsLocked() || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
 
@@ -376,14 +376,27 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
     uint32_t tilesW = texTilesW_.load(std::memory_order_relaxed);
     uint32_t tilesH = texTilesH_.load(std::memory_order_relaxed);
 
+    uint32_t capDwW = capDwPixelsW_.load(std::memory_order_relaxed);
+    uint32_t capDwH = capDwPixelsH_.load(std::memory_order_relaxed);
+    uint32_t tilesDwW = texDwTilesW_.load(std::memory_order_relaxed);
+    uint32_t tilesDwH = texDwTilesH_.load(std::memory_order_relaxed);
+
     ID3D12Resource* targetTex = currentVrsTexture_;
-    const bool needNewAllocation = (!reuploadInPlace || !targetTex || eyeW > capW || eyeH > capH);
+    ID3D12Resource* targetTexDw = currentVrsTextureDw_;
+    const bool needNewAllocation = (!reuploadInPlace || !targetTex || !targetTexDw ||
+                                    eyeW > capW || eyeH > capH || (eyeW * 2u) > capDwW || eyeH > capDwH);
 
     if (needNewAllocation) {
         capW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * static_cast<double>(kVrsMaxScale)));
         capH = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeH) * static_cast<double>(kVrsMaxScale)));
         tilesW = (std::max)(1u, (capW + tileSize_ - 1) / tileSize_);
         tilesH = (std::max)(1u, (capH + tileSize_ - 1) / tileSize_);
+
+        // [Z1] DoubleWide capacity: ceil(2 * eyeW * 1.5) x ceil(eyeH * 1.5)
+        capDwW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * 2.0 * static_cast<double>(kVrsMaxScale)));
+        capDwH = capH;
+        tilesDwW = (std::max)(1u, (capDwW + tileSize_ - 1) / tileSize_);
+        tilesDwH = tilesH;
 
         D3D12_HEAP_PROPERTIES defaultHeap{};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -413,17 +426,40 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
             LogMessage(LogLevel::Error, "VRS12: Failed to create R8_UINT VRS texture. HR=" + std::to_string(hr));
             return false;
         }
+
+        D3D12_RESOURCE_DESC texDwDesc = texDesc;
+        texDwDesc.Width = tilesDwW;
+        texDwDesc.Height = tilesDwH;
+
+        ID3D12Resource* newTexDw = nullptr;
+        hr = device_->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDwDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newTexDw));
+        if (FAILED(hr) || !newTexDw) {
+            leakedResources_.push_back(newTex);
+            LogMessage(LogLevel::Error, "VRS12: Failed to create DOUBLEWIDE R8_UINT VRS texture. HR=" + std::to_string(hr));
+            return false;
+        }
+
         targetTex = newTex;
+        targetTexDw = newTexDw;
     }
 
     std::vector<uint8_t> pattern = CreateTopLeftAnchoredPatternD3D12(
         eyeW, eyeH, tilesW, tilesH, tileSize_, mode, additionalShadingRates_);
-    if (pattern.size() < static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH)) {
+    std::vector<uint8_t> patternDw = CreateTopLeftAnchoredDoubleWidePatternD3D12(
+        eyeW, eyeH, tilesDwW, tilesDwH, tileSize_, mode, additionalShadingRates_);
+
+    if (pattern.size() < static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH) ||
+        patternDw.size() < static_cast<size_t>(tilesDwW) * static_cast<size_t>(tilesDwH)) {
         return false;
     }
 
     const uint32_t rowPitch = (tilesW + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     const uint64_t uploadSize = static_cast<uint64_t>(rowPitch) * static_cast<uint64_t>(tilesH);
+
+    const uint32_t rowPitchDw = (tilesDwW + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const uint64_t uploadSizeDw = static_cast<uint64_t>(rowPitchDw) * static_cast<uint64_t>(tilesDwH);
 
     D3D12_HEAP_PROPERTIES uploadHeap{};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -450,8 +486,24 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
         &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
     if (FAILED(hr) || !uploadBuf) {
-        if (needNewAllocation && targetTex) {
-            leakedResources_.push_back(targetTex);
+        if (needNewAllocation) {
+            if (targetTex) leakedResources_.push_back(targetTex);
+            if (targetTexDw) leakedResources_.push_back(targetTexDw);
+        }
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC bufDwDesc = bufDesc;
+    bufDwDesc.Width = uploadSizeDw;
+    ID3D12Resource* uploadBufDw = nullptr;
+    hr = device_->CreateCommittedResource(
+        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDwDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBufDw));
+    if (FAILED(hr) || !uploadBufDw) {
+        leakedResources_.push_back(uploadBuf);
+        if (needNewAllocation) {
+            if (targetTex) leakedResources_.push_back(targetTex);
+            if (targetTexDw) leakedResources_.push_back(targetTexDw);
         }
         return false;
     }
@@ -467,18 +519,33 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
         uploadBuf->Unmap(0, nullptr);
     }
 
+    uint8_t* mappedDw = nullptr;
+    if (SUCCEEDED(uploadBufDw->Map(0, &readRange, reinterpret_cast<void**>(&mappedDw))) && mappedDw) {
+        for (uint32_t y = 0; y < tilesDwH; ++y) {
+            std::memcpy(mappedDw + static_cast<size_t>(y) * rowPitchDw,
+                        patternDw.data() + static_cast<size_t>(y) * tilesDwW,
+                        tilesDwW);
+        }
+        uploadBufDw->Unmap(0, nullptr);
+    }
+
     (void)uploadAlloc_->Reset();
     (void)uploadList_->Reset(uploadAlloc_, nullptr);
 
     if (!needNewAllocation) {
-        D3D12_RESOURCE_BARRIER toCopy{};
-        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        toCopy.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-        toCopy.Transition.pResource = targetTex;
-        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        uploadList_->ResourceBarrier(1, &toCopy);
+        D3D12_RESOURCE_BARRIER toCopy[2]{};
+        toCopy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy[0].Transition.pResource = targetTex;
+        toCopy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+
+        toCopy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy[1].Transition.pResource = targetTexDw;
+        toCopy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        uploadList_->ResourceBarrier(2, toCopy);
     }
 
     D3D12_TEXTURE_COPY_LOCATION dstLoc{};
@@ -498,14 +565,36 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
 
     uploadList_->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
-    D3D12_RESOURCE_BARRIER toSrs{};
-    toSrs.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toSrs.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    toSrs.Transition.pResource = targetTex;
-    toSrs.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    toSrs.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    toSrs.Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-    uploadList_->ResourceBarrier(1, &toSrs);
+    D3D12_TEXTURE_COPY_LOCATION dstLocDw{};
+    dstLocDw.pResource = targetTexDw;
+    dstLocDw.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLocDw.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLocDw{};
+    srcLocDw.pResource = uploadBufDw;
+    srcLocDw.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLocDw.PlacedFootprint.Offset = 0;
+    srcLocDw.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UINT;
+    srcLocDw.PlacedFootprint.Footprint.Width = tilesDwW;
+    srcLocDw.PlacedFootprint.Footprint.Height = tilesDwH;
+    srcLocDw.PlacedFootprint.Footprint.Depth = 1;
+    srcLocDw.PlacedFootprint.Footprint.RowPitch = rowPitchDw;
+
+    uploadList_->CopyTextureRegion(&dstLocDw, 0, 0, 0, &srcLocDw, nullptr);
+
+    D3D12_RESOURCE_BARRIER toSrs[2]{};
+    toSrs[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toSrs[0].Transition.pResource = targetTex;
+    toSrs[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toSrs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toSrs[0].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+
+    toSrs[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toSrs[1].Transition.pResource = targetTexDw;
+    toSrs[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toSrs[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toSrs[1].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+    uploadList_->ResourceBarrier(2, toSrs);
 
     (void)uploadList_->Close();
 
@@ -520,11 +609,13 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
     }
 
     leakedResources_.push_back(uploadBuf);
+    leakedResources_.push_back(uploadBufDw);
 
     if (uploadFence_->GetCompletedValue() < fenceValue_) {
         LogMessage(LogLevel::Error, "VRS12: upload fence timeout");
-        if (needNewAllocation && targetTex) {
-            leakedResources_.push_back(targetTex);
+        if (needNewAllocation) {
+            if (targetTex) leakedResources_.push_back(targetTex);
+            if (targetTexDw) leakedResources_.push_back(targetTexDw);
         }
         return false;
     }
@@ -534,19 +625,29 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
             leakedResources_.push_back(currentVrsTexture_);
             LogMessage(LogLevel::Info, "VRS12: Rebuilt VRS capacity texture (old texture retained for process lifetime).");
         }
+        if (currentVrsTextureDw_ && currentVrsTextureDw_ != targetTexDw) {
+            leakedResources_.push_back(currentVrsTextureDw_);
+        }
         currentVrsTexture_ = targetTex;
+        currentVrsTextureDw_ = targetTexDw;
         capPixelsW_.store(capW, std::memory_order_relaxed);
         capPixelsH_.store(capH, std::memory_order_relaxed);
         texTilesW_.store(tilesW, std::memory_order_relaxed);
         texTilesH_.store(tilesH, std::memory_order_relaxed);
+        capDwPixelsW_.store(capDwW, std::memory_order_relaxed);
+        capDwPixelsH_.store(capDwH, std::memory_order_relaxed);
+        texDwTilesW_.store(tilesDwW, std::memory_order_relaxed);
+        texDwTilesH_.store(tilesDwH, std::memory_order_relaxed);
     }
 
     builtEyeW_ = eyeW;
     builtEyeH_ = eyeH;
     builtMode_ = mode;
 
-    LogMessage(LogLevel::Info, "VRS12: Pattern texture ready (texTiles=" + std::to_string(tilesW) + "x" +
+    LogMessage(LogLevel::Info, "VRS12: Pattern textures ready (singleTiles=" + std::to_string(tilesW) + "x" +
                std::to_string(tilesH) + " cap=" + std::to_string(capW) + "x" + std::to_string(capH) +
+               " dwTiles=" + std::to_string(tilesDwW) + "x" + std::to_string(tilesDwH) +
+               " dwCap=" + std::to_string(capDwW) + "x" + std::to_string(capDwH) +
                " eye=" + std::to_string(eyeW) + "x" + std::to_string(eyeH) +
                " mode=" + std::to_string(mode) + ").");
     return true;
@@ -574,7 +675,9 @@ void VrsFoveatedD3D12::UpdateTarget(ID3D12Device* dev,
 
     const uint32_t curCapW = capPixelsW_.load(std::memory_order_relaxed);
     const uint32_t curCapH = capPixelsH_.load(std::memory_order_relaxed);
-    const bool exceedsCapacity = (!currentVrsTexture_ || eyeWidth > curCapW || eyeHeight > curCapH);
+    const uint32_t curCapDwW = capDwPixelsW_.load(std::memory_order_relaxed);
+    const bool exceedsCapacity = (!currentVrsTexture_ || !currentVrsTextureDw_ ||
+                                  eyeWidth > curCapW || eyeHeight > curCapH || (eyeWidth * 2u) > curCapDwW);
     const bool needsPatternUpdate = (exceedsCapacity || builtEyeW_ != eyeWidth || builtEyeH_ != eyeHeight ||
                                      builtMode_ != debugMode || !vrs12Ready_.load(std::memory_order_relaxed));
 
@@ -725,16 +828,18 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         }
     }
 
-    auto bindOrResetVrs = [&](bool isCandidate) {
+    // [Z1] Select SingleEye or DoubleWide texture when binding
+    auto bindOrResetVrs = [&](bool isCandidate, bool isDoubleWide) {
         if (mode == 1 || !cl5) return;
 
-        if (isCandidate && isEnabled && isReady && currentVrsTexture_) {
+        ID3D12Resource* texToBind = isDoubleWide ? currentVrsTextureDw_ : currentVrsTexture_;
+        if (isCandidate && isEnabled && isReady && texToBind) {
             static const D3D12_SHADING_RATE_COMBINER c[D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT] = {
                 D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
                 D3D12_SHADING_RATE_COMBINER_OVERRIDE
             };
             cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
-            cl5->RSSetShadingRateImage(currentVrsTexture_);
+            cl5->RSSetShadingRateImage(texToBind);
             bindsCount_.fetch_add(1, std::memory_order_relaxed);
         } else {
             cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
@@ -744,7 +849,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     };
 
     if (numRenderTargetDescriptors == 0 || !pRenderTargetDescriptors) {
-        bindOrResetVrs(false);
+        bindOrResetVrs(false, false);
         return;
     }
 
@@ -759,12 +864,11 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         auto it = rtvMap_.find(rt0Handle.ptr);
         if (it == rtvMap_.end()) {
             rtvUnknownCount_.fetch_add(1, std::memory_order_relaxed);
-            bindOrResetVrs(false);
+            bindOrResetVrs(false, false);
             return;
         }
         rtPod = it->second;
 
-        // [F7] Verified MRT format collection: walks handle + i*rtvDescriptorSize_ when RTsSingleHandleToDescriptorRange==TRUE
         if (needDistinctLog) {
             const UINT mrtCount = (std::min)(numRenderTargetDescriptors, 8u);
             mrtFormatsStr = " mrt=" + std::to_string(numRenderTargetDescriptors) + " f=[";
@@ -798,24 +902,31 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         }
     }
 
+    // [Z1] Enable DOUBLEWIDE parity with D3D11; require sc=0 for DOUBLEWIDE
+    const float targetAspect = (eyeH > 0) ? (static_cast<float>(eyeW) / static_cast<float>(eyeH)) : 1.0f;
+    const float a2 = (rtPod.h > 0) ? ((static_cast<float>(rtPod.w) * 0.5f) / static_cast<float>(rtPod.h)) : 0.0f;
+    const bool isDwAspect = (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
+
     VrsFilterInput fIn{};
     fIn.rtW = rtPod.w;
     fIn.rtH = rtPod.h;
     fIn.rtArraySize = rtPod.arraySize;
     fIn.rtSamples = rtPod.samples;
     fIn.rtResourceFormat = rtPod.resourceFmt;
-    fIn.isExtraFormatAllowed = IsExtraFormatAllowed(rtPod.resourceFmt); // [F8]
+    fIn.isExtraFormatAllowed = IsExtraFormatAllowed(rtPod.resourceFmt);
     fIn.validViewDim = (rtPod.dim == 4u || rtPod.dim == 6u);
     fIn.rtvSlices = 1;
-    fIn.isExcludedSwapchain = false;
+    fIn.isExcludedSwapchain = isDwAspect ? rtPod.isSwapchain : false;
     fIn.hasDsv = hasValidDsv;
     fIn.dsvW = dsvPod.w;
     fIn.dsvH = dsvPod.h;
+    fIn.dsvArraySize = dsvPod.ArraySize;
     fIn.dsvArraySize = dsvPod.arraySize;
     fIn.dsvSamples = dsvPod.samples;
     fIn.targetEyeW = eyeW;
     fIn.targetEyeH = eyeH;
     fIn.allowArrayAndDoubleWide = false;
+    fIn.allowDoubleWideOnly = true; // [Z1]
 
     VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
@@ -853,9 +964,12 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
 
     if (fOut.accepted) {
         candidatesCount_.fetch_add(1, std::memory_order_relaxed);
+        if (fOut.doubleWide) {
+            dwCount_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
-    bindOrResetVrs(fOut.accepted);
+    bindOrResetVrs(fOut.accepted, fOut.doubleWide);
 }
 
 void VrsFoveatedD3D12::EndFrame() {
@@ -878,6 +992,7 @@ void VrsFoveatedD3D12::EndFrame() {
         const uint64_t omsrt = omsrtCount_.load(std::memory_order_relaxed);
         const uint64_t direct = directCount_.load(std::memory_order_relaxed);
         const uint64_t candidates = candidatesCount_.load(std::memory_order_relaxed);
+        const uint64_t dw = dwCount_.load(std::memory_order_relaxed); // [Z1]
         const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
         const uint64_t resets = resetsCount_.load(std::memory_order_relaxed);
         const uint64_t rtvUnk = rtvUnknownCount_.load(std::memory_order_relaxed);
@@ -918,6 +1033,7 @@ void VrsFoveatedD3D12::EndFrame() {
                    " omsrt=" + std::to_string(omsrt) +
                    " direct=" + std::to_string(direct) +
                    " candidates=" + std::to_string(candidates) +
+                   " dw=" + std::to_string(dw) +
                    " binds=" + std::to_string(binds) +
                    " resets=" + std::to_string(resets) +
                    " rtv_unknown=" + std::to_string(rtvUnk) +
@@ -937,7 +1053,6 @@ void VrsFoveatedD3D12::Shutdown(const char* reason) {
     LogMessage(LogLevel::Info, std::string("VRS12: Shutdown (reason=") + (reason ? reason : "DestroySession") + ")");
 }
 
-// [F9] Process detach fallback log when game exits without calling xrDestroySession / xrDestroyInstance
 void VrsFoveatedD3D12::ShutdownOnProcessDetach() {
     if (!capabilityChecked_) return;
     if (!shutdownLogged_.exchange(true, std::memory_order_relaxed)) {

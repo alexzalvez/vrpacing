@@ -15,7 +15,8 @@ struct UpscalingConfig {
 
 struct MaskConfig {
     bool enabled = true;
-    int openvrMode = 1;
+    int openvrMode = 2;  // [Z2] Release default: 2 (replaces only when original=EMPTY unless openvrForce!=0)
+    int openvrForce = 0; // [Z2] 0=passthrough when original=MESH, 1=force replace even when original=MESH
     float radiusX = 1.0f;
     float radiusY = 1.0f;
     float centerX = 0.0f;
@@ -32,10 +33,9 @@ struct FfrConfig {
     float outerRadius = 1.00f;
 };
 
-// [B8, F8] D3D12 VRS configuration
 struct Vrs12Config {
     int debugMode = 1;
-    std::string extraFormats = ""; // [F8] Comma-separated list of DXGI_FORMAT ints (default empty)
+    std::string extraFormats = "";
 };
 
 struct PacingConfig {

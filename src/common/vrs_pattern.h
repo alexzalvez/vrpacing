@@ -1,5 +1,5 @@
 #pragma once
-// [B5, C3, B8'] Shared pure ring pattern generator for D3D11 and D3D12 VRS.
+// [B5, C3, B8', Z1] Shared pure ring pattern generator for D3D11 and D3D12 VRS.
 
 #include <algorithm>
 #include <cmath>
@@ -19,7 +19,6 @@ enum class AbstractShadingRate : uint8_t {
     R4x4 = 4
 };
 
-// [B8'] Mode 2: all 1x1; Mode 3: middle ring 2x2, outer ring 4x4; Mode 0: normal (1x1, 2x1, 4x4)
 inline AbstractShadingRate DistanceToAbstractRate(float distance, int debugMode) {
     if (debugMode == 2) {
         return AbstractShadingRate::R1x1;
@@ -47,7 +46,6 @@ inline uint8_t AbstractRateToD3D11TableIndex(AbstractShadingRate r) {
     }
 }
 
-// D3D12_SHADING_RATE values: 1X1=0x0, 1X2=0x1, 2X1=0x4, 2X2=0x5, 4X4=0xA
 inline uint8_t AbstractRateToD3D12Byte(AbstractShadingRate r, bool additionalShadingRatesSupported) {
     switch (r) {
         case AbstractShadingRate::R1x1: return 0x0;
@@ -104,8 +102,6 @@ inline std::vector<uint8_t> CreateCenteredPatternD3D11(int tilesW, int tilesH, i
     return data;
 }
 
-// [C3] Top-left anchored pattern for D3D12 over-allocated capacity texture:
-// Pattern center = (eyeW/2, eyeH/2) in pixels; tiles beyond eyeW x eyeH receive outermost ring rate.
 inline std::vector<uint8_t> CreateTopLeftAnchoredPatternD3D12(
     uint32_t eyeW, uint32_t eyeH, uint32_t texTilesW, uint32_t texTilesH,
     uint32_t tileSize, int debugMode, bool additionalShadingRatesSupported) {
@@ -126,6 +122,45 @@ inline std::vector<uint8_t> CreateTopLeftAnchoredPatternD3D12(
                 data[static_cast<size_t>(ty) * texTilesW + tx] = outerByte;
             } else {
                 const float nx = (px - halfEyeW) / halfEyeW;
+                const float ny = (py - halfEyeH) / halfEyeH;
+                const float d = std::sqrt(nx * nx + ny * ny);
+                const AbstractShadingRate rate = DistanceToAbstractRate(d, debugMode);
+                data[static_cast<size_t>(ty) * texTilesW + tx] =
+                    AbstractRateToD3D12Byte(rate, additionalShadingRatesSupported);
+            }
+        }
+    }
+    return data;
+}
+
+// [Z1] Second pattern texture generator for D3D12 DOUBLEWIDE targets:
+// Capacity = ceil(2*eyeW*1.5) x ceil(eyeH*1.5), top-left anchored,
+// two foveal centers at (eyeW/2, eyeH/2) and (eyeW + eyeW/2, eyeH/2).
+// Tiles beyond (2*eyeW, eyeH) receive outermost ring rate.
+inline std::vector<uint8_t> CreateTopLeftAnchoredDoubleWidePatternD3D12(
+    uint32_t eyeW, uint32_t eyeH, uint32_t texTilesW, uint32_t texTilesH,
+    uint32_t tileSize, int debugMode, bool additionalShadingRatesSupported) {
+    std::vector<uint8_t> data(static_cast<size_t>(texTilesW) * static_cast<size_t>(texTilesH), 0);
+    if (eyeW == 0 || eyeH == 0 || texTilesW == 0 || texTilesH == 0 || tileSize == 0) {
+        return data;
+    }
+
+    const float fEyeW = static_cast<float>(eyeW);
+    const float fTwoEyeW = fEyeW * 2.0f;
+    const float fEyeH = static_cast<float>(eyeH);
+    const float halfEyeW = fEyeW * 0.5f;
+    const float halfEyeH = fEyeH * 0.5f;
+    const uint8_t outerByte = AbstractRateToD3D12Byte(DistanceToAbstractRate(2.0f, debugMode), additionalShadingRatesSupported);
+
+    for (uint32_t ty = 0; ty < texTilesH; ++ty) {
+        const float py = (static_cast<float>(ty) + 0.5f) * static_cast<float>(tileSize);
+        for (uint32_t tx = 0; tx < texTilesW; ++tx) {
+            const float px = (static_cast<float>(tx) + 0.5f) * static_cast<float>(tileSize);
+            if (px >= fTwoEyeW || py >= fEyeH) {
+                data[static_cast<size_t>(ty) * texTilesW + tx] = outerByte;
+            } else {
+                const float centerX = (px < fEyeW) ? halfEyeW : (fEyeW + halfEyeW);
+                const float nx = (px - centerX) / halfEyeW;
                 const float ny = (py - halfEyeH) / halfEyeH;
                 const float d = std::sqrt(nx * nx + ny * ny);
                 const AbstractShadingRate rate = DistanceToAbstractRate(d, debugMode);

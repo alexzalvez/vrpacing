@@ -40,6 +40,7 @@ void ToJson(json& j, const RuntimeConfig& cfg) {
         {"mask", {
             {"enabled", cfg.mask.enabled},
             {"openvrMode", cfg.mask.openvrMode},
+            {"openvrForce", cfg.mask.openvrForce},
             {"radiusX", cfg.mask.radiusX},
             {"radiusY", cfg.mask.radiusY},
             {"centerX", cfg.mask.centerX},
@@ -87,6 +88,13 @@ RuntimeConfig FromJson(const json& j) {
         const auto& m = j["mask"];
         cfg.mask.enabled = m.value("enabled", cfg.mask.enabled);
         cfg.mask.openvrMode = m.value("openvrMode", cfg.mask.openvrMode);
+        if (m.contains("openvrForce")) {
+            if (m["openvrForce"].is_boolean()) {
+                cfg.mask.openvrForce = m["openvrForce"].get<bool>() ? 1 : 0;
+            } else if (m["openvrForce"].is_number_integer()) {
+                cfg.mask.openvrForce = m["openvrForce"].get<int>();
+            }
+        }
         cfg.mask.radiusX = m.value("radiusX", cfg.mask.radiusX);
         cfg.mask.radiusY = m.value("radiusY", cfg.mask.radiusY);
         cfg.mask.centerX = m.value("centerX", cfg.mask.centerX);

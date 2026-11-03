@@ -61,7 +61,7 @@ using FnTableGetProjectionRawFn = void (__fastcall*)(vr::EVREye, float*, float*,
 
 struct VtableSlotRecord {
     uint32_t slot = 0;
-    int32_t projRawSlot = -1; // [F1] Per-version slot from kOpenVrSlotTable
+    int32_t projRawSlot = -1;
     void* target = nullptr;
     void* trampoline = nullptr;
     bool hamHasType = true;
@@ -83,16 +83,13 @@ HookSlotRegistry g_submitReg{};
 HookSlotRegistry g_hamReg{};
 
 void* g_fnTableHamTrampoline = nullptr;
-void* g_fnTableProjRawFn = nullptr; // [F1] FnTable GetProjectionRaw function pointer
+void* g_fnTableProjRawFn = nullptr;
 void* g_fnTableAssociatedCppIface = nullptr;
 int32_t g_fnTableProjRawSlot = -1;
 bool g_fnTableHamHasType = true;
 std::string g_fnTableVersionStr;
 
-// [F2] Latched to true if any SEH exception occurs inside HAM handler
 std::atomic<bool> g_hamLatchedPassthrough{ false };
-
-// [F4] Shared thread_local reentrancy depth counter across vtable and FnTable detours
 thread_local int g_hamReentrancyDepth = 0;
 
 std::unordered_set<std::string> g_loggedDiagInterfaces;
@@ -153,7 +150,12 @@ std::string PtrToHex(const void* ptr) {
     return std::string(buf);
 }
 
-// [F2] Pure C-frame SEH wrappers (no C++ objects with destructors in these frames)
+// [Z3] Check whether debug logging is explicitly enabled in config
+bool IsDebugLoggingEnabled() {
+    const std::string& lvl = g_cfg.logging.level;
+    return (lvl == "debug" || lvl == "DEBUG" || lvl == "Debug");
+}
+
 bool SehCallVtableGHAM(void* tramp, void* self, vr::HiddenAreaMesh_t* outMesh,
                        vr::EVREye eye, vr::EHiddenAreaMeshType type, bool hasType,
                        vr::HiddenAreaMesh_t** outRet, DWORD* outCode) noexcept {
@@ -221,7 +223,6 @@ void LogSehAndLatchPassthrough(const char* fnName, DWORD code) {
     LogMessage(LogLevel::Error, buf);
 }
 
-// [F5] Empty-mesh detection: tris == 0 or all vertices of every triangle are identical (eps 1e-6)
 bool IsOriginalMeshEmpty(const vr::HiddenAreaMesh_t* mesh, vr::EHiddenAreaMeshType type) {
     if (!mesh || !mesh->pVertexData || mesh->unTriangleCount == 0) {
         return true;
@@ -432,11 +433,14 @@ void EnsureInit() {
         g_cfg.upscaling.sharpness = 0.0f;
         g_cfg.pacing.enabled = true;
         g_limiter.Initialize();
-        LogMessage(LogLevel::Info, "OpenVR Hook initialized (mask.openvrMode=" + std::to_string(g_cfg.mask.openvrMode) + ").");
+        LogMessage(LogLevel::Info, "OpenVR Hook initialized (mask.openvrMode=" +
+                   std::to_string(g_cfg.mask.openvrMode) + ", mask.openvrForce=" +
+                   std::to_string(g_cfg.mask.openvrForce) + ").");
     });
 }
 
-// [F1-F6] Shared HAM handler with SEH guards, LineLoop-first probe ordering, empty detection, and slot-table GetProjectionRaw
+// [Z2, Z3] Release defaults: LineLoop probe/dump only when debug logging is enabled;
+// mode=2 replaces ONLY when original=EMPTY unless mask.openvrForce != 0.
 template <typename CallOrigFn>
 vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
     void* cppSelf,
@@ -469,7 +473,6 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         return passthroughRes;
     }
 
-    // [F1] If version's projRawSlot is unknown (< 0) and no FnTable projRaw is available, fall back to passthrough
     if (projRawSlot < 0 && !fnTableProjRaw) {
         LogMessage(LogLevel::Warn, "OpenVR HAM: unknown GetProjectionRaw slot for [" + versionStr + "], falling back to passthrough");
         vr::HiddenAreaMesh_t* passthroughRes = ret;
@@ -490,8 +493,9 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         maskKind = VisibilityMaskKind::LineLoop;
     }
 
-    // [F3] Probe LineLoop (type=2) FIRST while dumps < 2, BEFORE calling original for the requested type
-    const bool wantSmallDump = (g_hamSmallTrisDumpCount.load(std::memory_order_relaxed) < 2);
+    // [Z3] LineLoop probe and vertex dump only when debug logging is enabled
+    const bool debugLog = IsDebugLoggingEnabled();
+    const bool wantSmallDump = debugLog && (g_hamSmallTrisDumpCount.load(std::memory_order_relaxed) < 2);
     vr::HiddenAreaMesh_t loopMesh{};
     bool loopProbedOk = false;
     if (wantSmallDump && hamHasType && effectiveType != vr::k_eHiddenAreaMesh_LineLoop) {
@@ -520,12 +524,14 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         }
     }
 
-    // [F3] Now call original for the requested type (safe even if runtime reuses one static vertex buffer)
+    // [Z3] Single call to the original per HAM request in release
     vr::HiddenAreaMesh_t* origRes = ret;
     if (!callOrigSeh(ret, effectiveType, &origRes, &sehCode)) {
         LogSehAndLatchPassthrough("original GHAM", sehCode);
         return ret;
     }
+
+    const bool isEmpty = IsOriginalMeshEmpty(origRes, effectiveType);
 
     {
         std::lock_guard<std::mutex> lock(g_hamMutex);
@@ -549,11 +555,8 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         }
 
         if (firstForPair) {
-            // [F5] Classify original mesh as EMPTY or MESH
-            const bool isEmpty = IsOriginalMeshEmpty(origRes, effectiveType);
             LogMessage(LogLevel::Info, std::string("OpenVR HAM original=") + (isEmpty ? "EMPTY" : "MESH"));
 
-            // [F6] Updated bbox label to bbox[minX,minY,maxX,maxY]=
             char bboxBuf[128]{};
             std::snprintf(bboxBuf, sizeof(bboxBuf), "[%.4f,%.4f,%.4f,%.4f]", u0, v0, u1, v1);
             LogMessage(LogLevel::Info, "OpenVR HAM [" + versionStr + "] eye=" + std::to_string(eyeIdx) +
@@ -561,7 +564,7 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
                        " tris=" + std::to_string(tris) + " bbox[minX,minY,maxX,maxY]=" + std::string(bboxBuf));
         }
 
-        if (origRes && origRes->pVertexData && tris <= 4) {
+        if (debugLog && origRes && origRes->pVertexData && tris <= 4) {
             const int dumpIdx = g_hamSmallTrisDumpCount.fetch_add(1, std::memory_order_relaxed) + 1;
             if (dumpIdx <= 2) {
                 if (loopProbedOk) {
@@ -587,7 +590,17 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         return origRes;
     }
 
-    // Mode 2: Replace in both EMPTY and MESH cases using verified GetProjectionRaw slot (slot 2)
+    // [Z2] In mode=2, replace ONLY when original=EMPTY unless mask.openvrForce != 0
+    if (!isEmpty && g_cfg.mask.openvrForce == 0) {
+        std::lock_guard<std::mutex> lock(g_hamMutex);
+        if (!g_hamReplaceLogged[eyeIdx][typeIdx]) {
+            g_hamReplaceLogged[eyeIdx][typeIdx] = true;
+            LogMessage(LogLevel::Info, "OpenVR HAM passthrough (original=MESH, openvrForce=0) eye=" +
+                       std::to_string(eyeIdx) + " type=" + std::to_string(static_cast<int>(effectiveType)));
+        }
+        return origRes;
+    }
+
     std::lock_guard<std::mutex> lock(g_hamMutex);
     if (!g_hamCache.built[eyeIdx][typeIdx]) {
         float l = -1.0f, r = 1.0f, t = -1.0f, b = 1.0f;
@@ -641,7 +654,6 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
 
     const vr::EHiddenAreaMeshType effectiveType = rec.hamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
 
-    // [F4] Shared thread_local reentrancy guard: if depth > 0, call trampoline directly with no logging/replacement
     if (g_hamReentrancyDepth > 0) {
         vr::HiddenAreaMesh_t* directRet = ret;
         DWORD dummyCode = 0;
@@ -675,7 +687,6 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_FnTable_GetHiddenAreaMesh(vr::HiddenArea
 
     const vr::EHiddenAreaMeshType effectiveType = g_fnTableHamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
 
-    // [F4] Shared thread_local reentrancy guard
     if (g_hamReentrancyDepth > 0) {
         vr::HiddenAreaMesh_t* directRet = ret;
         DWORD dummyCode = 0;

@@ -31,7 +31,7 @@ public:
     void RecordVisibilityMaskCall();
     void EndFrame();
     void Shutdown(const char* reason = "DestroySession");
-    void ShutdownOnProcessDetach(); // [F9] Fallback log when process exits without xrDestroySession
+    void ShutdownOnProcessDetach();
 
     void OnCreateRenderTargetView(ID3D12Device* dev,
                                   ID3D12Resource* pResource,
@@ -112,7 +112,6 @@ private:
     std::unordered_set<ID3D12Resource*> swapchainTextures_;
     std::unordered_map<void**, CmdList5VtableEntry> cmdList5VtblCache_;
 
-    // [F8] Lock-free fixed array of extra allowed formats populated at init
     DXGI_FORMAT extraFormats_[16]{};
     std::atomic<uint32_t> extraFormatsCount_{ 0 };
 
@@ -126,7 +125,7 @@ private:
 
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
-    std::atomic<bool> shutdownLogged_{ false }; // [F9]
+    std::atomic<bool> shutdownLogged_{ false };
     std::atomic<int> debugMode_{ 1 };
     std::atomic<uint32_t> targetEyeW_{ 0 };
     std::atomic<uint32_t> targetEyeH_{ 0 };
@@ -134,6 +133,10 @@ private:
     std::atomic<uint32_t> capPixelsH_{ 0 };
     std::atomic<uint32_t> texTilesW_{ 0 };
     std::atomic<uint32_t> texTilesH_{ 0 };
+    std::atomic<uint32_t> capDwPixelsW_{ 0 }; // [Z1] DoubleWide capacity
+    std::atomic<uint32_t> capDwPixelsH_{ 0 };
+    std::atomic<uint32_t> texDwTilesW_{ 0 };
+    std::atomic<uint32_t> texDwTilesH_{ 0 };
     std::atomic<size_t> distinctRtLogCount_{ 0 };
     std::atomic<bool> deviceRemovedLogged_{ false };
 
@@ -148,6 +151,7 @@ private:
     HANDLE fenceEvent_ = nullptr;
     uint64_t fenceValue_ = 0;
     ID3D12Resource* currentVrsTexture_ = nullptr;
+    ID3D12Resource* currentVrsTextureDw_ = nullptr; // [Z1] Second pattern texture for DOUBLEWIDE
     std::vector<ID3D12Resource*> leakedResources_;
 
     std::unordered_set<size_t> loggedDistinctRtHandles_;
@@ -157,6 +161,7 @@ private:
     std::atomic<uint64_t> omsrtCount_{ 0 };
     std::atomic<uint64_t> directCount_{ 0 };
     std::atomic<uint64_t> candidatesCount_{ 0 };
+    std::atomic<uint64_t> dwCount_{ 0 }; // [Z1] DOUBLEWIDE candidate count
     std::atomic<uint64_t> bindsCount_{ 0 };
     std::atomic<uint64_t> resetsCount_{ 0 };
     std::atomic<uint64_t> rtvUnknownCount_{ 0 };

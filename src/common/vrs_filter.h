@@ -1,5 +1,5 @@
 #pragma once
-// [B4, F8] Shared pure candidate filter for D3D11 and D3D12 VRS.
+// [B4, F8, Z1] Shared pure candidate filter for D3D11 and D3D12 VRS.
 
 #include <dxgiformat.h>
 #include <cmath>
@@ -40,7 +40,7 @@ struct VrsFilterInput {
     uint32_t rtArraySize = 0;
     uint32_t rtSamples = 0;
     DXGI_FORMAT rtResourceFormat = DXGI_FORMAT_UNKNOWN;
-    bool isExtraFormatAllowed = false; // [F8] Optional extra formats list
+    bool isExtraFormatAllowed = false;
     bool validViewDim = false;
     uint32_t rtvSlices = 1;
     bool isExcludedSwapchain = false;
@@ -54,6 +54,7 @@ struct VrsFilterInput {
     uint32_t targetEyeW = 0;
     uint32_t targetEyeH = 0;
     bool allowArrayAndDoubleWide = true;
+    bool allowDoubleWideOnly = false; // [Z1] Enable DOUBLEWIDE (arraySize==1) in D3D12
 };
 
 struct VrsFilterOutput {
@@ -85,7 +86,8 @@ inline VrsFilterOutput EvaluateVrsCandidate(const VrsFilterInput& in) {
 
     const float a1 = static_cast<float>(in.rtW) / static_cast<float>(in.rtH);
     const float a2 = (static_cast<float>(in.rtW) * 0.5f) / static_cast<float>(in.rtH);
-    const bool doubleWide = in.allowArrayAndDoubleWide && (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
+    const bool allowDw = in.allowArrayAndDoubleWide || in.allowDoubleWideOnly; // [Z1]
+    const bool doubleWide = allowDw && (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
     const bool single = !doubleWide && (std::abs(a1 - targetAspect) <= kVrsAspectTolerance);
 
     if (!doubleWide && !single) {
@@ -105,7 +107,6 @@ inline VrsFilterOutput EvaluateVrsCandidate(const VrsFilterInput& in) {
         return out;
     }
 
-    // [F8] Check standard whitelist or extraFormats
     if (!IsWhitelistedVrsColorFormat(in.rtResourceFormat) && !in.isExtraFormatAllowed) {
         out.label = "REJECT_FORMAT";
         return out;
