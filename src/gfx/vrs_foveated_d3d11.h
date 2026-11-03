@@ -31,7 +31,8 @@ public:
                       bool enabled,
                       uint32_t eyeWidth,
                       uint32_t eyeHeight,
-                      int debugMode = 0);
+                      int debugMode = 0,
+                      bool debugLogging = false);
 
     void UpdateTarget(ID3D11Device* dev,
                       ID3D11DeviceContext* ctx,
@@ -40,8 +41,9 @@ public:
                       uint32_t eyeHeight,
                       VrsTextureMode /*mode*/,
                       float /*p0x*/ = 0.5f, float /*p0y*/ = 0.5f,
-                      float /*p1x*/ = 0.5f, float /*p1y*/ = 0.5f) {
-        UpdateTarget(dev, ctx, enabled, eyeWidth, eyeHeight, 0);
+                      float /*p1x*/ = 0.5f, float /*p1y*/ = 0.5f,
+                      bool debugLogging = false) {
+        UpdateTarget(dev, ctx, enabled, eyeWidth, eyeHeight, 0, debugLogging);
     }
 
     void RegisterExcludedTexture(ID3D11Texture2D* tex);
@@ -136,6 +138,7 @@ private:
     void LogNvapiFailureRateLimited(const char* opName, NvAPI_Status status);
 
     std::mutex mutex_;
+    std::atomic<bool> debugLogging_{ false };
     std::atomic<bool> fastEnabled_{ false };
     std::atomic<bool> fastBound_{ false };
 

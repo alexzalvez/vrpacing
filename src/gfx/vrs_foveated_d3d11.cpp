@@ -340,7 +340,9 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
                                     bool enabled,
                                     uint32_t eyeWidth,
                                     uint32_t eyeHeight,
-                                    int debugMode) {
+                                    int debugMode,
+                                    bool debugLogging) {
+    debugLogging_.store(debugLogging, std::memory_order_relaxed);
     if (!enabled && !fastEnabled_.load(std::memory_order_relaxed)) {
         return;
     }
@@ -382,7 +384,7 @@ void VrsFoveatedD3D11::EndFrame() {
     }
 
     const uint64_t frames = framesCount_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frames % 900 == 0) {
+    if (frames % 900 == 0 && debugLogging_.load(std::memory_order_relaxed)) {
         const uint64_t candidates = candidateBinds_.load(std::memory_order_relaxed);
         const uint64_t nvbinds = actualNvapiBinds_.load(std::memory_order_relaxed);
         const uint64_t enables = enableCount_.load(std::memory_order_relaxed);
@@ -494,7 +496,9 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(res.As(&tex)) || !tex) {
-        LogUniqueRenderTargetLocked(0, 0, 0, DXGI_FORMAT_UNKNOWN, rtvDesc.Format, 0, rtvDesc.ViewDimension, (pDepthStencilView != nullptr), "REJECT_DIM");
+        if (debugLogging_.load(std::memory_order_relaxed)) {
+            LogUniqueRenderTargetLocked(0, 0, 0, DXGI_FORMAT_UNKNOWN, rtvDesc.Format, 0, rtvDesc.ViewDimension, (pDepthStencilView != nullptr), "REJECT_DIM");
+        }
         DisableVRSLocked(ctx, false);
         return;
     }
@@ -557,8 +561,10 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
-    LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
-                                td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, fOut.label);
+    if (debugLogging_.load(std::memory_order_relaxed)) {
+        LogUniqueRenderTargetLocked(td.Width, td.Height, td.ArraySize, td.Format, rtvDesc.Format,
+                                    td.SampleDesc.Count, rtvDesc.ViewDimension, hasDsv, fOut.label);
+    }
 
     if (!fOut.accepted) {
         DisableVRSLocked(ctx, false);
@@ -567,9 +573,11 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
 
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
 
-    const RtHistogramKey histKey{ td.Width, td.Height, static_cast<uint32_t>(td.Format), td.SampleDesc.Count, td.ArraySize };
-    if (rtHistogram_.size() < kMaxHistogramEntries || rtHistogram_.find(histKey) != rtHistogram_.end()) {
-        rtHistogram_[histKey]++;
+    if (debugLogging_.load(std::memory_order_relaxed)) {
+        const RtHistogramKey histKey{ td.Width, td.Height, static_cast<uint32_t>(td.Format), td.SampleDesc.Count, td.ArraySize };
+        if (rtHistogram_.size() < kMaxHistogramEntries || rtHistogram_.find(histKey) != rtHistogram_.end()) {
+            rtHistogram_[histKey]++;
+        }
     }
 
     if (debugMode_ == 1) {
