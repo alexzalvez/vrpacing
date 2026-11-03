@@ -920,7 +920,6 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     fIn.hasDsv = hasValidDsv;
     fIn.dsvW = dsvPod.w;
     fIn.dsvH = dsvPod.h;
-    fIn.dsvArraySize = dsvPod.ArraySize;
     fIn.dsvArraySize = dsvPod.arraySize;
     fIn.dsvSamples = dsvPod.samples;
     fIn.targetEyeW = eyeW;
