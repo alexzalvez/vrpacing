@@ -26,15 +26,15 @@ struct MaskConfig {
 };
 
 struct FfrConfig {
-    bool enabled = false;
-    bool openxrEnabled = false;
+    bool enabled = true;
+    bool openxrEnabled = true;
     float innerRadius = 0.60f;
     int debugMode = 0;
     float outerRadius = 1.00f;
 };
 
 struct Vrs12Config {
-    int debugMode = 1;
+    int debugMode = 0;
     std::string extraFormats = "";
 };
 

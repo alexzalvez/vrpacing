@@ -105,7 +105,8 @@ RuntimeConfig FromJson(const json& j) {
     if (j.contains("ffr")) {
         const auto& f = j["ffr"];
         cfg.ffr.enabled = f.value("enabled", cfg.ffr.enabled);
-        cfg.ffr.openxrEnabled = f.value("openxrEnabled", cfg.ffr.openxrEnabled);
+        cfg.ffr.openxrEnabled = f.value("openxrEnabled", cfg.ffr.enabled);
+        cfg.ffr.openxrEnabled = cfg.ffr.enabled;
         cfg.ffr.innerRadius = f.value("innerRadius", cfg.ffr.innerRadius);
         cfg.ffr.outerRadius = f.value("outerRadius", cfg.ffr.outerRadius);
         cfg.ffr.debugMode = f.value("debugMode", cfg.ffr.debugMode);
