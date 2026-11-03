@@ -8,12 +8,13 @@
 #endif
 
 #include "gfx/vrs_foveated_d3d12.h"
+#include "gfx/vrs_foveated_d3d11.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,14 @@ namespace vrpacing {
 
 namespace {
 
-thread_local bool g_inVrs12Hook = false;
+constexpr uint32_t kSlot_Device_CreateRenderTargetView = 20;
+constexpr uint32_t kSlot_Device_CreateDepthStencilView = 21;
+constexpr uint32_t kSlot_CmdList_OMSetRenderTargets    = 46;
+constexpr uint32_t kSlot_CmdList4_BeginRenderPass      = 68;
+
+constexpr double kVrsMaxScale = 1.5;
+
+thread_local bool g_inVrsHook12 = false;
 
 using CreateRtvFn = void(STDMETHODCALLTYPE*)(
     ID3D12Device*,
@@ -69,10 +77,12 @@ void STDMETHODCALLTYPE Hooked_CreateRenderTargetView(
     if (g_origCreateRtv) {
         g_origCreateRtv(self, pResource, pDesc, DestDescriptor);
     }
-    if (g_inVrs12Hook) return;
-    g_inVrs12Hook = true;
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook12 || VrsFoveatedD3D11::IsSuppressed()) {
+        return;
+    }
+    g_inVrsHook12 = true;
     VrsFoveatedD3D12::Instance().OnCreateRenderTargetView(self, pResource, pDesc, DestDescriptor);
-    g_inVrs12Hook = false;
+    g_inVrsHook12 = false;
 }
 
 void STDMETHODCALLTYPE Hooked_CreateDepthStencilView(
@@ -83,10 +93,12 @@ void STDMETHODCALLTYPE Hooked_CreateDepthStencilView(
     if (g_origCreateDsv) {
         g_origCreateDsv(self, pResource, pDesc, DestDescriptor);
     }
-    if (g_inVrs12Hook) return;
-    g_inVrs12Hook = true;
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook12 || VrsFoveatedD3D11::IsSuppressed()) {
+        return;
+    }
+    g_inVrsHook12 = true;
     VrsFoveatedD3D12::Instance().OnCreateDepthStencilView(self, pResource, pDesc, DestDescriptor);
-    g_inVrs12Hook = false;
+    g_inVrsHook12 = false;
 }
 
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
@@ -99,13 +111,14 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
         g_origOMSetRenderTargets(self, NumRenderTargetDescriptors, pRenderTargetDescriptors,
                                  RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
     }
-    if (g_inVrs12Hook) return;
-    g_inVrs12Hook = true;
-    VrsFoveatedD3D12::Instance().OnPostOMSetRenderTargets(self, NumRenderTargetDescriptors,
-                                                          pRenderTargetDescriptors,
-                                                          RTsSingleHandleToDescriptorRange,
-                                                          pDepthStencilDescriptor);
-    g_inVrs12Hook = false;
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook12 || VrsFoveatedD3D11::IsSuppressed()) {
+        return;
+    }
+    g_inVrsHook12 = true;
+    VrsFoveatedD3D12::Instance().OnPostOMSetRenderTargets(
+        self, NumRenderTargetDescriptors, pRenderTargetDescriptors,
+        RTsSingleHandleToDescriptorRange, pDepthStencilDescriptor);
+    g_inVrsHook12 = false;
 }
 
 void STDMETHODCALLTYPE Hooked_BeginRenderPass(
@@ -117,35 +130,54 @@ void STDMETHODCALLTYPE Hooked_BeginRenderPass(
     if (g_origBeginRenderPass) {
         g_origBeginRenderPass(self, NumRenderTargets, pRenderTargets, pDepthStencil, Flags);
     }
-    if (g_inVrs12Hook) return;
-    g_inVrs12Hook = true;
+    if (g_vrsDetaching.load(std::memory_order_relaxed) || g_inVrsHook12 || VrsFoveatedD3D11::IsSuppressed()) {
+        return;
+    }
+    g_inVrsHook12 = true;
     VrsFoveatedD3D12::Instance().OnBeginRenderPass();
-    g_inVrs12Hook = false;
+    g_inVrsHook12 = false;
+}
+
+uint32_t MapRtvDimension(D3D12_RTV_DIMENSION dim) {
+    switch (dim) {
+        case D3D12_RTV_DIMENSION_TEXTURE2D: return 4u;
+        case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: return 5u;
+        case D3D12_RTV_DIMENSION_TEXTURE2DMS: return 6u;
+        case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY: return 7u;
+        default: return static_cast<uint32_t>(dim);
+    }
+}
+
+uint32_t MapDsvDimension(D3D12_DSV_DIMENSION dim) {
+    switch (dim) {
+        case D3D12_DSV_DIMENSION_TEXTURE2D: return 4u;
+        case D3D12_DSV_DIMENSION_TEXTURE2DARRAY: return 5u;
+        case D3D12_DSV_DIMENSION_TEXTURE2DMS: return 6u;
+        case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: return 7u;
+        default: return static_cast<uint32_t>(dim);
+    }
 }
 
 } // namespace
 
 VrsFoveatedD3D12& VrsFoveatedD3D12::Instance() {
-    static VrsFoveatedD3D12* s_instance = new VrsFoveatedD3D12();
-    return *s_instance;
+    static VrsFoveatedD3D12* s_inst = new VrsFoveatedD3D12();
+    return *s_inst;
 }
 
 void VrsFoveatedD3D12::ParseExtraFormatsCsv(const std::string& csv) {
     extraAllowedFormats_.clear();
     if (csv.empty()) return;
-
-    std::stringstream ss(csv);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        item.erase(0, item.find_first_not_of(" \t\r\n"));
-        item.erase(item.find_last_not_of(" \t\r\n") + 1);
-        if (item.empty()) continue;
-
-        try {
-            uint32_t fmtVal = static_cast<uint32_t>(std::stoul(item, nullptr, 0));
-            extraAllowedFormats_.insert(fmtVal);
-        } catch (...) {
+    const char* p = csv.c_str();
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (!*p) break;
+        char* end = nullptr;
+        unsigned long val = std::strtoul(p, &end, 0);
+        if (end != p && val > 0 && val < 200) {
+            extraAllowedFormats_.insert(static_cast<uint32_t>(val));
         }
+        p = end ? end : (p + 1);
     }
 }
 
@@ -158,7 +190,10 @@ bool VrsFoveatedD3D12::QueryTier2SupportLocked(ID3D12Device* dev) {
     if (capabilityChecked_) return tier2Supported_;
     capabilityChecked_ = true;
 
-    if (!dev) return false;
+    if (!dev) {
+        tier2Supported_ = false;
+        return false;
+    }
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
     HRESULT hr = dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6));
@@ -181,7 +216,7 @@ bool VrsFoveatedD3D12::QueryTier2SupportLocked(ID3D12Device* dev) {
 }
 
 void VrsFoveatedD3D12::InstallDeviceHooksLocked(ID3D12Device* dev) {
-    if (hooksInstalled_ || !dev) return;
+    if (!dev) return;
 
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
@@ -195,22 +230,24 @@ void VrsFoveatedD3D12::InstallDeviceHooksLocked(ID3D12Device* dev) {
     bool okRtv = false;
     bool okDsv = false;
 
-    if (vtbl[15]) {
-        MH_STATUS s = MH_CreateHook(vtbl[15], reinterpret_cast<void*>(&Hooked_CreateRenderTargetView),
+    if (vtbl[kSlot_Device_CreateRenderTargetView]) {
+        MH_STATUS s = MH_CreateHook(vtbl[kSlot_Device_CreateRenderTargetView],
+                                    reinterpret_cast<void*>(&Hooked_CreateRenderTargetView),
                                     reinterpret_cast<void**>(&g_origCreateRtv));
         if (s == MH_OK || s == MH_ERROR_ALREADY_CREATED) {
-            s = MH_EnableHook(vtbl[15]);
+            s = MH_EnableHook(vtbl[kSlot_Device_CreateRenderTargetView]);
             if (s == MH_OK || s == MH_ERROR_ENABLED) {
                 okRtv = true;
             }
         }
     }
 
-    if (vtbl[17]) {
-        MH_STATUS s = MH_CreateHook(vtbl[17], reinterpret_cast<void*>(&Hooked_CreateDepthStencilView),
+    if (vtbl[kSlot_Device_CreateDepthStencilView]) {
+        MH_STATUS s = MH_CreateHook(vtbl[kSlot_Device_CreateDepthStencilView],
+                                    reinterpret_cast<void*>(&Hooked_CreateDepthStencilView),
                                     reinterpret_cast<void**>(&g_origCreateDsv));
         if (s == MH_OK || s == MH_ERROR_ALREADY_CREATED) {
-            s = MH_EnableHook(vtbl[17]);
+            s = MH_EnableHook(vtbl[kSlot_Device_CreateDepthStencilView]);
             if (s == MH_OK || s == MH_ERROR_ENABLED) {
                 okDsv = true;
             }
@@ -233,11 +270,12 @@ void VrsFoveatedD3D12::InstallCommandListHooksLocked(ID3D12GraphicsCommandList* 
     if (!vtbl) return;
 
     bool okOmsrt = false;
-    if (vtbl[46]) {
-        MH_STATUS s = MH_CreateHook(vtbl[46], reinterpret_cast<void*>(&Hooked_OMSetRenderTargets),
+    if (vtbl[kSlot_CmdList_OMSetRenderTargets]) {
+        MH_STATUS s = MH_CreateHook(vtbl[kSlot_CmdList_OMSetRenderTargets],
+                                    reinterpret_cast<void*>(&Hooked_OMSetRenderTargets),
                                     reinterpret_cast<void**>(&g_origOMSetRenderTargets));
         if (s == MH_OK || s == MH_ERROR_ALREADY_CREATED) {
-            s = MH_EnableHook(vtbl[46]);
+            s = MH_EnableHook(vtbl[kSlot_CmdList_OMSetRenderTargets]);
             if (s == MH_OK || s == MH_ERROR_ENABLED) {
                 okOmsrt = true;
             }
@@ -248,11 +286,12 @@ void VrsFoveatedD3D12::InstallCommandListHooksLocked(ID3D12GraphicsCommandList* 
     bool okRp = false;
     if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(&cmdList4))) && cmdList4) {
         void** vtbl4 = *reinterpret_cast<void***>(cmdList4.Get());
-        if (vtbl4 && vtbl4[62]) {
-            MH_STATUS s = MH_CreateHook(vtbl4[62], reinterpret_cast<void*>(&Hooked_BeginRenderPass),
+        if (vtbl4 && vtbl4[kSlot_CmdList4_BeginRenderPass]) {
+            MH_STATUS s = MH_CreateHook(vtbl4[kSlot_CmdList4_BeginRenderPass],
+                                        reinterpret_cast<void*>(&Hooked_BeginRenderPass),
                                         reinterpret_cast<void**>(&g_origBeginRenderPass));
             if (s == MH_OK || s == MH_ERROR_ALREADY_CREATED) {
-                s = MH_EnableHook(vtbl4[62]);
+                s = MH_EnableHook(vtbl4[kSlot_CmdList4_BeginRenderPass]);
                 if (s == MH_OK || s == MH_ERROR_ENABLED) {
                     okRp = true;
                 }
@@ -355,178 +394,236 @@ void VrsFoveatedD3D12::ReleasePatternResourcesLocked() {
     builtMode_ = -1;
 }
 
-bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuseExisting) {
-    if (!device_ || eyeW == 0 || eyeH == 0) return false;
-
-    const uint32_t tile = tileSize_ ? tileSize_ : 16;
-    const uint32_t tilesW = (std::max)(1u, (eyeW + tile - 1) / tile);
-    const uint32_t tilesH = (std::max)(1u, (eyeH + tile - 1) / tile);
-    const uint32_t capW = tilesW * tile;
-    const uint32_t capH = tilesH * tile;
-
-    // [Z1] DoubleWide pattern texture dimensions
-    const uint32_t dwEyeW = eyeW * 2u;
-    const uint32_t tilesDwW = (std::max)(1u, (dwEyeW + tile - 1) / tile);
-    const uint32_t tilesDwH = tilesH;
-    const uint32_t capDwW = tilesDwW * tile;
-    const uint32_t capDwH = capH;
-
-    if (!uploadQueue_) {
-        D3D12_COMMAND_QUEUE_DESC qDesc{};
-        qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-        qDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        HRESULT hr = device_->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&uploadQueue_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateCommandQueue failed HR=" + std::to_string(hr));
-            return false;
-        }
-
-        hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&uploadAlloc_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateCommandAllocator failed HR=" + std::to_string(hr));
-            return false;
-        }
-
-        hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, uploadAlloc_, nullptr, IID_PPV_ARGS(&uploadList_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateCommandList failed HR=" + std::to_string(hr));
-            return false;
-        }
-        uploadList_->Close();
-
-        hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateFence failed HR=" + std::to_string(hr));
-            return false;
-        }
-        fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+bool VrsFoveatedD3D12::EnsureUploadObjectsLocked() {
+    if (!device_) return false;
+    if (uploadQueue_ && uploadAlloc_ && uploadList_ && uploadFence_ && fenceEvent_) {
+        return true;
     }
 
-    if (!reuseExisting || !currentVrsTexture_ || !currentVrsTextureDw_) {
-        if (currentVrsTexture_) {
-            currentVrsTexture_->Release();
-            currentVrsTexture_ = nullptr;
-        }
-        if (currentVrsTextureDw_) {
-            currentVrsTextureDw_->Release();
-            currentVrsTextureDw_ = nullptr;
-        }
+    D3D12_COMMAND_QUEUE_DESC qDesc{};
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    qDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    qDesc.NodeMask = 0;
 
-        D3D12_HEAP_PROPERTIES heapDefault{};
-        heapDefault.Type = D3D12_HEAP_TYPE_DEFAULT;
+    HRESULT hr = device_->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&uploadQueue_));
+    if (FAILED(hr) || !uploadQueue_) {
+        LogMessage(LogLevel::Error, "VRS12: Failed to create upload command queue. HR=" + std::to_string(hr));
+        return false;
+    }
 
-        D3D12_RESOURCE_DESC rDesc{};
-        rDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rDesc.Width = tilesW;
-        rDesc.Height = tilesH;
-        rDesc.DepthOrArraySize = 1;
-        rDesc.MipLevels = 1;
-        rDesc.Format = DXGI_FORMAT_R8_UINT;
-        rDesc.SampleDesc.Count = 1;
-        rDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        rDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SHADING_RATE;
+    hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&uploadAlloc_));
+    if (FAILED(hr) || !uploadAlloc_) {
+        LogMessage(LogLevel::Error, "VRS12: Failed to create upload command allocator. HR=" + std::to_string(hr));
+        return false;
+    }
 
+    hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, uploadAlloc_, nullptr, IID_PPV_ARGS(&uploadList_));
+    if (FAILED(hr) || !uploadList_) {
+        LogMessage(LogLevel::Error, "VRS12: Failed to create upload command list. HR=" + std::to_string(hr));
+        return false;
+    }
+    uploadList_->Close();
+
+    hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence_));
+    if (FAILED(hr) || !uploadFence_) {
+        LogMessage(LogLevel::Error, "VRS12: Failed to create upload fence. HR=" + std::to_string(hr));
+        return false;
+    }
+
+    fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fenceEvent_) {
+        LogMessage(LogLevel::Error, "VRS12: Failed to create upload fence event.");
+        return false;
+    }
+
+    fenceValue_ = 0;
+    return true;
+}
+
+bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace) {
+    if (!EnsureUploadObjectsLocked() || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
+
+    uint32_t capW = capPixelsW_.load(std::memory_order_relaxed);
+    uint32_t capH = capPixelsH_.load(std::memory_order_relaxed);
+    uint32_t tilesW = texTilesW_.load(std::memory_order_relaxed);
+    uint32_t tilesH = texTilesH_.load(std::memory_order_relaxed);
+
+    uint32_t capDwW = capDwPixelsW_.load(std::memory_order_relaxed);
+    uint32_t capDwH = capDwPixelsH_.load(std::memory_order_relaxed);
+    uint32_t tilesDwW = texDwTilesW_.load(std::memory_order_relaxed);
+    uint32_t tilesDwH = texDwTilesH_.load(std::memory_order_relaxed);
+
+    ID3D12Resource* targetTex = currentVrsTexture_;
+    ID3D12Resource* targetTexDw = currentVrsTextureDw_;
+    const bool needNewAllocation = (!reuploadInPlace || !targetTex || !targetTexDw ||
+                                    eyeW > capW || eyeH > capH || (eyeW * 2u) > capDwW || eyeH > capDwH);
+
+    if (needNewAllocation) {
+        capW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * static_cast<double>(kVrsMaxScale)));
+        capH = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeH) * static_cast<double>(kVrsMaxScale)));
+        tilesW = (std::max)(1u, (capW + tileSize_ - 1) / tileSize_);
+        tilesH = (std::max)(1u, (capH + tileSize_ - 1) / tileSize_);
+
+        // [Z1] DoubleWide capacity: ceil(2 * eyeW * 1.5) x ceil(eyeH * 1.5)
+        capDwW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * 2.0 * static_cast<double>(kVrsMaxScale)));
+        capDwH = capH;
+        tilesDwW = (std::max)(1u, (capDwW + tileSize_ - 1) / tileSize_);
+        tilesDwH = tilesH;
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        defaultHeap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        defaultHeap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        defaultHeap.CreationNodeMask = 1;
+        defaultHeap.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC texDesc{};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Alignment = 0;
+        texDesc.Width = tilesW;
+        texDesc.Height = tilesH;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R8_UINT;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.SampleDesc.Quality = 0;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        ID3D12Resource* newTex = nullptr;
         HRESULT hr = device_->CreateCommittedResource(
-            &heapDefault, D3D12_HEAP_FLAG_NONE, &rDesc,
-            D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&currentVrsTexture_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateCommittedResource(SingleEye) failed HR=" + std::to_string(hr));
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newTex));
+        if (FAILED(hr) || !newTex) {
+            LogMessage(LogLevel::Error, "VRS12: Failed to create R8_UINT VRS texture. HR=" + std::to_string(hr));
             return false;
         }
 
-        // [Z1] Create committed resource for DoubleWide pattern texture
-        D3D12_RESOURCE_DESC dwDesc = rDesc;
-        dwDesc.Width = tilesDwW;
-        dwDesc.Height = tilesDwH;
+        D3D12_RESOURCE_DESC texDwDesc = texDesc;
+        texDwDesc.Width = tilesDwW;
+        texDwDesc.Height = tilesDwH;
+
+        ID3D12Resource* newTexDw = nullptr;
         hr = device_->CreateCommittedResource(
-            &heapDefault, D3D12_HEAP_FLAG_NONE, &dwDesc,
-            D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&currentVrsTextureDw_));
-        if (FAILED(hr)) {
-            LogMessage(LogLevel::Error, "VRS12: CreateCommittedResource(DoubleWide) failed HR=" + std::to_string(hr));
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDwDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newTexDw));
+        if (FAILED(hr) || !newTexDw) {
+            leakedResources_.push_back(newTex);
+            LogMessage(LogLevel::Error, "VRS12: Failed to create DOUBLEWIDE R8_UINT VRS texture. HR=" + std::to_string(hr));
             return false;
         }
+
+        targetTex = newTex;
+        targetTexDw = newTexDw;
+    }
+
+    std::vector<uint8_t> pattern = CreateTopLeftAnchoredPatternD3D12(
+        eyeW, eyeH, tilesW, tilesH, tileSize_, mode, additionalShadingRates_);
+
+    std::vector<uint8_t> patternDw = CreateTopLeftAnchoredDoubleWidePatternD3D12(
+        eyeW, eyeH, tilesDwW, tilesDwH, tileSize_, mode, additionalShadingRates_);
+
+    if (pattern.size() < static_cast<size_t>(tilesW) * static_cast<size_t>(tilesH) ||
+        patternDw.size() < static_cast<size_t>(tilesDwW) * static_cast<size_t>(tilesDwH)) {
+        return false;
     }
 
     const uint32_t rowPitch = (tilesW + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    const uint64_t uploadSize = static_cast<uint64_t>(rowPitch) * tilesH;
+    const uint64_t uploadSize = static_cast<uint64_t>(rowPitch) * static_cast<uint64_t>(tilesH);
 
     const uint32_t rowPitchDw = (tilesDwW + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    const uint64_t uploadSizeDw = static_cast<uint64_t>(rowPitchDw) * tilesDwH;
+    const uint64_t uploadSizeDw = static_cast<uint64_t>(rowPitchDw) * static_cast<uint64_t>(tilesDwH);
 
-    D3D12_HEAP_PROPERTIES heapUpload{};
-    heapUpload.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    uploadHeap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    uploadHeap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    uploadHeap.CreationNodeMask = 1;
+    uploadHeap.VisibleNodeMask = 1;
 
-    D3D12_RESOURCE_DESC bDesc{};
-    bDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bDesc.Width = uploadSize + uploadSizeDw;
-    bDesc.Height = 1;
-    bDesc.DepthOrArraySize = 1;
-    bDesc.MipLevels = 1;
-    bDesc.Format = DXGI_FORMAT_UNKNOWN;
-    bDesc.SampleDesc.Count = 1;
-    bDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_RESOURCE_DESC bufDesc{};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Alignment = 0;
+    bufDesc.Width = uploadSize;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.SampleDesc.Quality = 0;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
     ID3D12Resource* uploadBuf = nullptr;
     HRESULT hr = device_->CreateCommittedResource(
-        &heapUpload, D3D12_HEAP_FLAG_NONE, &bDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&uploadBuf));
-    if (FAILED(hr)) {
-        LogMessage(LogLevel::Error, "VRS12: CreateCommittedResource(UploadBuffer) failed HR=" + std::to_string(hr));
+        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
+    if (FAILED(hr) || !uploadBuf) {
+        if (needNewAllocation) {
+            if (targetTex) leakedResources_.push_back(targetTex);
+            if (targetTexDw) leakedResources_.push_back(targetTexDw);
+        }
         return false;
     }
 
-    std::vector<uint8_t> patternData = CreateCenteredPatternD3D12(
-        tilesW, tilesH, eyeW, eyeH, false, tile, tile, additionalShadingRates_, mode);
-
-    std::vector<uint8_t> patternDataDw = CreateCenteredPatternD3D12(
-        tilesDwW, tilesDwH, dwEyeW, eyeH, true, tile, tile, additionalShadingRates_, mode);
-
-    uint8_t* pMapped = nullptr;
-    D3D12_RANGE rRange{ 0, 0 };
-    hr = uploadBuf->Map(0, &rRange, reinterpret_cast<void**>(&pMapped));
-    if (FAILED(hr)) {
-        uploadBuf->Release();
-        LogMessage(LogLevel::Error, "VRS12: UploadBuffer Map failed HR=" + std::to_string(hr));
+    D3D12_RESOURCE_DESC bufDwDesc = bufDesc;
+    bufDwDesc.Width = uploadSizeDw;
+    ID3D12Resource* uploadBufDw = nullptr;
+    hr = device_->CreateCommittedResource(
+        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDwDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBufDw));
+    if (FAILED(hr) || !uploadBufDw) {
+        leakedResources_.push_back(uploadBuf);
+        if (needNewAllocation) {
+            if (targetTex) leakedResources_.push_back(targetTex);
+            if (targetTexDw) leakedResources_.push_back(targetTexDw);
+        }
         return false;
     }
 
-    // Copy single-eye pattern
-    for (uint32_t y = 0; y < tilesH; ++y) {
-        std::memcpy(pMapped + y * rowPitch, patternData.data() + y * tilesW, tilesW);
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE readRange{ 0, 0 };
+    if (SUCCEEDED(uploadBuf->Map(0, &readRange, reinterpret_cast<void**>(&mapped))) && mapped) {
+        for (uint32_t y = 0; y < tilesH; ++y) {
+            std::memcpy(mapped + static_cast<size_t>(y) * rowPitch,
+                        pattern.data() + static_cast<size_t>(y) * tilesW,
+                        tilesW);
+        }
+        uploadBuf->Unmap(0, nullptr);
     }
 
-    // Copy doublewide pattern immediately after single-eye slice
-    uint8_t* pMappedDw = pMapped + uploadSize;
-    for (uint32_t y = 0; y < tilesDwH; ++y) {
-        std::memcpy(pMappedDw + y * rowPitchDw, patternDataDw.data() + y * tilesDwW, tilesDwW);
+    uint8_t* mappedDw = nullptr;
+    if (SUCCEEDED(uploadBufDw->Map(0, &readRange, reinterpret_cast<void**>(&mappedDw))) && mappedDw) {
+        for (uint32_t y = 0; y < tilesDwH; ++y) {
+            std::memcpy(mappedDw + static_cast<size_t>(y) * rowPitchDw,
+                        patternDw.data() + static_cast<size_t>(y) * tilesDwW,
+                        tilesDwW);
+        }
+        uploadBufDw->Unmap(0, nullptr);
     }
-    uploadBuf->Unmap(0, nullptr);
 
     uploadAlloc_->Reset();
     uploadList_->Reset(uploadAlloc_, nullptr);
 
-    D3D12_RESOURCE_BARRIER barriers[2]{};
-    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[0].Transition.pResource = currentVrsTexture_;
-    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (reuploadInPlace && !needNewAllocation) {
+        D3D12_RESOURCE_BARRIER bPre[2]{};
+        bPre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bPre[0].Transition.pResource = targetTex;
+        bPre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bPre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        bPre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 
-    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[1].Transition.pResource = currentVrsTextureDw_;
-    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-
-    uploadList_->ResourceBarrier(2, barriers);
+        bPre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bPre[1].Transition.pResource = targetTexDw;
+        bPre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bPre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        bPre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        uploadList_->ResourceBarrier(2, bPre);
+    }
 
     D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-    dstLoc.pResource = currentVrsTexture_;
+    dstLoc.pResource = targetTex;
     dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dstLoc.SubresourceIndex = 0;
 
@@ -539,63 +636,80 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
     srcLoc.PlacedFootprint.Footprint.Height = tilesH;
     srcLoc.PlacedFootprint.Footprint.Depth = 1;
     srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
-
     uploadList_->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
-    // [Z1] Copy DoubleWide texture from upload buffer
     D3D12_TEXTURE_COPY_LOCATION dstLocDw{};
-    dstLocDw.pResource = currentVrsTextureDw_;
+    dstLocDw.pResource = targetTexDw;
     dstLocDw.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dstLocDw.SubresourceIndex = 0;
 
     D3D12_TEXTURE_COPY_LOCATION srcLocDw{};
-    srcLocDw.pResource = uploadBuf;
+    srcLocDw.pResource = uploadBufDw;
     srcLocDw.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLocDw.PlacedFootprint.Offset = uploadSize;
+    srcLocDw.PlacedFootprint.Offset = 0;
     srcLocDw.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UINT;
     srcLocDw.PlacedFootprint.Footprint.Width = tilesDwW;
     srcLocDw.PlacedFootprint.Footprint.Height = tilesDwH;
     srcLocDw.PlacedFootprint.Footprint.Depth = 1;
     srcLocDw.PlacedFootprint.Footprint.RowPitch = rowPitchDw;
-
     uploadList_->CopyTextureRegion(&dstLocDw, 0, 0, 0, &srcLocDw, nullptr);
 
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-    uploadList_->ResourceBarrier(2, barriers);
+    D3D12_RESOURCE_BARRIER bPost[2]{};
+    bPost[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bPost[0].Transition.pResource = targetTex;
+    bPost[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bPost[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    bPost[0].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+
+    bPost[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bPost[1].Transition.pResource = targetTexDw;
+    bPost[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bPost[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    bPost[1].Transition.StateAfter = D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+    uploadList_->ResourceBarrier(2, bPost);
 
     uploadList_->Close();
 
     ID3D12CommandList* ppLists[] = { uploadList_ };
     uploadQueue_->ExecuteCommandLists(1, ppLists);
 
-    const uint64_t fv = ++fenceValue_;
-    uploadQueue_->Signal(uploadFence_, fv);
-    if (uploadFence_->GetCompletedValue() < fv) {
-        uploadFence_->SetEventOnCompletion(fv, fenceEvent_);
+    const uint64_t syncVal = ++fenceValue_;
+    uploadQueue_->Signal(uploadFence_, syncVal);
+    if (uploadFence_->GetCompletedValue() < syncVal) {
+        uploadFence_->SetEventOnCompletion(syncVal, fenceEvent_);
         WaitForSingleObject(fenceEvent_, 2000);
     }
 
-    uploadBuf->Release();
+    leakedResources_.push_back(uploadBuf);
+    leakedResources_.push_back(uploadBufDw);
 
-    texTilesW_.store(tilesW, std::memory_order_relaxed);
-    texTilesH_.store(tilesH, std::memory_order_relaxed);
-    capPixelsW_.store(capW, std::memory_order_relaxed);
-    capPixelsH_.store(capH, std::memory_order_relaxed);
-    texDwTilesW_.store(tilesDwW, std::memory_order_relaxed);
-    texDwTilesH_.store(tilesDwH, std::memory_order_relaxed);
-    capDwPixelsW_.store(capDwW, std::memory_order_relaxed);
-    capDwPixelsH_.store(capDwH, std::memory_order_relaxed);
+    if (needNewAllocation) {
+        if (currentVrsTexture_ && currentVrsTexture_ != targetTex) {
+            leakedResources_.push_back(currentVrsTexture_);
+        }
+        if (currentVrsTextureDw_ && currentVrsTextureDw_ != targetTexDw) {
+            leakedResources_.push_back(currentVrsTextureDw_);
+        }
+        currentVrsTexture_ = targetTex;
+        currentVrsTextureDw_ = targetTexDw;
+        texTilesW_.store(tilesW, std::memory_order_relaxed);
+        texTilesH_.store(tilesH, std::memory_order_relaxed);
+        capPixelsW_.store(capW, std::memory_order_relaxed);
+        capPixelsH_.store(capH, std::memory_order_relaxed);
+        texDwTilesW_.store(tilesDwW, std::memory_order_relaxed);
+        texDwTilesH_.store(tilesDwH, std::memory_order_relaxed);
+        capDwPixelsW_.store(capDwW, std::memory_order_relaxed);
+        capDwPixelsH_.store(capDwH, std::memory_order_relaxed);
+    }
+
     builtEyeW_ = eyeW;
     builtEyeH_ = eyeH;
     builtMode_ = mode;
 
-    LogMessage(LogLevel::Info, "VRS12: pattern texture uploaded (Single=" +
-               std::to_string(tilesW) + "x" + std::to_string(tilesH) +
-               " dwTiles=" + std::to_string(tilesDwW) + "x" + std::to_string(tilesDwH) +
+    LogMessage(LogLevel::Info, "VRS12: pattern texture " + std::string(needNewAllocation ? "allocated" : "re-uploaded") +
+               " (tiles=" + std::to_string(tilesW) + "x" + std::to_string(tilesH) +
                " cap=" + std::to_string(capW) + "x" + std::to_string(capH) +
+               " dwTiles=" + std::to_string(tilesDwW) + "x" + std::to_string(tilesDwH) +
                " dwCap=" + std::to_string(capDwW) + "x" + std::to_string(capDwH) +
                " eye=" + std::to_string(eyeW) + "x" + std::to_string(eyeH) +
                " mode=" + std::to_string(mode) + ").");
@@ -670,11 +784,15 @@ void VrsFoveatedD3D12::OnCreateRenderTargetView(
     pod.isSwapchain = (swapchainTextures_.find(pResource) != swapchainTextures_.end());
 
     if (pDesc) {
-        pod.viewFmt = pDesc->Format;
-        pod.dim = static_cast<uint32_t>(pDesc->ViewDimension);
+        pod.viewFmt = (pDesc->Format != DXGI_FORMAT_UNKNOWN) ? pDesc->Format : rDesc.Format;
+        pod.dim = MapRtvDimension(pDesc->ViewDimension);
     } else {
         pod.viewFmt = rDesc.Format;
-        pod.dim = static_cast<uint32_t>(D3D12_RTV_DIMENSION_TEXTURE2D);
+        if (rDesc.SampleDesc.Count > 1) {
+            pod.dim = (rDesc.DepthOrArraySize > 1) ? 7u : 6u;
+        } else {
+            pod.dim = (rDesc.DepthOrArraySize > 1) ? 5u : 4u;
+        }
     }
 
     rtvMap_[destDescriptor.ptr] = pod;
@@ -705,11 +823,15 @@ void VrsFoveatedD3D12::OnCreateDepthStencilView(
     pod.arraySize = rDesc.DepthOrArraySize;
 
     if (pDesc) {
-        pod.viewFmt = pDesc->Format;
-        pod.dim = static_cast<uint32_t>(pDesc->ViewDimension);
+        pod.viewFmt = (pDesc->Format != DXGI_FORMAT_UNKNOWN) ? pDesc->Format : rDesc.Format;
+        pod.dim = MapDsvDimension(pDesc->ViewDimension);
     } else {
         pod.viewFmt = rDesc.Format;
-        pod.dim = static_cast<uint32_t>(D3D12_DSV_DIMENSION_TEXTURE2D);
+        if (rDesc.SampleDesc.Count > 1) {
+            pod.dim = (rDesc.DepthOrArraySize > 1) ? 7u : 6u;
+        } else {
+            pod.dim = (rDesc.DepthOrArraySize > 1) ? 5u : 4u;
+        }
     }
 
     dsvMap_[destDescriptor.ptr] = pod;
