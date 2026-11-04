@@ -54,6 +54,16 @@ public:
     void Shutdown(const char* reason = "Explicit");
     void DisableVRS(ID3D11DeviceContext* ctx, bool force = false);
 
+    int32_t GetVrsStatus() const noexcept {
+        if (!nvapiSupported_ || !fastEnabled_.load(std::memory_order_relaxed)) {
+            return 0;
+        }
+        if (fastBound_.load(std::memory_order_relaxed) || actualNvapiBinds_.load(std::memory_order_relaxed) > 0) {
+            return 1;
+        }
+        return 2;
+    }
+
     static void EnterSuppressScope() noexcept;
     static void LeaveSuppressScope() noexcept;
     static bool IsSuppressed() noexcept;
