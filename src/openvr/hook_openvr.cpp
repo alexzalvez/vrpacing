@@ -807,9 +807,13 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         g_limiter.WaitBeforeRuntime();
     }
 
-    g_shm.UpdateTelemetry(L"OpenVR (SteamVR)", hz, targetFps,
-                          g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
-                          g_lastFormat, g_upscaleStatus, g_lastHResult);
+    const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
+    const int32_t maskStatus = (g_cfg.mask.openvrMode > 0) ? 1 : 0;
+    g_shm.UpdateSessionTelemetry(L"OpenVR (SteamVR)", hz, targetFps,
+                                 s_panelHz, s_sswHalfRateActive ? 1u : 0u,
+                                 vrsStatus, maskStatus,
+                                 g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                 g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     vr::EVRCompositorError res = origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
 
