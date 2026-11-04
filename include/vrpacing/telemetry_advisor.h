@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <algorithm>
 #include <array>
@@ -34,16 +34,37 @@ public:
         Reset();
     }
 
+    static void ResolveDisplayMode(const SharedState& shm, bool& outIsSsw, double& outTargetHz, double& outPanelHz) {
+        const bool manualHalf = (shm.frameGenDivisor > 1.05);
+        const bool reportedLowHz = (shm.effectiveHz > 10.0 && shm.effectiveHz <= 60.5);
+        outIsSsw = (shm.sswActive != 0) || manualHalf || reportedLowHz;
+
+        if (outIsSsw) {
+            if (manualHalf && shm.effectiveHz > 60.5) {
+                outTargetHz = shm.effectiveHz * 0.5;
+                outPanelHz = shm.effectiveHz;
+            } else {
+                outTargetHz = shm.effectiveHz;
+                outPanelHz = (shm.rawPanelHz > 60.5) ? shm.rawPanelHz : (shm.effectiveHz * 2.0);
+            }
+        } else {
+            outTargetHz = shm.effectiveHz;
+            outPanelHz = (shm.rawPanelHz > 60.5) ? shm.rawPanelHz : shm.effectiveHz;
+        }
+    }
+
     void Reset() {
         shortWindowMs_.clear();
         evalWindowMs_.clear();
         graphHistoryMs_.fill(0.0f);
         lastPid_ = 0;
-        lastRawHz_ = 0.0;
+        lastAppliedCap_ = 0.0;
         lastDivisor_ = 1.0;
         lastReadIdx_ = 0;
         avgFps_ = 0.0;
         onePercentLowFps_ = 0.0;
+        initialCollectionDone_ = false;
+        hasLatchedVerdict_ = false;
         pendingTicks_ = 0;
         pendingState_ = static_cast<int32_t>(AdvisorState::Idle);
         pendingSummary_[0] = L'\0';
@@ -54,27 +75,27 @@ public:
     }
 
     void Ingest(const SharedState& shm) {
-        // Reinicio automatico de contexto ante cambio de PID, cierre o cambio brusco de Hz
-        if (shm.activePid == 0 ||
-            shm.activePid != lastPid_ ||
-            std::abs(shm.rawPanelHz - lastRawHz_) > 0.5 ||
-            std::abs(shm.frameGenDivisor - lastDivisor_) > 0.05) {
-
+        if (shm.activePid == 0 || shm.activePid != lastPid_) {
             const uint32_t newPid = shm.activePid;
-            const double newRawHz = shm.rawPanelHz;
-            const double newDivisor = shm.frameGenDivisor;
             const uint32_t syncIdx = shm.frameTimeWriteIdx % 256u;
-
             Reset();
-
             lastPid_ = newPid;
-            lastRawHz_ = newRawHz;
-            lastDivisor_ = newDivisor;
+            lastAppliedCap_ = shm.appliedCap;
+            lastDivisor_ = shm.frameGenDivisor;
             lastReadIdx_ = syncIdx;
-
-            if (newPid == 0 || newRawHz < 10.0) {
+            if (newPid == 0) {
                 return;
             }
+        }
+
+        // Si cambia el limite aplicado (cambio de Hz en el visor o cambio 1x / 1/2x),
+        // reevaluar suavemente sin volver a mostrar la barra de Collecting
+        if (shm.appliedCap > 0.0 && std::abs(shm.appliedCap - lastAppliedCap_) > 0.5) {
+            lastAppliedCap_ = shm.appliedCap;
+            lastDivisor_ = shm.frameGenDivisor;
+            shortWindowMs_.clear();
+            hasLatchedVerdict_ = false;
+            pendingTicks_ = 0;
         }
 
         const uint32_t writeIdx = shm.frameTimeWriteIdx % 256u;
@@ -87,31 +108,29 @@ public:
             const uint32_t idx = (lastReadIdx_ + i) % 256u;
             const float dtMs = shm.frameTimesMs[idx];
 
-            // 1. Purga automatica tras pausas de carga, enganche de shaders o cambio de escena
-            if (dtMs > 100.0f) {
-                shortWindowMs_.clear();
-                evalWindowMs_.clear();
+            // Ignorar tirones puntuales de carga (>100 ms) sin vaciar las ventanas
+            if (dtMs < 2.0f || dtMs > 100.0f) {
                 continue;
             }
 
-            // 2. Muestras validas de juego (2.0 ms a 100.0 ms)
-            if (dtMs >= 2.0f) {
-                shortWindowMs_.push_back(dtMs);
-                if (shortWindowMs_.size() > 180) {
-                    shortWindowMs_.pop_front();
-                }
-
-                evalWindowMs_.push_back(dtMs);
-                if (evalWindowMs_.size() > 300) {
-                    evalWindowMs_.pop_front();
-                }
-
-                // Rotar buffer de 180 muestras para la grafica de la Fase 4
-                std::rotate(graphHistoryMs_.begin(), graphHistoryMs_.begin() + 1, graphHistoryMs_.end());
-                graphHistoryMs_.back() = dtMs;
+            shortWindowMs_.push_back(dtMs);
+            if (shortWindowMs_.size() > 180) {
+                shortWindowMs_.pop_front();
             }
+
+            evalWindowMs_.push_back(dtMs);
+            if (evalWindowMs_.size() > 300) {
+                evalWindowMs_.pop_front();
+            }
+
+            std::rotate(graphHistoryMs_.begin(), graphHistoryMs_.begin() + 1, graphHistoryMs_.end());
+            graphHistoryMs_.back() = dtMs;
         }
         lastReadIdx_ = writeIdx;
+
+        if (evalWindowMs_.size() >= 90) {
+            initialCollectionDone_ = true;
+        }
 
         ComputeMetrics();
         EvaluateAdvisor(shm);
@@ -125,7 +144,6 @@ public:
 
 private:
     void ComputeMetrics() {
-        // 1. Avg FPS sobre ventana rapida (180 muestras / ~2.5 - 3s)
         if (shortWindowMs_.size() >= 15) {
             double sumMs = 0.0;
             for (float dt : shortWindowMs_) {
@@ -137,9 +155,6 @@ private:
             avgFps_ = 0.0;
         }
 
-        // 2. 1% Low FPS sobre ventana informativa (300 muestras / ~4 - 5s)
-        // NOTA DE ARQUITECTURA: onePercentLowFps_ es unicamente informativo para la UI
-        // y JAMAS participa en las condiciones de decision del Asesor.
         if (evalWindowMs_.size() >= 60) {
             scratch_.assign(evalWindowMs_.begin(), evalWindowMs_.end());
             const size_t k = std::max<size_t>(1, evalWindowMs_.size() / 100);
@@ -159,100 +174,93 @@ private:
     void EvaluateAdvisor(const SharedState& shm) {
         AdvisorReport rawReport;
 
-        // Estado 0 — Sin sesion
-        if (shm.activePid == 0 || shm.rawPanelHz < 10.0) {
+        if (shm.activePid == 0 || shm.effectiveHz < 10.0) {
             rawReport.state = static_cast<int32_t>(AdvisorState::Idle);
             swprintf_s(rawReport.summaryLine, L"Advisor: Waiting for VR session...");
             ApplyReportImmediate(rawReport);
             return;
         }
 
-        // Estado 1 — Recopilando datos (solo pide 120 muestras validas / ~2s de juego real)
-        if (evalWindowMs_.size() < 120) {
-            rawReport.state = static_cast<int32_t>(AdvisorState::Collecting);
-            const uint32_t pct = static_cast<uint32_t>((evalWindowMs_.size() * 100) / 120);
-            swprintf_s(rawReport.summaryLine, L"Advisor: Collecting gameplay data... (%u%%)", pct);
-            ApplyReportImmediate(rawReport);
+        if (!initialCollectionDone_ || shortWindowMs_.size() < 30) {
+            if (!hasLatchedVerdict_) {
+                rawReport.state = static_cast<int32_t>(AdvisorState::Collecting);
+                const uint32_t pct = static_cast<uint32_t>(std::min<size_t>(99, (evalWindowMs_.size() * 100) / 90));
+                swprintf_s(rawReport.summaryLine, L"Advisor: Measuring frame pacing... (%u%%)", pct);
+                ApplyReportImmediate(rawReport);
+            }
             return;
         }
 
-        // Estado 2 — Objetivo Actual Sostenido (Regla directa basada 100% en Avg FPS)
-        if (shm.appliedCap > 0.0 && avgFps_ >= (shm.appliedCap - 1.5)) {
+        bool isSsw = false;
+        double targetHz = shm.effectiveHz;
+        double panelHz = shm.rawPanelHz;
+        ResolveDisplayMode(shm, isSsw, targetHz, panelHz);
+
+        const double cap = (shm.appliedCap > 0.0) ? shm.appliedCap : (targetHz - 0.10);
+
+        // Banda muerta: si ya estaba en Sustained, se mantiene hasta que Avg FPS caiga mas de 3.0 FPS por debajo del cap
+        const bool wasSustained = hasLatchedVerdict_ && (currentReport_.state == static_cast<int32_t>(AdvisorState::Sustained));
+        const double sustainThreshold = wasSustained ? (cap - 3.0) : (cap - 1.5);
+
+        if (cap > 0.0 && avgFps_ >= sustainThreshold) {
             rawReport.state = static_cast<int32_t>(AdvisorState::Sustained);
-            if (shm.sswActive != 0 || shm.frameGenDivisor > 1.05) {
-                const double displayHz = (shm.rawPanelHz > 10.0) ? shm.rawPanelHz : (shm.effectiveHz * 2.0);
+            if (isSsw) {
                 swprintf_s(rawReport.summaryLine,
-                           L"Advisor: Target Sustained — %.1f Avg FPS at %.0f Hz (SSW / Half-Rate)",
-                           avgFps_, displayHz);
+                           L"Advisor: Target Sustained | %.2f FPS Cap (%.0f/%.0f Hz SSW)",
+                           cap, targetHz, panelHz);
             } else {
                 swprintf_s(rawReport.summaryLine,
-                           L"Advisor: Target Sustained — %.1f Avg FPS at %.0f Hz (Native)",
-                           avgFps_, shm.effectiveHz);
+                           L"Advisor: Target Sustained | %.2f FPS Cap (%.0f Hz Native)",
+                           cap, panelHz);
             }
         } else {
-            // Estado 3 — Objetivo Actual NO Sostenido (Jerarquia basada 100% en Avg FPS)
             rawReport.state = static_cast<int32_t>(AdvisorState::NotSustained);
 
-            // Tramo 1 — avgFps >= 73.0 (Puede sostener un modo Nativo >= 72 Hz)
             if (avgFps_ >= 73.0) {
                 constexpr double kPanelModes[] = { 120.0, 100.0, 96.0, 90.0, 80.0, 72.0 };
-                double bestNativeHz = 0.0;
+                double bestNativeHz = 72.0;
                 for (double modeHz : kPanelModes) {
                     if (avgFps_ >= (modeHz + 1.0)) {
                         bestNativeHz = modeHz;
                         break;
                     }
                 }
-
-                if (bestNativeHz >= 72.0) {
-                    const double suggestedCap = bestNativeHz - 0.1;
-                    swprintf_s(rawReport.summaryLine,
-                               L"Advisor: Try %.0f Hz Native (%.1f FPS) | Or 120 Hz + SSW Always On (59.9 FPS)",
-                               bestNativeHz, suggestedCap);
-                } else {
-                    swprintf_s(rawReport.summaryLine,
-                               L"Advisor: Try 72 Hz Native (71.9 FPS) | Or 120 Hz + SSW Always On (59.9 FPS)");
-                }
-            }
-            // Tramo 2 — 61.0 <= avgFps < 73.0 (No llega a 72 Hz nativos, pero supera los 59.9 FPS de 120 Hz SSW)
-            else if (avgFps_ >= 61.0) {
                 swprintf_s(rawReport.summaryLine,
-                           L"Advisor: Try 120 Hz + SSW Always On (59.9 FPS), or lower res for 72 Hz Native");
-            }
-            // Tramo 3 — 37.0 <= avgFps < 61.0 (Escalones SSW ordenados de mayor a menor)
-            else if (avgFps_ >= 37.0) {
-                double sswHz = 72.0;
+                           L"Advisor: Try %.0f Hz Native (%.1f FPS) | Or 60/120 Hz SSW (59.9 FPS)",
+                           bestNativeHz, bestNativeHz - 0.1);
+            } else if (avgFps_ >= 61.0) {
+                swprintf_s(rawReport.summaryLine,
+                           L"Advisor: Try 60/120 Hz SSW (59.9 FPS) | Or lower res for 72 Hz");
+            } else if (avgFps_ >= 37.0) {
+                double sswTarget = 36.0;
+                double sswPanel = 72.0;
                 double sswCap = 35.9;
 
                 if (avgFps_ >= 51.0) {
-                    sswHz = 100.0;
-                    sswCap = 49.9;
+                    sswTarget = 50.0; sswPanel = 100.0; sswCap = 49.9;
                 } else if (avgFps_ >= 49.0) {
-                    sswHz = 96.0;
-                    sswCap = 47.9;
+                    sswTarget = 48.0; sswPanel = 96.0; sswCap = 47.9;
                 } else if (avgFps_ >= 46.0) {
-                    sswHz = 90.0;
-                    sswCap = 44.9;
+                    sswTarget = 45.0; sswPanel = 90.0; sswCap = 44.9;
                 } else if (avgFps_ >= 41.0) {
-                    sswHz = 80.0;
-                    sswCap = 39.9;
-                } else {
-                    sswHz = 72.0;
-                    sswCap = 35.9;
+                    sswTarget = 40.0; sswPanel = 80.0; sswCap = 39.9;
                 }
 
                 swprintf_s(rawReport.summaryLine,
-                           L"Advisor: Try %.0f Hz + SSW Always On (%.1f FPS cap)",
-                           sswHz, sswCap);
-            }
-            // Tramo 4 — avgFps < 37.0 (Por debajo del suelo de 36 FPS SSW)
-            else {
+                           L"Advisor: Try %.0f/%.0f Hz SSW Always On (%.1f FPS cap)",
+                           sswTarget, sswPanel, sswCap);
+            } else {
                 swprintf_s(rawReport.summaryLine,
-                           L"Advisor: Below 36 FPS SSW floor — Reduce resolution or graphics settings");
+                           L"Advisor: Below 36 FPS SSW floor - Reduce resolution or settings");
             }
         }
 
-        ApplyReportWithHysteresis(rawReport);
+        if (!hasLatchedVerdict_) {
+            hasLatchedVerdict_ = true;
+            ApplyReportImmediate(rawReport);
+        } else {
+            ApplyReportWithHysteresis(rawReport);
+        }
     }
 
     void ApplyReportImmediate(const AdvisorReport& report) {
@@ -263,17 +271,15 @@ private:
     }
 
     void ApplyReportWithHysteresis(const AdvisorReport& report) {
-        // Si el estado y el texto coinciden con el actual, no hay cambio pendiente
         if (report.state == currentReport_.state && wcscmp(report.summaryLine, currentReport_.summaryLine) == 0) {
             pendingTicks_ = 0;
             return;
         }
 
-        // Verificar si el candidato coincide con el cambio pendiente
         if (report.state == pendingState_ && wcscmp(report.summaryLine, pendingSummary_) == 0) {
             pendingTicks_++;
-            // 12 ticks de 250 ms = ~3.0 segundos de estabilidad antes de cambiar texto
-            if (pendingTicks_ >= 12) {
+            // 20 ticks de 250 ms = 5.0 segundos continuos antes de cambiar el veredicto enclavado
+            if (pendingTicks_ >= 20) {
                 currentReport_ = report;
                 pendingTicks_ = 0;
             }
@@ -290,16 +296,17 @@ private:
     std::vector<float> scratch_;
 
     uint32_t lastPid_ = 0;
-    double lastRawHz_ = 0.0;
+    double lastAppliedCap_ = 0.0;
     double lastDivisor_ = 1.0;
     uint32_t lastReadIdx_ = 0;
 
     double avgFps_ = 0.0;
     double onePercentLowFps_ = 0.0;
+    bool initialCollectionDone_ = false;
+    bool hasLatchedVerdict_ = false;
 
     AdvisorReport currentReport_;
 
-    // Variables de histeresis para evitar parpadeos visuales
     uint32_t pendingTicks_ = 0;
     int32_t pendingState_ = static_cast<int32_t>(AdvisorState::Idle);
     wchar_t pendingSummary_[160]{};

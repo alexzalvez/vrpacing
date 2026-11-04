@@ -1,4 +1,4 @@
-#ifdef _WIN32
+﻿#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -930,7 +930,8 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         s_sswHalfRateHits = 0;
     }
 
-    const double effectiveHz = (!manualSubRate && s_sswHalfRateActive) ? (s_panelHz * 0.5) : s_panelHz;
+    const bool panelAlreadyHalf = (s_panelHz <= 60.5);
+    const double effectiveHz = (!manualSubRate && !panelAlreadyHalf && s_sswHalfRateActive) ? (s_panelHz * 0.5) : s_panelHz;
     const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
@@ -938,7 +939,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         LimitInputs lim{};
         lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
-        lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
+        lim.frameGenDivisor = (manualSubRate && panelAlreadyHalf) ? 1.0 : g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
         targetFps = ComputeTargetFps(lim);
         g_limiter.SetTargetFps(targetFps);
@@ -949,8 +950,10 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     const int32_t vrsStatus = g_d3d12Device ? VrsFoveatedD3D12::Instance().GetVrsStatus()
                                             : VrsFoveatedD3D11::Instance().GetVrsStatus();
     const int32_t maskStatus = g_cfg.mask.enabled ? 1 : 0;
+    const double reportedRawHz = panelAlreadyHalf ? (s_panelHz * 2.0) : s_panelHz;
+    const uint32_t reportedSsw = (s_sswHalfRateActive || panelAlreadyHalf || manualSubRate) ? 1u : 0u;
     g_shm.UpdateSessionTelemetry(apiLabel, hz, targetFps,
-                                 s_panelHz, s_sswHalfRateActive ? 1u : 0u,
+                                 reportedRawHz, reportedSsw,
                                  vrsStatus, maskStatus,
                                  g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                                  g_lastFormat, g_upscaleStatus, g_lastHResult);
@@ -970,7 +973,6 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
                 const double snappedPanel = HzTracker::SnapToCommonHz(rawDisplayHz).value_or(std::round(rawDisplayHz));
                 if (std::abs(snappedPanel - s_panelHz) > 0.5) {
                     s_panelHz = snappedPanel;
-                    s_warmupFrames = 0;
                     s_sswHalfRateHits = 0;
                     s_sswHalfRateActive = false;
                 }
@@ -982,15 +984,13 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
             if (dt > 0.250) {
-                s_warmupFrames = 0;
                 s_sswHalfRateHits = 0;
-                s_sswHalfRateActive = false;
             } else if (dt > 0.004 && dt < 0.050) {
                 if (s_warmupFrames < 30) {
                     s_warmupFrames++;
                 }
 
-                if (!manualSubRate && !s_sswHalfRateActive) {
+                if (!manualSubRate && !panelAlreadyHalf && !s_sswHalfRateActive) {
                     const double measuredHz = 1.0 / dt;
                     const double halfPanel = s_panelHz * 0.5;
                     if (std::abs(measuredHz - halfPanel) <= (halfPanel * 0.035)) {
@@ -1324,3 +1324,4 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
 }
 
 #endif
+

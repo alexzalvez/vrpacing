@@ -1,4 +1,4 @@
-#ifdef _WIN32
+﻿#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -784,33 +784,36 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     }
 
     if (g_phaseResetRequested.exchange(false, std::memory_order_relaxed) || s_noSubmitStreak >= 15) {
-        s_warmupFrames = 0;
         s_blockFrames = 0;
         s_blockDtSum = 0.0;
         s_sswBlockStreak = 0;
-        s_sswHalfRateActive = false;
     }
 
     const bool hasSubmitted3D = g_openVrHandlingFrames.load(std::memory_order_relaxed) && (s_noSubmitStreak < 15);
-    const double effectiveHz = (!manualSubRate && s_sswHalfRateActive) ? (s_panelHz * 0.5) : s_panelHz;
+    const bool panelAlreadyHalf = (s_panelHz <= 60.5);
+    const double effectiveHz = (!manualSubRate && !panelAlreadyHalf && s_sswHalfRateActive) ? (s_panelHz * 0.5) : s_panelHz;
     const double hz = (g_cfg.pacing.hzOverride > 0.0) ? g_cfg.pacing.hzOverride : effectiveHz;
     double targetFps = 0.0;
 
-    if (g_cfg.pacing.enabled && hasSubmitted3D && s_warmupFrames >= 30) {
+    if (g_cfg.pacing.enabled && s_warmupFrames >= 30) {
         LimitInputs lim{};
         lim.hz = hz;
         lim.offsetFps = g_cfg.pacing.offsetFps;
-        lim.frameGenDivisor = g_cfg.pacing.frameGenDivisor;
+        lim.frameGenDivisor = (manualSubRate && panelAlreadyHalf) ? 1.0 : g_cfg.pacing.frameGenDivisor;
         lim.afrMultiplier = g_cfg.pacing.afrMultiplier;
         targetFps = ComputeTargetFps(lim);
         g_limiter.SetTargetFps(targetFps);
-        g_limiter.WaitBeforeRuntime();
+        if (hasSubmitted3D) {
+            g_limiter.WaitBeforeRuntime();
+        }
     }
 
     const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
     const int32_t maskStatus = (g_cfg.mask.openvrMode > 0) ? 1 : 0;
+    const double reportedRawHz = panelAlreadyHalf ? (s_panelHz * 2.0) : s_panelHz;
+    const uint32_t reportedSsw = (s_sswHalfRateActive || panelAlreadyHalf || manualSubRate) ? 1u : 0u;
     g_shm.UpdateSessionTelemetry(L"OpenVR (SteamVR)", hz, targetFps,
-                                 s_panelHz, s_sswHalfRateActive ? 1u : 0u,
+                                 reportedRawHz, reportedSsw,
                                  vrsStatus, maskStatus,
                                  g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                                  g_lastFormat, g_upscaleStatus, g_lastHResult);
@@ -824,15 +827,13 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
         if (s_lastWaitExitQpc > 0) {
             const double dt = static_cast<double>(afterWaitQpc.QuadPart - s_lastWaitExitQpc) / static_cast<double>(s_qpcFreq);
             if (dt > 0.250) {
-                s_warmupFrames = 0;
                 s_blockFrames = 0;
                 s_blockDtSum = 0.0;
                 s_sswBlockStreak = 0;
-                s_sswHalfRateActive = false;
             } else if (dt > 0.003 && dt < 0.100) {
                 if (s_warmupFrames < 30) {
                     s_warmupFrames++;
-                } else if (!manualSubRate) {
+                } else if (!manualSubRate && !panelAlreadyHalf && !s_sswHalfRateActive) {
                     s_blockDtSum += dt;
                     s_blockFrames++;
 
@@ -842,25 +843,18 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                         s_blockFrames = 0;
                         s_blockDtSum = 0.0;
 
-                        if (!s_sswHalfRateActive) {
-                            if (std::abs(blockAvgHz - halfPanel) <= (halfPanel * 0.035)) {
-                                s_sswBlockStreak++;
-                                if (s_sswBlockStreak >= 2) {
-                                    s_sswHalfRateActive = true;
-                                    s_sswBlockStreak = 0;
-                                    LogMessage(LogLevel::Info, "OpenVR Pacing: SSW half-rate lock detected (avg " +
-                                               std::to_string(blockAvgHz) + " FPS -> " +
-                                               std::to_string(static_cast<int>(std::lround(halfPanel))) + " Hz / " +
-                                               std::to_string(static_cast<int>(std::lround(s_panelHz))) + " Hz panel).");
-                                }
-                            } else {
+                        if (std::abs(blockAvgHz - halfPanel) <= (halfPanel * 0.035)) {
+                            s_sswBlockStreak++;
+                            if (s_sswBlockStreak >= 2) {
+                                s_sswHalfRateActive = true;
                                 s_sswBlockStreak = 0;
+                                LogMessage(LogLevel::Info, "OpenVR Pacing: SSW half-rate lock detected (avg " +
+                                           std::to_string(blockAvgHz) + " FPS -> " +
+                                           std::to_string(static_cast<int>(std::lround(halfPanel))) + " Hz / " +
+                                           std::to_string(static_cast<int>(std::lround(s_panelHz))) + " Hz panel).");
                             }
                         } else {
-                            if (blockAvgHz < (halfPanel * 0.85) || blockAvgHz > (halfPanel * 1.06)) {
-                                s_sswHalfRateActive = false;
-                                s_sswBlockStreak = 0;
-                            }
+                            s_sswBlockStreak = 0;
                         }
                     }
                 }
@@ -1310,3 +1304,4 @@ void InstallOpenVRHooks() {
 } // namespace vrpacing
 
 #endif
+

@@ -1,4 +1,4 @@
-#ifdef _WIN32
+﻿#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -310,11 +310,14 @@ void UpdateTelemetryDisplay() {
         }
 
         if (g_shared->effectiveHz > 10.0) {
-            if (g_shared->sswActive != 0) {
-                const double displayPanelHz = (g_shared->rawPanelHz > 10.0) ? g_shared->rawPanelHz : (g_shared->effectiveHz * 2.0);
-                swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (SSW Active)", displayPanelHz);
+            bool isSsw = false;
+            double targetHz = g_shared->effectiveHz;
+            double panelHz = g_shared->rawPanelHz;
+            vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
+            if (isSsw) {
+                swprintf_s(txtHz, L"HMD Refresh: %.0f / %.0f Hz (SSW)", targetHz, panelHz);
             } else {
-                swprintf_s(txtHz, L"HMD Refresh: %.1f Hz", g_shared->effectiveHz);
+                swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (Native)", panelHz);
             }
         } else {
             wcscpy_s(txtHz, L"HMD Refresh: Detecting...");
@@ -518,7 +521,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                        15, 260, 434, 248, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
-    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active — Locks FPS just below refresh rate for smooth VR",
+    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active - Locks FPS just below refresh rate for smooth VR",
                                              WS_CHILD | WS_VISIBLE | SS_LEFT,
                                              30, 282, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblPacingStatus, g_hFontNormal);
@@ -888,3 +891,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 }
 
 #endif
+
