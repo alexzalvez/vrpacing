@@ -632,9 +632,11 @@ ovrResult __cdecl Hooked_ovrWaitToBeginFrame(ovrSession session, long long frame
         g_limiter.WaitBeforeRuntime();
     }
 
-    g_shm.UpdateTelemetry(L"LibOVR", hz, targetFps,
-                          g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
-                          g_lastFormat, g_upscaleStatus, g_lastHResult);
+    const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
+    g_shm.UpdateSessionTelemetry(L"LibOVR", hz, targetFps,
+                                 hz, 0u, vrsStatus, 0,
+                                 g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                 g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     return g_origWaitToBeginFrame(session, frameIndex);
 }
@@ -694,9 +696,11 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
                 g_limiter.SetTargetFps(targetFps);
                 g_limiter.WaitBeforeRuntime();
             }
-            g_shm.UpdateTelemetry(L"LibOVR (VDXR)", hz, targetFps,
-                                  g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
-                                  g_lastFormat, g_upscaleStatus, g_lastHResult);
+            const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
+            g_shm.UpdateSessionTelemetry(L"LibOVR (VDXR)", hz, targetFps,
+                                         hz, 0u, vrsStatus, 0,
+                                         g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                         g_lastFormat, g_upscaleStatus, g_lastHResult);
         }
         ovrResult res = origFn(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
         inOculusSubmit = false;
@@ -808,9 +812,11 @@ ovrResult SubmitFrameInternal(ovrSubmitFrameFn origFn,
             g_limiter.SetTargetFps(targetFps);
             g_limiter.WaitBeforeRuntime();
         }
-        g_shm.UpdateTelemetry(L"LibOVR (VDXR)", hz, targetFps,
-                              g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
-                              g_lastFormat, g_upscaleStatus, g_lastHResult);
+        const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
+        g_shm.UpdateSessionTelemetry(L"LibOVR (VDXR)", hz, targetFps,
+                                     hz, 0u, vrsStatus, 0,
+                                     g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                     g_lastFormat, g_upscaleStatus, g_lastHResult);
     }
 
     ovrResult res = origFn(session, frameIndex, viewScaleDesc, modifiedLayers.data(), layerCount);
