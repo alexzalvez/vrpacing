@@ -53,9 +53,9 @@ public:
         }
 
         shared_ = reinterpret_cast<SharedState*>(view_);
-        if (newlyCreated || shared_->version != 6) {
+        if (newlyCreated || shared_->version != kSharedStateVersion) {
             *shared_ = {};
-            shared_->version = 6;
+            shared_->version = kSharedStateVersion;
             shared_->flags = kFlagEnabled | kFlagUpscalingEnabled | kFlagPacingEnabled | kFlagTelemetryActive;
             shared_->frameGenDivisor = 1.0;
             shared_->offsetFps = 0.10;
@@ -98,7 +98,7 @@ public:
         cfg.upscaling.radius = 0.60f;
         cfg.upscaling.sharpness = 0.0f;
 
-        if (!OpenOrCreate() || !shared_ || shared_->version != 6) {
+        if (!OpenOrCreate() || !shared_ || shared_->version != kSharedStateVersion) {
             cfg.enabled = true;
             cfg.upscaling.enabled = true;
             cfg.pacing.enabled = true;
@@ -163,6 +163,14 @@ public:
             shared_->lastHResult = 0;
             shared_->avgFps = 0.0;
             shared_->onePercentLowFps = 0.0;
+            shared_->rawPanelHz = 0.0;
+            shared_->sswActive = 0;
+            shared_->vrsStatus = 0;
+            shared_->maskStatus = 0;
+            shared_->frameTimeWriteIdx = 0;
+            for (size_t i = 0; i < 256; ++i) {
+                shared_->frameTimesMs[i] = 0.0f;
+            }
         }
 
         shared_->activePid = currentPid;
@@ -216,6 +224,11 @@ public:
         if (s_lastQpc > 0 && s_qpcFreq > 0) {
             const double dt = static_cast<double>(nowQpc.QuadPart - s_lastQpc) / static_cast<double>(s_qpcFreq);
             if (dt > 0.002 && dt < 0.100) {
+                const float ftMs = static_cast<float>(dt * 1000.0);
+                const uint32_t ftIdx = shared_->frameTimeWriteIdx % 256;
+                shared_->frameTimesMs[ftIdx] = ftMs;
+                shared_->frameTimeWriteIdx = (ftIdx + 1) % 256;
+
                 s_samples[s_sampleIdx] = dt;
                 s_sampleIdx = (s_sampleIdx + 1) % 180;
                 if (s_sampleCount < 180) s_sampleCount++;
@@ -245,6 +258,38 @@ public:
             }
         }
         s_lastQpc = nowQpc.QuadPart;
+    }
+
+    void UpdateExtendedTelemetry(double rawPanelHz, uint32_t sswActive,
+                                 int32_t vrsStatus = -1, int32_t maskStatus = -1) {
+        if (!OpenOrCreate() || !shared_) return;
+        if (rawPanelHz > 0.0) shared_->rawPanelHz = rawPanelHz;
+        shared_->sswActive = sswActive;
+        if (vrsStatus >= 0) shared_->vrsStatus = vrsStatus;
+        if (maskStatus >= 0) shared_->maskStatus = maskStatus;
+    }
+
+    void PushFrameTime(float frameTimeMs) {
+        if (!OpenOrCreate() || !shared_ || !IsTelemetryActive()) return;
+        const uint32_t idx = shared_->frameTimeWriteIdx % 256;
+        shared_->frameTimesMs[idx] = frameTimeMs;
+        shared_->frameTimeWriteIdx = (idx + 1) % 256;
+    }
+
+    void UpdateSessionTelemetry(const wchar_t* apiName, double effectiveHz, double appliedCap,
+                                double rawPanelHz, uint32_t sswActive,
+                                int32_t vrsStatus = 0, int32_t maskStatus = 0,
+                                uint32_t inW = 0, uint32_t inH = 0,
+                                uint32_t outW = 0, uint32_t outH = 0,
+                                uint32_t dxgiFmt = 0, int32_t status = 0,
+                                int32_t hresult = 0) {
+        UpdateTelemetry(apiName, effectiveHz, appliedCap, inW, inH, outW, outH, dxgiFmt, status, hresult);
+        if (shared_) {
+            if (rawPanelHz > 0.0) shared_->rawPanelHz = rawPanelHz;
+            shared_->sswActive = sswActive;
+            shared_->vrsStatus = vrsStatus;
+            shared_->maskStatus = maskStatus;
+        }
     }
 
     SharedState* GetRaw() { return shared_; }
