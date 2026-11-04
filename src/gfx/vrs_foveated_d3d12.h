@@ -145,7 +145,7 @@ private:
     std::atomic<uint32_t> capPixelsH_{ 0 };
     std::atomic<uint32_t> texTilesW_{ 0 };
     std::atomic<uint32_t> texTilesH_{ 0 };
-    std::atomic<uint32_t> capDwPixelsW_{ 0 }; // [Z1] DoubleWide capacity
+    std::atomic<uint32_t> capDwPixelsW_{ 0 };
     std::atomic<uint32_t> capDwPixelsH_{ 0 };
     std::atomic<uint32_t> texDwTilesW_{ 0 };
     std::atomic<uint32_t> texDwTilesH_{ 0 };
@@ -163,7 +163,7 @@ private:
     HANDLE fenceEvent_ = nullptr;
     uint64_t fenceValue_ = 0;
     ID3D12Resource* currentVrsTexture_ = nullptr;
-    ID3D12Resource* currentVrsTextureDw_ = nullptr; // [Z1] Second pattern texture for DOUBLEWIDE
+    ID3D12Resource* currentVrsTextureDw_ = nullptr;
     std::vector<ID3D12Resource*> leakedResources_;
 
     std::unordered_set<size_t> loggedDistinctRtHandles_;
@@ -173,7 +173,7 @@ private:
     std::atomic<uint64_t> omsrtCount_{ 0 };
     std::atomic<uint64_t> directCount_{ 0 };
     std::atomic<uint64_t> candidatesCount_{ 0 };
-    std::atomic<uint64_t> dwCount_{ 0 }; // [Z1] DOUBLEWIDE candidate count
+    std::atomic<uint64_t> dwCount_{ 0 };
     std::atomic<uint64_t> bindsCount_{ 0 };
     std::atomic<uint64_t> resetsCount_{ 0 };
     std::atomic<uint64_t> rtvUnknownCount_{ 0 };
