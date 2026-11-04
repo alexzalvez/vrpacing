@@ -25,13 +25,24 @@ public:
                       bool enabled,
                       uint32_t eyeWidth,
                       uint32_t eyeHeight,
-                      int debugMode);
+                      int debugMode,
+                      bool debugLogging = false);
     void RegisterSwapchainTexture(ID3D12Resource* tex);
     void ClearSwapchainTextures();
     void RecordVisibilityMaskCall();
     void EndFrame();
     void Shutdown(const char* reason = "DestroySession");
     void ShutdownOnProcessDetach();
+
+    int32_t GetVrsStatus() const noexcept {
+        if (!tier2Supported_ || !enabled_.load(std::memory_order_relaxed)) {
+            return 0;
+        }
+        if (bindsCount_.load(std::memory_order_relaxed) > 0 || vrs12Ready_.load(std::memory_order_relaxed)) {
+            return 1;
+        }
+        return 2;
+    }
 
     void OnCreateRenderTargetView(ID3D12Device* dev,
                                   ID3D12Resource* pResource,
@@ -123,6 +134,7 @@ private:
     uint32_t tileSize_ = 16;
     bool additionalShadingRates_ = false;
 
+    std::atomic<bool> debugLogging_{ false };
     std::atomic<bool> enabled_{ false };
     std::atomic<bool> vrs12Ready_{ false };
     std::atomic<bool> shutdownLogged_{ false };
