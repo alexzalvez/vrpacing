@@ -20,6 +20,7 @@
 #include "injector/process_scanner.h"
 #include "vrpacing/config.h"
 #include "vrpacing/shared_state.h"
+#include "vrpacing/telemetry_advisor.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -27,6 +28,7 @@ namespace {
 
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT_PTR IDT_SCANNER_TIMER = 101;
+constexpr UINT_PTR IDT_TELEMETRY_TIMER = 102;
 
 // UI Control IDs
 constexpr UINT ID_CHECK_NIS = 2001;
@@ -75,6 +77,10 @@ HWND g_hLblFps = nullptr;
 HWND g_hLblProcess = nullptr;
 HWND g_hLblRes = nullptr;
 HWND g_hLblPipeline = nullptr;
+HWND g_hLblAdvisor = nullptr;
+HWND g_hFrameGraph = nullptr;
+
+static vrpacing::TelemetryAnalyzer g_advisor;
 
 HWND g_hChkNis = nullptr;
 HWND g_hChkMask = nullptr;
@@ -259,6 +265,7 @@ void CheckActiveProcessLiveness() {
                 g_shared->frameTimesMs[i] = 0.0f;
             }
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VR game closed. Telemetry and IPC state reset to Idle.");
+            g_advisor.Reset();
         }
     } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
         const DWORD deadPid = g_shared->activePid;
@@ -274,6 +281,7 @@ void CheckActiveProcessLiveness() {
         g_shared->vrsStatus = 0;
         g_shared->maskStatus = 0;
         g_shared->frameTimeWriteIdx = 0;
+        g_advisor.Reset();
     }
 }
 
@@ -387,6 +395,10 @@ void UpdateTelemetryDisplay() {
     if (g_hLblProcess) SetWindowTextW(g_hLblProcess, txtProc);
     if (g_hLblRes) SetWindowTextW(g_hLblRes, txtRes);
     if (g_hLblPipeline) SetWindowTextW(g_hLblPipeline, txtPipe);
+    if (g_hLblAdvisor) {
+        const auto& rep = g_advisor.GetReport();
+        SetWindowTextW(g_hLblAdvisor, rep.summaryLine);
+    }
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -443,7 +455,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
 
     HWND hGrpStatus = CreateWindowExW(0, L"BUTTON", L" Telemetry && Real-Time Diagnostics ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 8, 434, 138, hwnd, nullptr, hInst, nullptr);
+                                      15, 8, 434, 162, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpStatus, g_hFontBold);
 
     g_hLblApi = CreateWindowExW(0, L"STATIC", L"Active API: Detecting...",
@@ -481,105 +493,110 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                      30, 116, 400, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblPipeline, g_hFontBold);
 
+    g_hLblAdvisor = CreateWindowExW(0, L"STATIC", L"Advisor: Waiting for VR session...",
+                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                    30, 138, 404, 18, hwnd, nullptr, hInst, nullptr);
+    SetFont(g_hLblAdvisor, g_hFontBold);
+
     HWND hGrpUpscale = CreateWindowExW(0, L"BUTTON", L" Spatial Upscaling (NVIDIA Image Scaling) ",
-                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                       15, 154, 434, 74, hwnd, nullptr, hInst, nullptr);
+                                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                        15, 178, 434, 74, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpUpscale, g_hFontBold);
 
     g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Spatial Upscaling",
-                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                30, 176, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 30, 200, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
     SetFont(g_hChkNis, g_hFontNormal);
 
     HWND hLblFixed = CreateWindowExW(0, L"STATIC", L"Profile: 2.0x Scale  |  60% Center Radius  |  0% Sharpening",
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     30, 200, 404, 18, hwnd, nullptr, hInst, nullptr);
+                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                      30, 224, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblFixed, g_hFontNormal);
 
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Smoothness ",
-                                      WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 236, 434, 248, hwnd, nullptr, hInst, nullptr);
+                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                       15, 260, 434, 248, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
-    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active  Locks FPS just below refresh rate for smooth VR",
-                                            WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                            30, 258, 404, 18, hwnd, nullptr, hInst, nullptr);
+    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active — Locks FPS just below refresh rate for smooth VR",
+                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                             30, 282, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblPacingStatus, g_hFontNormal);
 
     HWND hLblRate = CreateWindowExW(0, L"STATIC", L"Target Rate Mode:",
-                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 282, 400, 16, hwnd, nullptr, hInst, nullptr);
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     30, 306, 400, 16, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblRate, g_hFontBold);
 
     g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"1x - Standard VR: Native Hz && VD SSW (60 / 72 / 80 / 90 / 120 Hz)",
-                                 WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                 42, 300, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
+                                  WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+                                  42, 324, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
     SetFont(g_hRadio1x, g_hFontNormal);
 
     g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"1/2x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
-                                   WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                   42, 320, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
+                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                                    42, 344, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
     SetFont(g_hRadioHalf, g_hFontNormal);
 
     g_hRadioThird = CreateWindowExW(0, L"BUTTON", L"1/3x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
-                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                    42, 340, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_THIRD)), hInst, nullptr);
+                                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                                     42, 364, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_THIRD)), hInst, nullptr);
     SetFont(g_hRadioThird, g_hFontNormal);
 
     HWND hLblOffset = CreateWindowExW(0, L"STATIC", L"Frame Rate Cap Offset:",
-                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      30, 366, 400, 16, hwnd, nullptr, hInst, nullptr);
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       30, 390, 400, 16, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblOffset, g_hFontBold);
 
     g_hRadioOffset010 = CreateWindowExW(0, L"BUTTON", L"-0.10 FPS (Recommended - Best stability && driver queue drainage)",
-                                        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                        42, 384, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_010)), hInst, nullptr);
+                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+                                         42, 408, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_010)), hInst, nullptr);
     SetFont(g_hRadioOffset010, g_hFontNormal);
 
     g_hRadioOffset005 = CreateWindowExW(0, L"BUTTON", L"-0.05 FPS (Tight Margin - Closer to native Hz, less headroom)",
-                                        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                        42, 404, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_005)), hInst, nullptr);
+                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                                         42, 428, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_005)), hInst, nullptr);
     SetFont(g_hRadioOffset005, g_hFontNormal);
 
     HWND hLblNote = CreateWindowExW(0, L"STATIC",
-                                    L"Note: Always use 1x for Native Hz and Virtual Desktop SSW. Use 1/2x or 1/3x only with external tools like VectorXR or OFXR-Bridge.",
-                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 430, 404, 32, hwnd, nullptr, hInst, nullptr);
+                                     L"Note: Always use 1x for Native Hz and Virtual Desktop SSW. Use 1/2x or 1/3x only with external tools like VectorXR or OFXR-Bridge.",
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     30, 454, 404, 32, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblNote, g_hFontNormal);
 
     HWND hGrpExp = CreateWindowExW(0, L"BUTTON", L" Experimental Options ",
-                                   WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                   15, 492, 434, 96, hwnd, nullptr, hInst, nullptr);
+                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                    15, 516, 434, 96, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpExp, g_hFontBold);
 
     g_hChkMask = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR Only)",
-                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 30, 512, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
+                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                  30, 536, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
 
     g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenVR && Oculus Only)",
-                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                30, 536, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 30, 560, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
     SetFont(g_hChkFfr, g_hFontNormal);
 
     g_hChkFfrOpenXr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenXR D3D11 Only)",
-                                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                      30, 560, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR_OPENXR)), hInst, nullptr);
+                                       WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                       30, 584, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR_OPENXR)), hInst, nullptr);
     SetFont(g_hChkFfrOpenXr, g_hFontNormal);
 
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
-                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                        15, 600, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         15, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   163, 600, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
+                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                    163, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
     HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit Application",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    311, 600, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     311, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -591,11 +608,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SyncUiWithConfig();
             RegisterOpenXrImplicitLayer();
             SetTimer(hwnd, IDT_SCANNER_TIMER, 2000, nullptr);
+            SetTimer(hwnd, IDT_TELEMETRY_TIMER, 250, nullptr);
             return 0;
         }
 
         case WM_TIMER:
-            if (wParam == IDT_SCANNER_TIMER) {
+            if (wParam == IDT_TELEMETRY_TIMER) {
+                if (g_shared) {
+                    g_advisor.Ingest(*g_shared);
+                    g_shared->avgFps = g_advisor.GetAvgFps();
+                    g_shared->onePercentLowFps = g_advisor.GetOnePercentLowFps();
+                }
+                UpdateTelemetryDisplay();
+                if (g_hFrameGraph) {
+                    InvalidateRect(g_hFrameGraph, nullptr, FALSE);
+                }
+            } else if (wParam == IDT_SCANNER_TIMER) {
                 g_scanner.PollAndInject(g_hookPath);
                 UpdateTelemetryDisplay();
             }
@@ -735,6 +763,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd, IDT_SCANNER_TIMER);
+            KillTimer(hwnd, IDT_TELEMETRY_TIMER);
             UnregisterOpenXrImplicitLayer();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hFontNormal) DeleteObject(g_hFontNormal);
@@ -805,7 +834,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 680;
+    const int winH = 710;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 
