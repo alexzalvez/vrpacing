@@ -250,6 +250,14 @@ void CheckActiveProcessLiveness() {
             g_shared->appliedCap = 0.0;
             g_shared->avgFps = 0.0;
             g_shared->onePercentLowFps = 0.0;
+            g_shared->rawPanelHz = 0.0;
+            g_shared->sswActive = 0;
+            g_shared->vrsStatus = 0;
+            g_shared->maskStatus = 0;
+            g_shared->frameTimeWriteIdx = 0;
+            for (size_t i = 0; i < 256; ++i) {
+                g_shared->frameTimesMs[i] = 0.0f;
+            }
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VR game closed. Telemetry and IPC state reset to Idle.");
         }
     } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
@@ -261,6 +269,11 @@ void CheckActiveProcessLiveness() {
         wcscpy_s(g_shared->activeApi, L"Idle");
         wcscpy_s(g_shared->hookedProcess, L"None");
         g_shared->appliedCap = 0.0;
+        g_shared->rawPanelHz = 0.0;
+        g_shared->sswActive = 0;
+        g_shared->vrsStatus = 0;
+        g_shared->maskStatus = 0;
+        g_shared->frameTimeWriteIdx = 0;
     }
 }
 
@@ -289,7 +302,12 @@ void UpdateTelemetryDisplay() {
         }
 
         if (g_shared->effectiveHz > 10.0) {
-            swprintf_s(txtHz, L"HMD Refresh: %.1f Hz", g_shared->effectiveHz);
+            if (g_shared->sswActive != 0) {
+                const double displayPanelHz = (g_shared->rawPanelHz > 10.0) ? g_shared->rawPanelHz : (g_shared->effectiveHz * 2.0);
+                swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (SSW Active)", displayPanelHz);
+            } else {
+                swprintf_s(txtHz, L"HMD Refresh: %.1f Hz", g_shared->effectiveHz);
+            }
         } else {
             wcscpy_s(txtHz, L"HMD Refresh: Detecting...");
         }
@@ -321,22 +339,38 @@ void UpdateTelemetryDisplay() {
             wcscpy_s(txtRes, L"Resolution: Waiting for Swapchain...");
         }
 
+        const wchar_t* vrsStr = L"Off";
+        if (g_shared->vrsStatus == 1) vrsStr = L"D3D11 NVAPI";
+        else if (g_shared->vrsStatus == 2) vrsStr = L"D3D12 Tier-2";
+        else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded";
+        else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
+
+        const wchar_t* maskStr = (g_shared->maskStatus > 0) ? L"Active" : L"Off";
+
         if (g_shared->upscaleStatus == 1) {
-            wcscpy_s(txtPipe, L"NIS Pipeline: ACTIVE OK (2.0x Scaled)");
+            swprintf_s(txtPipe, L"NIS: Active (2.0x) | VRS: %s | Mask: %s", vrsStr, maskStr);
         } else if (g_shared->upscaleStatus == -1) {
-            swprintf_s(txtPipe, L"NIS Pipeline: Swapchain Create Error [HR: 0x%08X]", g_shared->lastHResult);
+            swprintf_s(txtPipe, L"NIS: Err [HR: 0x%08X] | VRS: %s", g_shared->lastHResult, vrsStr);
         } else if (g_shared->upscaleStatus == -2) {
-            wcscpy_s(txtPipe, L"NIS Pipeline: Shader Initialization Error");
+            swprintf_s(txtPipe, L"NIS: Shader Err | VRS: %s", vrsStr);
         } else if (g_shared->upscaleStatus == -3) {
-            swprintf_s(txtPipe, L"NIS Pipeline: Dispatch/UAV Error [HR: 0x%08X]", g_shared->lastHResult);
+            swprintf_s(txtPipe, L"NIS: Dispatch Err | VRS: %s", vrsStr);
+        } else if (g_shared->vrsStatus != 0 || g_shared->maskStatus > 0) {
+            swprintf_s(txtPipe, L"NIS: Idle | VRS: %s | Mask: %s", vrsStr, maskStr);
         } else {
-            wcscpy_s(txtPipe, L"NIS Pipeline: Idle");
+            wcscpy_s(txtPipe, L"Pipeline: Idle");
         }
 
         wchar_t tip[128]{};
         if (hasApi && g_shared->appliedCap > 0.0) {
-            swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.1f Hz)",
-                       vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, g_shared->effectiveHz);
+            if (g_shared->sswActive != 0) {
+                const double displayHz = (g_shared->rawPanelHz > 10.0) ? g_shared->rawPanelHz : (g_shared->effectiveHz * 2.0);
+                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f Hz SSW)",
+                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, displayHz);
+            } else {
+                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.1f Hz)",
+                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, g_shared->effectiveHz);
+            }
         } else if (hasApi) {
             swprintf_s(tip, L"VRPacing %s [%s] | Active", vrpacing::kAppVersionString, g_shared->activeApi);
         } else {
@@ -467,7 +501,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                       15, 236, 434, 248, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
-    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active — Locks FPS just below refresh rate for smooth VR",
+    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active Â— Locks FPS just below refresh rate for smooth VR",
                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
                                             30, 258, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblPacingStatus, g_hFontNormal);
@@ -801,7 +835,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared = reinterpret_cast<vrpacing::SharedState*>(view);
     if (g_shared) {
         *g_shared = {};
-        g_shared->version = 6;
+        g_shared->version = vrpacing::kSharedStateVersion;
         g_shared->activePid = 0;
         g_shared->openXrD3D11Pid = 0;
         wcscpy_s(g_shared->activeApi, L"Idle");
