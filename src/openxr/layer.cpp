@@ -946,9 +946,14 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     }
 
     const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (VDXR Bridge)";
-    g_shm.UpdateTelemetry(apiLabel, hz, targetFps,
-                          g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
-                          g_lastFormat, g_upscaleStatus, g_lastHResult);
+    const int32_t vrsStatus = g_d3d12Device ? VrsFoveatedD3D12::Instance().GetVrsStatus()
+                                            : VrsFoveatedD3D11::Instance().GetVrsStatus();
+    const int32_t maskStatus = g_cfg.mask.enabled ? 1 : 0;
+    g_shm.UpdateSessionTelemetry(apiLabel, hz, targetFps,
+                                 s_panelHz, s_sswHalfRateActive ? 1u : 0u,
+                                 vrsStatus, maskStatus,
+                                 g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
+                                 g_lastFormat, g_upscaleStatus, g_lastHResult);
 
     XrResult res = g_nextWaitFrame(session, info, state);
 
