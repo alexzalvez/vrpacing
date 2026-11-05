@@ -951,9 +951,10 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     if (IsOpenCompositeActive()) {
         vrsStatus = -1;
     } else if (g_d3d12Device) {
-        vrsStatus = (VrsFoveatedD3D12::Instance().GetVrsStatus() > 0 || VrsFoveatedD3D12::Instance().HasActiveBinds()) ? 2 : 0;
+        const int32_t st12 = VrsFoveatedD3D12::Instance().GetVrsStatus();
+        vrsStatus = (st12 > 0) ? 2 : st12;
     } else if (g_d3d11Device) {
-        vrsStatus = (VrsFoveatedD3D11::Instance().GetVrsStatus() > 0 || VrsFoveatedD3D11::Instance().HasActiveBinds()) ? 1 : 0;
+        vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
     }
 
     int32_t maskStatus = 0;
@@ -1338,5 +1339,6 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
 }
 
 #endif
+
 
 
