@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
 #include <filesystem>
@@ -34,15 +35,12 @@ constexpr UINT_PTR IDT_TELEMETRY_TIMER = 102;
 constexpr UINT ID_CHECK_NIS = 2001;
 constexpr UINT ID_RADIO_1X = 2003;
 constexpr UINT ID_RADIO_HALF = 2004;
-constexpr UINT ID_RADIO_THIRD = 2005;
-constexpr UINT ID_RADIO_OFFSET_010 = 2006;
-constexpr UINT ID_RADIO_OFFSET_005 = 2007;
 constexpr UINT ID_BTN_MINIMIZE = 2009;
 constexpr UINT ID_BTN_OPEN_LOG = 2010;
 constexpr UINT ID_BTN_EXIT = 2011;
 constexpr UINT ID_CHECK_MASK = 2012;
 constexpr UINT ID_CHECK_FFR = 2013;
-constexpr UINT ID_CHECK_FFR_OPENXR = 2014;
+constexpr UINT ID_BTN_RESET_STATS = 2015;
 
 // Tray Menu IDs
 constexpr UINT ID_TRAY_OPEN = 3001;
@@ -50,14 +48,13 @@ constexpr UINT ID_TRAY_NIS = 3002;
 constexpr UINT ID_TRAY_PACING = 3003;
 constexpr UINT ID_TRAY_RATE_1X = 3004;
 constexpr UINT ID_TRAY_RATE_HALF = 3005;
-constexpr UINT ID_TRAY_RATE_THIRD = 3006;
-constexpr UINT ID_TRAY_OFFSET_010 = 3007;
-constexpr UINT ID_TRAY_OFFSET_005 = 3008;
 constexpr UINT ID_TRAY_OPEN_LOG = 3010;
 constexpr UINT ID_TRAY_EXIT = 3011;
 constexpr UINT ID_TRAY_MASK = 3012;
 constexpr UINT ID_TRAY_FFR = 3013;
-constexpr UINT ID_TRAY_FFR_OPENXR = 3014;
+
+// Coordenadas del area de la grafica GDI en la ventana principal
+constexpr RECT kGraphRect = { 30, 172, 434, 246 };
 
 NOTIFYICONDATAW g_nid{};
 vrpacing::RuntimeConfig g_cfg;
@@ -69,6 +66,7 @@ std::wstring g_hookPath;
 HWND g_hMainWnd = nullptr;
 HFONT g_hFontNormal = nullptr;
 HFONT g_hFontBold = nullptr;
+HFONT g_hFontSmall = nullptr;
 
 HWND g_hLblApi = nullptr;
 HWND g_hLblHz = nullptr;
@@ -78,19 +76,14 @@ HWND g_hLblProcess = nullptr;
 HWND g_hLblRes = nullptr;
 HWND g_hLblPipeline = nullptr;
 HWND g_hLblAdvisor = nullptr;
-HWND g_hFrameGraph = nullptr;
 
 static vrpacing::TelemetryAnalyzer g_advisor;
 
 HWND g_hChkNis = nullptr;
-HWND g_hChkMask = nullptr;
 HWND g_hChkFfr = nullptr;
-HWND g_hChkFfrOpenXr = nullptr;
+HWND g_hChkMask = nullptr;
 HWND g_hRadio1x = nullptr;
 HWND g_hRadioHalf = nullptr;
-HWND g_hRadioThird = nullptr;
-HWND g_hRadioOffset010 = nullptr;
-HWND g_hRadioOffset005 = nullptr;
 
 bool IsCurrentProcessElevated() {
     HANDLE hToken = nullptr;
@@ -172,8 +165,10 @@ void UpdateSharedStateFlags() {
     if (g_cfg.enabled) flags |= vrpacing::kFlagEnabled;
     if (g_cfg.upscaling.enabled) flags |= vrpacing::kFlagUpscalingEnabled;
     if (g_cfg.mask.enabled) flags |= vrpacing::kFlagMaskEnabled;
-    if (g_cfg.ffr.enabled) flags |= vrpacing::kFlagFfrEnabled;
-    if (g_cfg.ffr.openxrEnabled) flags |= vrpacing::kFlagFfrOpenXrEnabled;
+    if (g_cfg.ffr.enabled) {
+        flags |= vrpacing::kFlagFfrEnabled;
+        flags |= vrpacing::kFlagFfrOpenXrEnabled;
+    }
     flags |= vrpacing::kFlagPacingEnabled;
     if (g_hMainWnd && IsWindowVisible(g_hMainWnd)) {
         flags |= vrpacing::kFlagTelemetryActive;
@@ -181,35 +176,25 @@ void UpdateSharedStateFlags() {
 
     g_shared->flags = flags;
     g_shared->frameGenDivisor = (g_cfg.pacing.frameGenDivisor > 0.0) ? g_cfg.pacing.frameGenDivisor : 1.0;
-    g_shared->offsetFps = g_cfg.pacing.offsetFps;
+    g_shared->offsetFps = 0.10;
 }
 
 void SyncUiWithConfig() {
     if (g_hChkNis) {
         SendMessageW(g_hChkNis, BM_SETCHECK, g_cfg.upscaling.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
-    if (g_hChkMask) {
-        SendMessageW(g_hChkMask, BM_SETCHECK, g_cfg.mask.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    }
     if (g_hChkFfr) {
         SendMessageW(g_hChkFfr, BM_SETCHECK, g_cfg.ffr.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
-    if (g_hChkFfrOpenXr) {
-        SendMessageW(g_hChkFfrOpenXr, BM_SETCHECK, g_cfg.ffr.openxrEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_hChkMask) {
+        SendMessageW(g_hChkMask, BM_SETCHECK, g_cfg.mask.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
     const double divisor = g_cfg.pacing.frameGenDivisor;
-    const bool is1x = (divisor <= 1.05);
-    const bool isHalf = (std::abs(divisor - 2.0) < 0.1);
-    const bool isThird = (std::abs(divisor - 3.0) < 0.1);
+    const bool isHalf = (divisor > 1.05);
 
-    if (g_hRadio1x) SendMessageW(g_hRadio1x, BM_SETCHECK, is1x ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_hRadio1x) SendMessageW(g_hRadio1x, BM_SETCHECK, (!isHalf) ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_hRadioHalf) SendMessageW(g_hRadioHalf, BM_SETCHECK, isHalf ? BST_CHECKED : BST_UNCHECKED, 0);
-    if (g_hRadioThird) SendMessageW(g_hRadioThird, BM_SETCHECK, isThird ? BST_CHECKED : BST_UNCHECKED, 0);
-
-    const bool is005 = (std::abs(g_cfg.pacing.offsetFps - 0.05) < 0.025);
-    if (g_hRadioOffset010) SendMessageW(g_hRadioOffset010, BM_SETCHECK, is005 ? BST_UNCHECKED : BST_CHECKED, 0);
-    if (g_hRadioOffset005) SendMessageW(g_hRadioOffset005, BM_SETCHECK, is005 ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void SaveAndPropagate() {
@@ -220,10 +205,14 @@ void SaveAndPropagate() {
     g_cfg.mask.radiusY = 1.00f;
     g_cfg.mask.segments = 256;
     g_cfg.ffr.innerRadius = 0.60f;
+    g_cfg.ffr.openxrEnabled = g_cfg.ffr.enabled;
     g_cfg.pacing.enabled = true;
+    g_cfg.pacing.offsetFps = 0.10;
 
-    if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
-        g_cfg.pacing.offsetFps = 0.10;
+    if (g_cfg.pacing.frameGenDivisor > 1.05) {
+        g_cfg.pacing.frameGenDivisor = 2.0;
+    } else {
+        g_cfg.pacing.frameGenDivisor = 1.0;
     }
 
     vrpacing::SaveConfig(g_cfg);
@@ -246,6 +235,7 @@ void CheckActiveProcessLiveness() {
             }
             wcscpy_s(g_shared->activeApi, L"Idle");
             wcscpy_s(g_shared->hookedProcess, L"None");
+            g_shared->effectiveHz = 0.0;
             g_shared->inputWidth = 0;
             g_shared->inputHeight = 0;
             g_shared->outputWidth = 0;
@@ -256,6 +246,7 @@ void CheckActiveProcessLiveness() {
             g_shared->appliedCap = 0.0;
             g_shared->avgFps = 0.0;
             g_shared->onePercentLowFps = 0.0;
+            g_shared->frameCounter = 0;
             g_shared->rawPanelHz = 0.0;
             g_shared->sswActive = 0;
             g_shared->vrsStatus = 0;
@@ -275,7 +266,11 @@ void CheckActiveProcessLiveness() {
         }
         wcscpy_s(g_shared->activeApi, L"Idle");
         wcscpy_s(g_shared->hookedProcess, L"None");
+        g_shared->effectiveHz = 0.0;
         g_shared->appliedCap = 0.0;
+        g_shared->avgFps = 0.0;
+        g_shared->onePercentLowFps = 0.0;
+        g_shared->frameCounter = 0;
         g_shared->rawPanelHz = 0.0;
         g_shared->sswActive = 0;
         g_shared->vrsStatus = 0;
@@ -283,6 +278,104 @@ void CheckActiveProcessLiveness() {
         g_shared->frameTimeWriteIdx = 0;
         g_advisor.Reset();
     }
+}
+
+void DrawFrametimeGraph(HDC hdcWindow) {
+    const int w = kGraphRect.right - kGraphRect.left;
+    const int h = kGraphRect.bottom - kGraphRect.top;
+    if (w <= 0 || h <= 0) return;
+
+    HDC memDc = CreateCompatibleDC(hdcWindow);
+    HBITMAP memBmp = CreateCompatibleBitmap(hdcWindow, w, h);
+    HGDIOBJ oldBmp = SelectObject(memDc, memBmp);
+
+    // 1. Fondo oscuro y marco
+    RECT rcLocal{ 0, 0, w, h };
+    HBRUSH bgBrush = CreateSolidBrush(RGB(22, 26, 32));
+    FillRect(memDc, &rcLocal, bgBrush);
+    DeleteObject(bgBrush);
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(65, 72, 84));
+    HGDIOBJ oldPen = SelectObject(memDc, borderPen);
+    HGDIOBJ oldBrush = SelectObject(memDc, GetStockObject(NULL_BRUSH));
+    Rectangle(memDc, 0, 0, w, h);
+
+    // Escala vertical: 0.0 ms (abajo) a 33.33 ms (arriba)
+    constexpr float kMaxMs = 33.33f;
+    auto MsToY = [h, kMaxMs](float ms) -> int {
+        const float clamped = std::clamp(ms, 0.0f, kMaxMs);
+        const float norm = clamped / kMaxMs;
+        return (h - 2) - static_cast<int>( std::lround(norm * static_cast<float>(h - 4)) );
+    };
+
+    // 2. Lineas guia horizontales (8.33 ms = 120 FPS, 11.11 ms = 90 FPS, 16.67 ms = 60 FPS)
+    HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(40, 46, 56));
+    SelectObject(memDc, gridPen);
+    const float kGuides[] = { 8.33f, 11.11f, 16.67f, 22.22f };
+    for (float gMs : kGuides) {
+        const int y = MsToY(gMs);
+        MoveToEx(memDc, 1, y, nullptr);
+        LineTo(memDc, w - 1, y);
+    }
+
+    // 3. Linea verde del objetivo actual (Target Budget ms)
+    const bool hasActiveSession = (g_shared && g_shared->activePid != 0 && g_shared->appliedCap > 0.0);
+    if (hasActiveSession) {
+        const float targetMs = static_cast<float>(1000.0 / g_shared->appliedCap);
+        const int yTarget = MsToY(targetMs);
+        HPEN targetPen = CreatePen(PS_SOLID, 1, RGB(50, 185, 85));
+        SelectObject(memDc, targetPen);
+        MoveToEx(memDc, 1, yTarget, nullptr);
+        LineTo(memDc, w - 1, yTarget);
+        DeleteObject(targetPen);
+    }
+
+    // 4. Polilinea cian con las 180 muestras de frametime (ms)
+    const auto& history = g_advisor.GetGraphHistory();
+    HPEN linePen = CreatePen(PS_SOLID, 1, RGB(80, 205, 255));
+    SelectObject(memDc, linePen);
+
+    POINT pts[180]{};
+    int validCount = 0;
+    for (size_t i = 0; i < history.size(); ++i) {
+        const float ms = history[i];
+        if (ms <= 0.1f) continue;
+        const int x = 2 + static_cast<int>((i * static_cast<size_t>(w - 4)) / (history.size() - 1));
+        const int y = MsToY(ms);
+        pts[validCount++] = POINT{ x, y };
+    }
+    if (validCount >= 2) {
+        Polyline(memDc, pts, validCount);
+    }
+
+    // 5. Etiquetas de escala superpuestas
+    SetBkMode(memDc, TRANSPARENT);
+    SetTextColor(memDc, RGB(155, 165, 180));
+    HGDIOBJ oldFont = SelectObject(memDc, g_hFontSmall ? g_hFontSmall : g_hFontNormal);
+
+    wchar_t overlayTxt[96]{};
+    if (hasActiveSession) {
+        const double targetMs = 1000.0 / g_shared->appliedCap;
+        swprintf_s(overlayTxt, L"Frame Interval (0 - 33.3 ms)  |  Target Budget: %.2f ms", targetMs);
+    } else {
+        wcscpy_s(overlayTxt, L"Frame Interval Graph (0 - 33.3 ms)  |  Idle");
+    }
+    RECT rcText{ 6, 3, w - 6, 19 };
+    DrawTextW(memDc, overlayTxt, -1, &rcText, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+
+    // Volcado final sin parpadeo
+    BitBlt(hdcWindow, kGraphRect.left, kGraphRect.top, w, h, memDc, 0, 0, SRCCOPY);
+
+    SelectObject(memDc, oldFont);
+    SelectObject(memDc, oldBrush);
+    SelectObject(memDc, oldPen);
+    DeleteObject(linePen);
+    DeleteObject(gridPen);
+    DeleteObject(borderPen);
+
+    SelectObject(memDc, oldBmp);
+    DeleteObject(memBmp);
+    DeleteDC(memDc);
 }
 
 void UpdateTelemetryDisplay() {
@@ -297,7 +390,8 @@ void UpdateTelemetryDisplay() {
     wchar_t txtPipe[128]{};
 
     if (g_shared) {
-        const bool hasApi = (g_shared->activeApi[0] != L'\0' &&
+        const bool hasApi = (g_shared->activePid != 0 &&
+                             g_shared->activeApi[0] != L'\0' &&
                              wcscmp(g_shared->activeApi, L"Idle") != 0 &&
                              wcscmp(g_shared->activeApi, L"none") != 0);
 
@@ -307,7 +401,7 @@ void UpdateTelemetryDisplay() {
             wcscpy_s(txtApi, L"Active API: Idle (No VR Session)");
         }
 
-        if (g_shared->effectiveHz > 10.0) {
+        if (hasApi && g_shared->effectiveHz > 10.0) {
             bool isSsw = false;
             double targetHz = g_shared->effectiveHz;
             double panelHz = g_shared->rawPanelHz;
@@ -318,28 +412,30 @@ void UpdateTelemetryDisplay() {
                 swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (Native)", panelHz);
             }
         } else {
-            wcscpy_s(txtHz, L"HMD Refresh: Detecting...");
+            wcscpy_s(txtHz, L"HMD Refresh: Waiting...");
         }
 
-        if (g_shared->appliedCap > 0.0) {
+        if (hasApi && g_shared->appliedCap > 0.0) {
             swprintf_s(txtCap, L"Active Cap: %.2f FPS", g_shared->appliedCap);
         } else {
-            swprintf_s(txtCap, L"Active Cap: Armed (-%.2f FPS)", g_cfg.pacing.offsetFps);
+            wcscpy_s(txtCap, L"Active Cap: Armed (-0.10 FPS)");
         }
 
-        if (g_shared->avgFps > 5.0) {
+        if (hasApi && g_shared->avgFps > 5.0) {
             swprintf_s(txtFps, L"Avg FPS: %.1f  |  1%% Low: %.1f FPS", g_shared->avgFps, g_shared->onePercentLowFps);
-        } else {
+        } else if (hasApi) {
             swprintf_s(txtFps, L"FPS: Measuring... (Frames: %llu)", g_shared->frameCounter);
+        } else {
+            wcscpy_s(txtFps, L"Avg FPS: --  |  1% Low: --");
         }
 
-        if (g_shared->hookedProcess[0] != L'\0' && wcscmp(g_shared->hookedProcess, L"None") != 0) {
+        if (hasApi && g_shared->hookedProcess[0] != L'\0' && wcscmp(g_shared->hookedProcess, L"None") != 0) {
             swprintf_s(txtProc, L"Process: %s", g_shared->hookedProcess);
         } else {
             wcscpy_s(txtProc, L"Process: Monitoring for VR games...");
         }
 
-        if (g_shared->inputWidth > 0 && g_shared->outputWidth > 0) {
+        if (hasApi && g_shared->inputWidth > 0 && g_shared->outputWidth > 0) {
             swprintf_s(txtRes, L"Resolution: %ux%u -> %ux%u | FMT: %u",
                        g_shared->inputWidth, g_shared->inputHeight,
                        g_shared->outputWidth, g_shared->outputHeight,
@@ -348,39 +444,47 @@ void UpdateTelemetryDisplay() {
             wcscpy_s(txtRes, L"Resolution: Waiting for Swapchain...");
         }
 
+        // Estado individual verificado para NIS, VRS y Mascara
+        const wchar_t* nisStr = L"Off";
+        if (g_cfg.upscaling.enabled) {
+            if (!hasApi) nisStr = L"Standby";
+            else if (g_shared->upscaleStatus == 1) nisStr = L"Active (2.0x)";
+            else if (g_shared->upscaleStatus < 0) nisStr = L"Error";
+            else nisStr = L"Standby";
+        }
+
         const wchar_t* vrsStr = L"Off";
-        if (g_shared->vrsStatus == 1) vrsStr = L"D3D11 NVAPI";
-        else if (g_shared->vrsStatus == 2) vrsStr = L"D3D12 Tier-2";
-        else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded";
-        else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
+        if (g_cfg.ffr.enabled) {
+            if (!hasApi) vrsStr = L"Standby";
+            else if (g_shared->vrsStatus == 1) vrsStr = L"D3D11 NVAPI";
+            else if (g_shared->vrsStatus == 2) vrsStr = L"D3D12 Tier-2";
+            else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded (OC)";
+            else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
+            else vrsStr = L"Standby";
+        }
 
         const wchar_t* maskStr = L"Off";
-        if (g_shared->maskStatus == 1) maskStr = L"Active";
-        else if (g_shared->maskStatus == -1) maskStr = L"Excluded";
-
-        if (g_shared->upscaleStatus == 1) {
-            swprintf_s(txtPipe, L"NIS: Active (2.0x) | VRS: %s | Mask: %s", vrsStr, maskStr);
-        } else if (g_shared->upscaleStatus == -1) {
-            swprintf_s(txtPipe, L"NIS: Err [HR: 0x%08X] | VRS: %s", g_shared->lastHResult, vrsStr);
-        } else if (g_shared->upscaleStatus == -2) {
-            swprintf_s(txtPipe, L"NIS: Shader Err | VRS: %s", vrsStr);
-        } else if (g_shared->upscaleStatus == -3) {
-            swprintf_s(txtPipe, L"NIS: Dispatch Err | VRS: %s", vrsStr);
-        } else if (g_shared->vrsStatus != 0 || g_shared->maskStatus > 0) {
-            swprintf_s(txtPipe, L"NIS: Idle | VRS: %s | Mask: %s", vrsStr, maskStr);
-        } else {
-            wcscpy_s(txtPipe, L"Pipeline: Idle");
+        if (g_cfg.mask.enabled) {
+            if (!hasApi) maskStr = L"Standby";
+            else if (g_shared->maskStatus == 1) maskStr = L"Active";
+            else if (g_shared->maskStatus == -1) maskStr = L"Excluded (OC)";
+            else maskStr = L"Standby";
         }
+
+        swprintf_s(txtPipe, L"NIS: %s  |  VRS: %s  |  Mask: %s", nisStr, vrsStr, maskStr);
 
         wchar_t tip[128]{};
         if (hasApi && g_shared->appliedCap > 0.0) {
-            if (g_shared->sswActive != 0) {
-                const double displayHz = (g_shared->rawPanelHz > 10.0) ? g_shared->rawPanelHz : (g_shared->effectiveHz * 2.0);
-                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f Hz SSW)",
-                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, displayHz);
+            bool isSsw = false;
+            double targetHz = g_shared->effectiveHz;
+            double panelHz = g_shared->rawPanelHz;
+            vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
+            if (isSsw) {
+                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f/%.0f Hz SSW)",
+                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, targetHz, panelHz);
             } else {
-                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.1f Hz)",
-                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, g_shared->effectiveHz);
+                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f Hz Native)",
+                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, panelHz);
             }
         } else if (hasApi) {
             swprintf_s(tip, L"VRPacing %s [%s] | Active", vrpacing::kAppVersionString, g_shared->activeApi);
@@ -410,28 +514,16 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_STRING | MF_DEFAULT, ID_TRAY_OPEN, L"Open VRPacing Panel");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    AppendMenuW(hMenu, MF_STRING | (g_cfg.upscaling.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_NIS, L"NIS 2.0x Spatial Upscaling");
-    AppendMenuW(hMenu, MF_STRING | MF_CHECKED | MF_GRAYED, ID_TRAY_PACING, L"Frame Pacing && Smoothness (Always Active)");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.upscaling.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_NIS, L"Enable NIS 2.0x Spatial Upscaling");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"Enable Fixed Foveated Rendering (VRS)");
+    AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"Enable Pre-Render Circular Mask");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    const double divisor = g_cfg.pacing.frameGenDivisor;
-    const bool is1x = (divisor <= 1.05);
-    const bool isHalf = (std::abs(divisor - 2.0) < 0.1);
-    const bool isThird = (std::abs(divisor - 3.0) < 0.1);
-
-    AppendMenuW(hMenu, MF_STRING | (is1x ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_1X, L"Rate: 1x Standard VR (Native Hz && VD SSW)");
-    AppendMenuW(hMenu, MF_STRING | (isHalf ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_HALF, L"Rate: 1/2x External Only (VectorXR / OFXR-Bridge)");
-    AppendMenuW(hMenu, MF_STRING | (isThird ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_THIRD, L"Rate: 1/3x External Only (VectorXR / OFXR-Bridge)");
+    const bool isHalf = (g_cfg.pacing.frameGenDivisor > 1.05);
+    AppendMenuW(hMenu, MF_STRING | (!isHalf ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_1X, L"Rate: Automatic (Native Hz && Auto SSW)");
+    AppendMenuW(hMenu, MF_STRING | (isHalf ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_HALF, L"Rate: Half Refresh Rate (Manual Hz / 2)");
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    const bool is005 = (std::abs(g_cfg.pacing.offsetFps - 0.05) < 0.025);
-    AppendMenuW(hMenu, MF_STRING | (is005 ? MF_UNCHECKED : MF_CHECKED), ID_TRAY_OFFSET_010, L"Offset: -0.10 FPS (Recommended - Best Stability)");
-    AppendMenuW(hMenu, MF_STRING | (is005 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_OFFSET_005, L"Offset: -0.05 FPS (Tight Margin)");
-
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR Only)");
-    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenVR && Oculus Only)");
-    AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.openxrEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR_OPENXR, L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenXR D3D11 Only)");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_LOG, L"Open Log File");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -452,154 +544,121 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
+    g_hFontSmall = CreateFontW(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
     auto SetFont = [](HWND hCtrl, HFONT hFont) {
         SendMessageW(hCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
     };
 
+    // 1. Seccion de Telemetria, Asesor y Grafica GDI
     HWND hGrpStatus = CreateWindowExW(0, L"BUTTON", L" Telemetry && Real-Time Diagnostics ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 8, 434, 162, hwnd, nullptr, hInst, nullptr);
+                                      15, 8, 434, 248, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpStatus, g_hFontBold);
 
-    g_hLblApi = CreateWindowExW(0, L"STATIC", L"Active API: Detecting...",
+    g_hLblApi = CreateWindowExW(0, L"STATIC", L"Active API: Idle (No VR Session)",
                                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                                 30, 28, 195, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblApi, g_hFontNormal);
 
-    g_hLblHz = CreateWindowExW(0, L"STATIC", L"HMD Refresh: -- Hz",
+    g_hLblHz = CreateWindowExW(0, L"STATIC", L"HMD Refresh: Waiting...",
                                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               230, 28, 200, 18, hwnd, nullptr, hInst, nullptr);
+                               230, 28, 204, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblHz, g_hFontNormal);
 
-    g_hLblCap = CreateWindowExW(0, L"STATIC", L"Active Cap: -- FPS",
+    g_hLblCap = CreateWindowExW(0, L"STATIC", L"Active Cap: Armed (-0.10 FPS)",
                                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                                 30, 50, 195, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblCap, g_hFontNormal);
 
-    g_hLblFps = CreateWindowExW(0, L"STATIC", L"Avg FPS: --  |  1% Low: -- FPS",
+    g_hLblFps = CreateWindowExW(0, L"STATIC", L"Avg FPS: --  |  1% Low: --",
                                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                230, 50, 200, 18, hwnd, nullptr, hInst, nullptr);
+                                230, 50, 204, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblFps, g_hFontNormal);
 
-    g_hLblProcess = CreateWindowExW(0, L"STATIC", L"Process: Monitoring...",
+    g_hLblProcess = CreateWindowExW(0, L"STATIC", L"Process: Monitoring for VR games...",
                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 72, 400, 18, hwnd, nullptr, hInst, nullptr);
+                                    30, 72, 310, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblProcess, g_hFontNormal);
+
+    HWND hBtnReset = CreateWindowExW(0, L"BUTTON", L"Reset Stats",
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     350, 69, 84, 22, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_RESET_STATS)), hInst, nullptr);
+    SetFont(hBtnReset, g_hFontSmall);
 
     g_hLblRes = CreateWindowExW(0, L"STATIC", L"Resolution: Waiting for Swapchain...",
                                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                30, 94, 400, 18, hwnd, nullptr, hInst, nullptr);
+                                30, 94, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblRes, g_hFontNormal);
 
-    g_hLblPipeline = CreateWindowExW(0, L"STATIC", L"NIS Pipeline: Idle",
+    g_hLblPipeline = CreateWindowExW(0, L"STATIC", L"NIS: Standby  |  VRS: Standby  |  Mask: Standby",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     30, 116, 400, 18, hwnd, nullptr, hInst, nullptr);
+                                     30, 118, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblPipeline, g_hFontBold);
 
     g_hLblAdvisor = CreateWindowExW(0, L"STATIC", L"Advisor: Waiting for VR session...",
                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    30, 138, 404, 18, hwnd, nullptr, hInst, nullptr);
+                                    30, 142, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblAdvisor, g_hFontBold);
 
-    HWND hGrpUpscale = CreateWindowExW(0, L"BUTTON", L" Spatial Upscaling (NVIDIA Image Scaling) ",
-                                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                        15, 178, 434, 74, hwnd, nullptr, hInst, nullptr);
-    SetFont(hGrpUpscale, g_hFontBold);
+    // 2. Seccion Unificada de Optimizaciones de Renderizado
+    HWND hGrpOpt = CreateWindowExW(0, L"BUTTON", L" Render Pipeline Optimizations ",
+                                   WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                   15, 266, 434, 108, hwnd, nullptr, hInst, nullptr);
+    SetFont(hGrpOpt, g_hFontBold);
 
-    g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Spatial Upscaling",
-                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 30, 200, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
+    g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Spatial Upscaling (60% Radius, 0% Sharpness)",
+                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                30, 290, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
     SetFont(g_hChkNis, g_hFontNormal);
 
-    HWND hLblFixed = CreateWindowExW(0, L"STATIC", L"Profile: 2.0x Scale  |  60% Center Radius  |  0% Sharpening",
-                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      30, 224, 404, 18, hwnd, nullptr, hInst, nullptr);
-    SetFont(hLblFixed, g_hFontNormal);
-
-    HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Smoothness ",
-                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                       15, 260, 434, 248, hwnd, nullptr, hInst, nullptr);
-    SetFont(hGrpPacing, g_hFontBold);
-
-    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Status: Always Active - Locks FPS just below refresh rate for smooth VR",
-                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                             30, 282, 404, 18, hwnd, nullptr, hInst, nullptr);
-    SetFont(hLblPacingStatus, g_hFontNormal);
-
-    HWND hLblRate = CreateWindowExW(0, L"STATIC", L"Target Rate Mode:",
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     30, 306, 400, 16, hwnd, nullptr, hInst, nullptr);
-    SetFont(hLblRate, g_hFontBold);
-
-    g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"1x - Standard VR: Native Hz && VD SSW (60 / 72 / 80 / 90 / 120 Hz)",
-                                  WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                  42, 324, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
-    SetFont(g_hRadio1x, g_hFontNormal);
-
-    g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"1/2x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
-                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                    42, 344, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
-    SetFont(g_hRadioHalf, g_hFontNormal);
-
-    g_hRadioThird = CreateWindowExW(0, L"BUTTON", L"1/3x - External Motion Interpolation Only (VectorXR / OFXR-Bridge)",
-                                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                     42, 364, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_THIRD)), hInst, nullptr);
-    SetFont(g_hRadioThird, g_hFontNormal);
-
-    HWND hLblOffset = CreateWindowExW(0, L"STATIC", L"Frame Rate Cap Offset:",
-                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       30, 390, 400, 16, hwnd, nullptr, hInst, nullptr);
-    SetFont(hLblOffset, g_hFontBold);
-
-    g_hRadioOffset010 = CreateWindowExW(0, L"BUTTON", L"-0.10 FPS (Recommended - Best stability && driver queue drainage)",
-                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                         42, 408, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_010)), hInst, nullptr);
-    SetFont(g_hRadioOffset010, g_hFontNormal);
-
-    g_hRadioOffset005 = CreateWindowExW(0, L"BUTTON", L"-0.05 FPS (Tight Margin - Closer to native Hz, less headroom)",
-                                         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                         42, 428, 395, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_OFFSET_005)), hInst, nullptr);
-    SetFont(g_hRadioOffset005, g_hFontNormal);
-
-    HWND hLblNote = CreateWindowExW(0, L"STATIC",
-                                     L"Note: Always use 1x for Native Hz and Virtual Desktop SSW. Use 1/2x or 1/3x only with external tools like VectorXR or OFXR-Bridge.",
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     30, 454, 404, 32, hwnd, nullptr, hInst, nullptr);
-    SetFont(hLblNote, g_hFontNormal);
-
-    HWND hGrpExp = CreateWindowExW(0, L"BUTTON", L" Experimental Options ",
-                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                    15, 516, 434, 96, hwnd, nullptr, hInst, nullptr);
-    SetFont(hGrpExp, g_hFontBold);
-
-    g_hChkMask = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Pre-Render Circular Mask (OpenXR Only)",
-                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                  30, 536, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
-    SetFont(g_hChkMask, g_hFontNormal);
-
-    g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenVR && Oculus Only)",
-                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 30, 560, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
+    g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"Enable Fixed Foveated Rendering (VRS - D3D11 && D3D12)",
+                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                30, 316, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
     SetFont(g_hChkFfr, g_hFontNormal);
 
-    g_hChkFfrOpenXr = CreateWindowExW(0, L"BUTTON", L"[EXPERIMENTAL] Fixed Foveated Rendering (OpenXR D3D11 Only)",
-                                       WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                       30, 584, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR_OPENXR)), hInst, nullptr);
-    SetFont(g_hChkFfrOpenXr, g_hFontNormal);
+    g_hChkMask = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Render Circular Visibility Mask",
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 30, 342, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
+    SetFont(g_hChkMask, g_hFontNormal);
 
+    // 3. Seccion Simplificada de Frame Pacing
+    HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Target Rate Mode ",
+                                      WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                      15, 384, 434, 118, hwnd, nullptr, hInst, nullptr);
+    SetFont(hGrpPacing, g_hFontBold);
+
+    HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Pacing is Always Active (-0.10 FPS offset below refresh target).",
+                                            WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                            30, 408, 404, 18, hwnd, nullptr, hInst, nullptr);
+    SetFont(hLblPacingStatus, g_hFontNormal);
+
+    g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"Automatic (Recommended - Native Hz && Auto SSW detection)",
+                                 WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+                                 36, 434, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
+    SetFont(g_hRadio1x, g_hFontNormal);
+
+    g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"Half Refresh Rate (Manual Hz / 2 lock - Force half-rate cap)",
+                                   WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                                   36, 460, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
+    SetFont(g_hRadioHalf, g_hFontNormal);
+
+    // 4. Botones de accion inferiores
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         15, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                        15, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    163, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
+                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                   163, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
     HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit Application",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     311, 624, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
+                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                    311, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -623,8 +682,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_shared->onePercentLowFps = g_advisor.GetOnePercentLowFps();
                 }
                 UpdateTelemetryDisplay();
-                if (g_hFrameGraph) {
-                    InvalidateRect(g_hFrameGraph, nullptr, FALSE);
+                if (IsWindowVisible(hwnd)) {
+                    InvalidateRect(hwnd, &kGraphRect, FALSE);
                 }
             } else if (wParam == IDT_SCANNER_TIMER) {
                 CheckActiveProcessLiveness();
@@ -632,6 +691,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 UpdateTelemetryDisplay();
             }
             return 0;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            DrawFrametimeGraph(hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
 
         case WM_CTLCOLORSTATIC: {
             auto hdcStatic = reinterpret_cast<HDC>(wParam);
@@ -645,48 +712,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_CHECK_NIS:
                     g_cfg.upscaling.enabled = (SendMessageW(g_hChkNis, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
+                    UpdateTelemetryDisplay();
                     break;
+
+                case ID_CHECK_FFR: {
+                    const bool checked = (SendMessageW(g_hChkFfr, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    g_cfg.ffr.enabled = checked;
+                    g_cfg.ffr.openxrEnabled = checked;
+                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
+                    break;
+                }
 
                 case ID_CHECK_MASK:
                     g_cfg.mask.enabled = (SendMessageW(g_hChkMask, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
-                    break;
-
-                case ID_CHECK_FFR:
-                    g_cfg.ffr.enabled = (SendMessageW(g_hChkFfr, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    SaveAndPropagate();
-                    break;
-
-                case ID_CHECK_FFR_OPENXR:
-                    g_cfg.ffr.openxrEnabled = (SendMessageW(g_hChkFfrOpenXr, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
                     break;
 
                 case ID_RADIO_1X:
+                case ID_TRAY_RATE_1X:
                     g_cfg.pacing.frameGenDivisor = 1.0;
                     SaveAndPropagate();
                     break;
 
                 case ID_RADIO_HALF:
+                case ID_TRAY_RATE_HALF:
                     g_cfg.pacing.frameGenDivisor = 2.0;
                     SaveAndPropagate();
                     break;
 
-                case ID_RADIO_THIRD:
-                    g_cfg.pacing.frameGenDivisor = 3.0;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_RADIO_OFFSET_010:
-                case ID_TRAY_OFFSET_010:
-                    g_cfg.pacing.offsetFps = 0.10;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_RADIO_OFFSET_005:
-                case ID_TRAY_OFFSET_005:
-                    g_cfg.pacing.offsetFps = 0.05;
-                    SaveAndPropagate();
+                case ID_BTN_RESET_STATS:
+                    g_advisor.Reset();
+                    if (g_shared) {
+                        g_shared->avgFps = 0.0;
+                        g_shared->onePercentLowFps = 0.0;
+                    }
+                    UpdateTelemetryDisplay();
+                    InvalidateRect(hwnd, &kGraphRect, FALSE);
                     break;
 
                 case ID_BTN_MINIMIZE:
@@ -710,41 +773,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
                     UpdateSharedStateFlags();
+                    UpdateTelemetryDisplay();
+                    InvalidateRect(hwnd, &kGraphRect, FALSE);
                     break;
 
                 case ID_TRAY_NIS:
                     g_cfg.upscaling.enabled = !g_cfg.upscaling.enabled;
                     SaveAndPropagate();
+                    UpdateTelemetryDisplay();
+                    break;
+
+                case ID_TRAY_FFR:
+                    g_cfg.ffr.enabled = !g_cfg.ffr.enabled;
+                    g_cfg.ffr.openxrEnabled = g_cfg.ffr.enabled;
+                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
                     break;
 
                 case ID_TRAY_MASK:
                     g_cfg.mask.enabled = !g_cfg.mask.enabled;
                     SaveAndPropagate();
-                    break;
-
-                case ID_TRAY_FFR:
-                    g_cfg.ffr.enabled = !g_cfg.ffr.enabled;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_TRAY_FFR_OPENXR:
-                    g_cfg.ffr.openxrEnabled = !g_cfg.ffr.openxrEnabled;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_TRAY_RATE_1X:
-                    g_cfg.pacing.frameGenDivisor = 1.0;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_TRAY_RATE_HALF:
-                    g_cfg.pacing.frameGenDivisor = 2.0;
-                    SaveAndPropagate();
-                    break;
-
-                case ID_TRAY_RATE_THIRD:
-                    g_cfg.pacing.frameGenDivisor = 3.0;
-                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
                     break;
             }
             return 0;
@@ -755,6 +804,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
                 UpdateSharedStateFlags();
+                UpdateTelemetryDisplay();
+                InvalidateRect(hwnd, &kGraphRect, FALSE);
             } else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
                 ShowTrayMenu(hwnd);
             }
@@ -772,6 +823,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hFontNormal) DeleteObject(g_hFontNormal);
             if (g_hFontBold) DeleteObject(g_hFontBold);
+            if (g_hFontSmall) DeleteObject(g_hFontSmall);
             PostQuitMessage(0);
             return 0;
     }
@@ -807,18 +859,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_cfg.upscaling.scale = 2.0f;
     g_cfg.upscaling.radius = 0.60f;
     g_cfg.upscaling.sharpness = 0.0f;
-    g_cfg.mask.enabled = false;
     g_cfg.mask.radiusX = 1.00f;
     g_cfg.mask.radiusY = 1.00f;
     g_cfg.mask.segments = 256;
-    g_cfg.ffr.enabled = false;
-    g_cfg.ffr.openxrEnabled = false;
     g_cfg.ffr.innerRadius = 0.60f;
+    g_cfg.ffr.openxrEnabled = g_cfg.ffr.enabled;
     g_cfg.pacing.enabled = true;
-    if (g_cfg.pacing.offsetFps <= 0.0 || g_cfg.pacing.offsetFps > 1.0) {
-        g_cfg.pacing.offsetFps = 0.10;
-    }
-    if (g_cfg.pacing.frameGenDivisor <= 0.0) {
+    g_cfg.pacing.offsetFps = 0.10;
+    if (g_cfg.pacing.frameGenDivisor > 1.05) {
+        g_cfg.pacing.frameGenDivisor = 2.0;
+    } else {
         g_cfg.pacing.frameGenDivisor = 1.0;
     }
     vrpacing::SaveConfig(g_cfg);
@@ -838,7 +888,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 710;
+    const int winH = 598;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 
@@ -877,6 +927,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ShowWindow(g_hMainWnd, SW_SHOW);
     UpdateWindow(g_hMainWnd);
     UpdateSharedStateFlags();
+    UpdateTelemetryDisplay();
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -892,5 +943,3 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 }
 
 #endif
-
-

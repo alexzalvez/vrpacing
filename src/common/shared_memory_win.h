@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #ifdef _WIN32
 
@@ -118,7 +118,8 @@ public:
         cfg.mask.radiusY = 1.00f;
         cfg.mask.segments = 256;
 
-        cfg.ffr.enabled = cfg.enabled && ((flags & kFlagFfrEnabled) != 0);
+        cfg.ffr.enabled = cfg.enabled && ((flags & (kFlagFfrEnabled | kFlagFfrOpenXrEnabled)) != 0);
+        cfg.ffr.openxrEnabled = cfg.ffr.enabled;
         cfg.ffr.innerRadius = 0.60f;
 
         if (shared_->frameGenDivisor > 0.0) {
@@ -303,3 +304,4 @@ private:
 } // namespace vrpacing
 
 #endif
+
