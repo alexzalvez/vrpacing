@@ -63,6 +63,7 @@ public:
         lastReadIdx_ = 0;
         avgFps_ = 0.0;
         onePercentLowFps_ = 0.0;
+        smoothedGraphMs_ = 0.0f;
         initialCollectionDone_ = false;
         hasLatchedVerdict_ = false;
         pendingTicks_ = 0;
@@ -88,12 +89,12 @@ public:
             }
         }
 
-        // Si cambia el limite aplicado (cambio de Hz en el visor o cambio 1x / 1/2x),
-        // reevaluar suavemente sin volver a mostrar la barra de Collecting
         if (shm.appliedCap > 0.0 && std::abs(shm.appliedCap - lastAppliedCap_) > 0.5) {
             lastAppliedCap_ = shm.appliedCap;
             lastDivisor_ = shm.frameGenDivisor;
             shortWindowMs_.clear();
+            smoothedGraphMs_ = 0.0f;
+            graphHistoryMs_.fill(0.0f);
             hasLatchedVerdict_ = false;
             pendingTicks_ = 0;
         }
@@ -104,11 +105,13 @@ public:
                                    : (256u + writeIdx - lastReadIdx_);
         const uint32_t samplesToRead = std::min<uint32_t>(count, 256u);
 
+        double batchSumMs = 0.0;
+        uint32_t batchValid = 0;
+
         for (uint32_t i = 0; i < samplesToRead; ++i) {
             const uint32_t idx = (lastReadIdx_ + i) % 256u;
             const float dtMs = shm.frameTimesMs[idx];
 
-            // Ignorar tirones puntuales de carga (>100 ms) sin vaciar las ventanas
             if (dtMs < 2.0f || dtMs > 100.0f) {
                 continue;
             }
@@ -123,8 +126,8 @@ public:
                 evalWindowMs_.pop_front();
             }
 
-            std::rotate(graphHistoryMs_.begin(), graphHistoryMs_.begin() + 1, graphHistoryMs_.end());
-            graphHistoryMs_.back() = dtMs;
+            batchSumMs += dtMs;
+            batchValid++;
         }
         lastReadIdx_ = writeIdx;
 
@@ -133,6 +136,12 @@ public:
         }
 
         ComputeMetrics();
+
+        if (batchValid > 0 && avgFps_ > 1.0) {
+            const float batchMeanMs = static_cast<float>(batchSumMs / static_cast<double>(batchValid));
+            PushSmoothedGraphSample(shm, batchMeanMs);
+        }
+
         EvaluateAdvisor(shm);
     }
 
@@ -143,6 +152,38 @@ public:
     size_t GetSampleCount() const { return evalWindowMs_.size(); }
 
 private:
+    void PushSmoothedGraphSample(const SharedState& shm, float batchMeanMs) {
+        const float avgMs = static_cast<float>(1000.0 / avgFps_);
+        const float targetMs = (shm.appliedCap > 0.0) ? static_cast<float>(1000.0 / shm.appliedCap) : avgMs;
+        const bool isSustained = (shm.appliedCap > 0.0) && (avgFps_ >= (shm.appliedCap - 1.5));
+
+        float desiredMs = avgMs;
+        if (isSustained) {
+            // Cuando Avg FPS sostiene el cap, la grafica refleja la estabilidad de la media
+            // amortiguando picos aislados de 1% low y micro-oscilaciones de fase del visor.
+            const float clampedBatch = std::clamp(batchMeanMs, targetMs - 0.30f, targetMs + 0.30f);
+            desiredMs = 0.88f * avgMs + 0.12f * clampedBatch;
+            if (smoothedGraphMs_ <= 0.1f) {
+                smoothedGraphMs_ = desiredMs;
+                graphHistoryMs_.fill(smoothedGraphMs_);
+            } else {
+                smoothedGraphMs_ = 0.82f * smoothedGraphMs_ + 0.18f * desiredMs;
+            }
+        } else {
+            // Cuando el equipo NO sostiene el objetivo, mostrar las fluctuaciones reales de la media
+            desiredMs = 0.55f * avgMs + 0.45f * batchMeanMs;
+            if (smoothedGraphMs_ <= 0.1f) {
+                smoothedGraphMs_ = desiredMs;
+                graphHistoryMs_.fill(smoothedGraphMs_);
+            } else {
+                smoothedGraphMs_ = 0.50f * smoothedGraphMs_ + 0.50f * desiredMs;
+            }
+        }
+
+        std::rotate(graphHistoryMs_.begin(), graphHistoryMs_.begin() + 1, graphHistoryMs_.end());
+        graphHistoryMs_.back() = smoothedGraphMs_;
+    }
+
     void ComputeMetrics() {
         if (shortWindowMs_.size() >= 15) {
             double sumMs = 0.0;
@@ -198,7 +239,6 @@ private:
 
         const double cap = (shm.appliedCap > 0.0) ? shm.appliedCap : (targetHz - 0.10);
 
-        // Banda muerta: si ya estaba en Sustained, se mantiene hasta que Avg FPS caiga mas de 3.0 FPS por debajo del cap
         const bool wasSustained = hasLatchedVerdict_ && (currentReport_.state == static_cast<int32_t>(AdvisorState::Sustained));
         const double sustainThreshold = wasSustained ? (cap - 3.0) : (cap - 1.5);
 
@@ -278,7 +318,6 @@ private:
 
         if (report.state == pendingState_ && wcscmp(report.summaryLine, pendingSummary_) == 0) {
             pendingTicks_++;
-            // 20 ticks de 250 ms = 5.0 segundos continuos antes de cambiar el veredicto enclavado
             if (pendingTicks_ >= 20) {
                 currentReport_ = report;
                 pendingTicks_ = 0;
@@ -302,6 +341,7 @@ private:
 
     double avgFps_ = 0.0;
     double onePercentLowFps_ = 0.0;
+    float smoothedGraphMs_ = 0.0f;
     bool initialCollectionDone_ = false;
     bool hasLatchedVerdict_ = false;
 

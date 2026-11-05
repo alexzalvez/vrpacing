@@ -150,7 +150,16 @@ bool IsCurrentProcessBlacklisted() {
 }
 
 bool IsOpenCompositeActive() {
-    return GetModuleHandleW(L"openvr_api.dll") != nullptr;
+    if (GetModuleHandleW(L"openvr_api.dll") == nullptr) {
+        return false;
+    }
+    HMODULE hHook = GetModuleHandleW(L"VRPacingHook.dll");
+    if (!hHook) {
+        return false;
+    }
+    using IsUsedFn = bool(__cdecl*)();
+    auto fn = reinterpret_cast<IsUsedFn>(GetProcAddress(hHook, "VRPacingHook_IsOpenVrUsed"));
+    return (fn != nullptr) && fn();
 }
 
 void EnsureHookDllLoadedForVdxrBridge() {
@@ -333,8 +342,6 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
         return XR_SUCCESS;
     }
 
-    g_maskWasActiveInSession.store(true, std::memory_order_relaxed);
-
     constexpr uint32_t kSeg = 256;
     uint32_t reqVerts = 0;
     uint32_t reqIndices = 0;
@@ -350,6 +357,10 @@ XrResult XRAPI_CALL Impl_xrGetVisibilityMaskKHR(
 
     if (visibilityMask->vertexCapacityInput < reqVerts || visibilityMask->indexCapacityInput < reqIndices) {
         return XR_ERROR_SIZE_INSUFFICIENT;
+    }
+
+    if (kind != VisibilityMaskKind::LineLoop) {
+        g_maskWasActiveInSession.store(true, std::memory_order_relaxed);
     }
 
     GeneratedVisibilityMask gen = GenerateCircularMaskTangentSpace(kind, minX, maxX, minY, maxY, kSeg);
@@ -1339,6 +1350,7 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
 }
 
 #endif
+
 
 
 

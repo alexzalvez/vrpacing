@@ -91,6 +91,7 @@ std::string g_fnTableVersionStr;
 
 std::atomic<bool> g_hamLatchedPassthrough{ false };
 std::atomic<bool> g_openVrHamActive{ false };
+std::atomic<bool> g_openVrApiUsed{ false };
 thread_local int g_hamReentrancyDepth = 0;
 
 std::unordered_set<std::string> g_loggedDiagInterfaces;
@@ -1100,6 +1101,7 @@ void LogUnsupportedOnce(const char* cleanName) {
 
 void HookCompositorInstance(const char* name, void* iface) {
     if (!iface || !name) return;
+    g_openVrApiUsed.store(true, std::memory_order_relaxed);
     const char* cleanName = StripFnTablePrefix(name);
     const OpenVrSlotEntry* entry = LookupOpenVrSlots(cleanName);
     if (!entry || entry->waitSlot < 0 || entry->submitSlot < 0) {
@@ -1120,6 +1122,7 @@ void HookCompositorInstance(const char* name, void* iface) {
 
 void HookSystemInstance(const char* name, void* iface) {
     if (!iface || !name) return;
+    g_openVrApiUsed.store(true, std::memory_order_relaxed);
     const char* cleanName = StripFnTablePrefix(name);
     const OpenVrSlotEntry* entry = LookupOpenVrSlots(cleanName);
     if (!entry || entry->hamSlot < 0 || entry->projRawSlot < 0) {
@@ -1305,6 +1308,11 @@ void InstallOpenVRHooks() {
 
 } // namespace vrpacing
 
+extern "C" __declspec(dllexport) bool __cdecl VRPacingHook_IsOpenVrUsed() {
+    return vrpacing::g_openVrApiUsed.load(std::memory_order_relaxed);
+}
+
 #endif
+
 
 
