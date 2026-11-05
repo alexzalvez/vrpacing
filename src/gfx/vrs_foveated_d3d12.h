@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #ifdef _WIN32
 
 #include <d3d12.h>
@@ -33,10 +33,7 @@ public:
     void Shutdown(const char* reason = "DestroySession");
     void ShutdownOnProcessDetach();
 
-    int32_t GetVrsStatus() const noexcept {
-        if (!tier2Supported_ || !enabled_.load(std::memory_order_relaxed)) {
-            return 0;
-        }
+    int32_t GetVrsStatus() const noexcept { return bindsCount_.load(std::memory_order_relaxed) > 0 ? 2 : 0; }
         if (bindsCount_.load(std::memory_order_relaxed) > 0 || vrs12Ready_.load(std::memory_order_relaxed)) {
             return 1;
         }
@@ -182,3 +179,4 @@ private:
 } // namespace vrpacing
 
 #endif // _WIN32
+

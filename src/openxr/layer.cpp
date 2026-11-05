@@ -947,9 +947,23 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
     }
 
     const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (VDXR Bridge)";
-    const int32_t vrsStatus = g_d3d12Device ? VrsFoveatedD3D12::Instance().GetVrsStatus()
-                                            : VrsFoveatedD3D11::Instance().GetVrsStatus();
-    const int32_t maskStatus = g_cfg.mask.enabled ? 1 : 0;
+    int32_t vrsStatus = 0;
+    if (IsOpenCompositeActive()) {
+        vrsStatus = -1;
+    } else if (g_d3d12Device) {
+        vrsStatus = (VrsFoveatedD3D12::Instance().GetVrsStatus() > 0 || VrsFoveatedD3D12::Instance().HasActiveBinds()) ? 2 : 0;
+    } else if (g_d3d11Device) {
+        vrsStatus = (VrsFoveatedD3D11::Instance().GetVrsStatus() > 0 || VrsFoveatedD3D11::Instance().HasActiveBinds()) ? 1 : 0;
+    }
+
+    int32_t maskStatus = 0;
+    if (IsOpenCompositeActive()) {
+        maskStatus = -1;
+    } else if (!g_cfg.mask.enabled) {
+        maskStatus = 0;
+    } else {
+        maskStatus = g_maskWasActiveInSession.load(std::memory_order_relaxed) ? 1 : 0;
+    }
     const double reportedRawHz = panelAlreadyHalf ? (s_panelHz * 2.0) : s_panelHz;
     const uint32_t reportedSsw = (s_sswHalfRateActive || panelAlreadyHalf || manualSubRate) ? 1u : 0u;
     g_shm.UpdateSessionTelemetry(apiLabel, hz, targetFps,
@@ -1324,4 +1338,5 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
 }
 
 #endif
+
 

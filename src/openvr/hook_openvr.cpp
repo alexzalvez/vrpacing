@@ -90,6 +90,7 @@ bool g_fnTableHamHasType = true;
 std::string g_fnTableVersionStr;
 
 std::atomic<bool> g_hamLatchedPassthrough{ false };
+std::atomic<bool> g_openVrHamActive{ false };
 thread_local int g_hamReentrancyDepth = 0;
 
 std::unordered_set<std::string> g_loggedDiagInterfaces;
@@ -627,6 +628,7 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
 
     ret->pVertexData = g_hamCache.verts[eyeIdx][typeIdx].data();
     ret->unTriangleCount = g_hamCache.triCounts[eyeIdx][typeIdx];
+    g_openVrHamActive.store(true, std::memory_order_relaxed);
 
     if (!g_hamReplaceLogged[eyeIdx][typeIdx]) {
         g_hamReplaceLogged[eyeIdx][typeIdx] = true;
@@ -809,7 +811,7 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     }
 
     const int32_t vrsStatus = VrsFoveatedD3D11::Instance().GetVrsStatus();
-    const int32_t maskStatus = (g_cfg.mask.openvrMode > 0) ? 1 : 0;
+    const int32_t maskStatus = (g_cfg.mask.openvrMode > 0 && g_openVrHamActive.load(std::memory_order_relaxed)) ? 1 : 0;
     const double reportedRawHz = panelAlreadyHalf ? (s_panelHz * 2.0) : s_panelHz;
     const uint32_t reportedSsw = (s_sswHalfRateActive || panelAlreadyHalf || manualSubRate) ? 1u : 0u;
     g_shm.UpdateSessionTelemetry(L"OpenVR (SteamVR)", hz, targetFps,
@@ -1304,4 +1306,5 @@ void InstallOpenVRHooks() {
 } // namespace vrpacing
 
 #endif
+
 

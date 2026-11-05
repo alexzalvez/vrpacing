@@ -286,8 +286,6 @@ void CheckActiveProcessLiveness() {
 }
 
 void UpdateTelemetryDisplay() {
-    CheckActiveProcessLiveness();
-
     if (!IsWindowVisible(g_hMainWnd)) return;
 
     wchar_t txtApi[64]{};
@@ -356,7 +354,9 @@ void UpdateTelemetryDisplay() {
         else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded";
         else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
 
-        const wchar_t* maskStr = (g_shared->maskStatus > 0) ? L"Active" : L"Off";
+        const wchar_t* maskStr = L"Off";
+        if (g_shared->maskStatus == 1) maskStr = L"Active";
+        else if (g_shared->maskStatus == -1) maskStr = L"Excluded";
 
         if (g_shared->upscaleStatus == 1) {
             swprintf_s(txtPipe, L"NIS: Active (2.0x) | VRS: %s | Mask: %s", vrsStr, maskStr);
@@ -627,6 +627,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(g_hFrameGraph, nullptr, FALSE);
                 }
             } else if (wParam == IDT_SCANNER_TIMER) {
+                CheckActiveProcessLiveness();
                 g_scanner.PollAndInject(g_hookPath);
                 UpdateTelemetryDisplay();
             }
@@ -891,4 +892,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 }
 
 #endif
+
 
