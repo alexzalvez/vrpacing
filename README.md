@@ -30,8 +30,7 @@ Third-party components bundled with VRPacing (NVIDIA Image Scaling, NVAPI, MinHo
 ### Installation / Uninstallation
 
 1. Download `VRPacing-windows-x64.zip` from the **Releases** page and extract it anywhere.
-2. Run `scripts/install.ps1` from the repository (right-click → *Run with PowerShell*). It copies the files to `%LOCALAPPDATA%\VRPacing` and registers the OpenXR implicit layer for the current user.
-3. To remove it, run `scripts/uninstall.ps1`.
+2. Run `VRPacingTray.exe`.
 
 ### Zero-Configuration Setup
 All core optimizations in `VRPacing` (**`-0.10 FPS` Frame Pacing**, **NIS `2.0x` Spatial Reconstruction**, **Fixed Foveated VRS**, and **Pre-Render Circular Mask**) are **enabled by default**. You do not need to configure settings for each individual game:
