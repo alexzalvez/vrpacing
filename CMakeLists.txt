@@ -1,6 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.22)
 
-project(VRPacing VERSION 0.1.0 LANGUAGES C CXX)
+project(VRPacing VERSION 0.8.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,3 +113,4 @@ if(VRPACING_BUILD_TESTS)
   target_link_libraries(vrpacing_tests PRIVATE vrpacing_core)
   add_test(NAME vrpacing_tests COMMAND vrpacing_tests)
 endif()
+
