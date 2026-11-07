@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
+
 project(VRPacing VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -39,7 +40,6 @@ add_library(vrpacing_core STATIC
   src/core/hz_tracker.cpp
   src/common/visibility_mask.cpp
 )
-
 target_include_directories(vrpacing_core PUBLIC include src)
 
 if(WIN32)
@@ -70,7 +70,7 @@ if(WIN32)
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi"
   )
-  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3d12 d3dcompiler dxgi minhook nvapi64)
+  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3d12 d3dcompiler dxgi minhook nvapi64 windowscodecs ole32)
   target_compile_definitions(VRPacingLayer PRIVATE XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12)
   set_target_properties(VRPacingLayer PROPERTIES OUTPUT_NAME "VRPacingLayer")
 
@@ -82,7 +82,7 @@ if(WIN32)
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
-  target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid)
+  target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid windowscodecs ole32)
   set_target_properties(VRPacingHook PROPERTIES OUTPUT_NAME "VRPacingHook")
 
   add_executable(VRPacingTray WIN32
@@ -93,6 +93,7 @@ if(WIN32)
   )
   target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32)
   set_target_properties(VRPacingTray PROPERTIES OUTPUT_NAME "VRPacingTray")
+
   if(MSVC)
     set_target_properties(VRPacingTray PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
   endif()

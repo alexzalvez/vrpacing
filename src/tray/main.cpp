@@ -30,6 +30,7 @@ namespace {
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT_PTR IDT_SCANNER_TIMER = 101;
 constexpr UINT_PTR IDT_TELEMETRY_TIMER = 102;
+constexpr int ID_HOTKEY_SCREENSHOT = 9001;
 
 // UI Control IDs
 constexpr UINT ID_CHECK_NIS = 2001;
@@ -41,17 +42,19 @@ constexpr UINT ID_BTN_EXIT = 2011;
 constexpr UINT ID_CHECK_MASK = 2012;
 constexpr UINT ID_CHECK_FFR = 2013;
 constexpr UINT ID_BTN_RESET_STATS = 2015;
+constexpr UINT ID_BTN_OPEN_SHOTS = 2016;
 
 // Tray Menu IDs
 constexpr UINT ID_TRAY_OPEN = 3001;
 constexpr UINT ID_TRAY_NIS = 3002;
-constexpr UINT ID_TRAY_PACING = 3003;
 constexpr UINT ID_TRAY_RATE_1X = 3004;
 constexpr UINT ID_TRAY_RATE_HALF = 3005;
 constexpr UINT ID_TRAY_OPEN_LOG = 3010;
 constexpr UINT ID_TRAY_EXIT = 3011;
 constexpr UINT ID_TRAY_MASK = 3012;
 constexpr UINT ID_TRAY_FFR = 3013;
+constexpr UINT ID_TRAY_TAKE_SHOT = 3014;
+constexpr UINT ID_TRAY_OPEN_SHOTS = 3015;
 
 // Coordenadas del area de la grafica GDI en la ventana principal
 constexpr RECT kGraphRect = { 30, 172, 434, 246 };
@@ -62,6 +65,7 @@ vrpacing::SharedState* g_shared = nullptr;
 HANDLE g_mapFile = nullptr;
 vrpacing::ProcessScanner g_scanner;
 std::wstring g_hookPath;
+std::wstring g_screenshotsDir;
 
 HWND g_hMainWnd = nullptr;
 HFONT g_hFontNormal = nullptr;
@@ -76,6 +80,7 @@ HWND g_hLblProcess = nullptr;
 HWND g_hLblRes = nullptr;
 HWND g_hLblPipeline = nullptr;
 HWND g_hLblAdvisor = nullptr;
+HWND g_hLblShotInfo = nullptr;
 
 static vrpacing::TelemetryAnalyzer g_advisor;
 
@@ -107,6 +112,22 @@ std::wstring ExeDir() {
     const auto pos = p.find_last_of(L"\\/");
     if (pos != std::wstring::npos) p.resize(pos);
     return p;
+}
+
+void TriggerComparisonScreenshot() {
+    if (!g_shared) return;
+    if (g_shared->activePid != 0 && g_cfg.upscaling.enabled) {
+        g_shared->screenshotRequest = 1;
+        MessageBeep(MB_OK);
+    } else {
+        MessageBeep(MB_ICONWARNING);
+    }
+}
+
+void OpenScreenshotsFolder() {
+    std::error_code ec;
+    std::filesystem::create_directories(g_screenshotsDir, ec);
+    ShellExecuteW(nullptr, L"open", g_screenshotsDir.c_str(), nullptr, nullptr, SW_SHOW);
 }
 
 void RegisterOpenXrImplicitLayer() {
@@ -177,6 +198,9 @@ void UpdateSharedStateFlags() {
     g_shared->flags = flags;
     g_shared->frameGenDivisor = (g_cfg.pacing.frameGenDivisor > 0.0) ? g_cfg.pacing.frameGenDivisor : 1.0;
     g_shared->offsetFps = 0.10;
+    if (!g_screenshotsDir.empty()) {
+        wcsncpy_s(g_shared->screenshotDir, g_screenshotsDir.c_str(), _TRUNCATE);
+    }
 }
 
 void SyncUiWithConfig() {
@@ -252,6 +276,7 @@ void CheckActiveProcessLiveness() {
             g_shared->vrsStatus = 0;
             g_shared->maskStatus = 0;
             g_shared->frameTimeWriteIdx = 0;
+            g_shared->screenshotRequest = 0;
             for (size_t i = 0; i < 256; ++i) {
                 g_shared->frameTimesMs[i] = 0.0f;
             }
@@ -276,6 +301,7 @@ void CheckActiveProcessLiveness() {
         g_shared->vrsStatus = 0;
         g_shared->maskStatus = 0;
         g_shared->frameTimeWriteIdx = 0;
+        g_shared->screenshotRequest = 0;
         g_advisor.Reset();
     }
 }
@@ -289,7 +315,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     HBITMAP memBmp = CreateCompatibleBitmap(hdcWindow, w, h);
     HGDIOBJ oldBmp = SelectObject(memDc, memBmp);
 
-    // 1. Fondo oscuro y marco
     RECT rcLocal{ 0, 0, w, h };
     HBRUSH bgBrush = CreateSolidBrush(RGB(22, 26, 32));
     FillRect(memDc, &rcLocal, bgBrush);
@@ -300,7 +325,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     HGDIOBJ oldBrush = SelectObject(memDc, GetStockObject(NULL_BRUSH));
     Rectangle(memDc, 0, 0, w, h);
 
-    // Escala vertical: 0.0 ms (abajo) a 33.33 ms (arriba)
     constexpr float kMaxMs = 33.33f;
     auto MsToY = [h, kMaxMs](float ms) -> int {
         const float clamped = std::clamp(ms, 0.0f, kMaxMs);
@@ -308,7 +332,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
         return (h - 2) - static_cast<int>( std::lround(norm * static_cast<float>(h - 4)) );
     };
 
-    // 2. Lineas guia horizontales (8.33 ms = 120 FPS, 11.11 ms = 90 FPS, 16.67 ms = 60 FPS)
     HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(40, 46, 56));
     SelectObject(memDc, gridPen);
     const float kGuides[] = { 8.33f, 11.11f, 16.67f, 22.22f };
@@ -318,7 +341,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
         LineTo(memDc, w - 1, y);
     }
 
-    // 3. Linea verde del objetivo actual (Target Budget ms)
     const bool hasActiveSession = (g_shared && g_shared->activePid != 0 && g_shared->appliedCap > 0.0);
     if (hasActiveSession) {
         const float targetMs = static_cast<float>(1000.0 / g_shared->appliedCap);
@@ -330,7 +352,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
         DeleteObject(targetPen);
     }
 
-    // 4. Polilinea cian con las 180 muestras de frametime (ms)
     const auto& history = g_advisor.GetGraphHistory();
     HPEN linePen = CreatePen(PS_SOLID, 1, RGB(80, 205, 255));
     SelectObject(memDc, linePen);
@@ -348,7 +369,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
         Polyline(memDc, pts, validCount);
     }
 
-    // 5. Etiquetas de escala superpuestas
     SetBkMode(memDc, TRANSPARENT);
     SetTextColor(memDc, RGB(155, 165, 180));
     HGDIOBJ oldFont = SelectObject(memDc, g_hFontSmall ? g_hFontSmall : g_hFontNormal);
@@ -363,7 +383,6 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     RECT rcText{ 6, 3, w - 6, 19 };
     DrawTextW(memDc, overlayTxt, -1, &rcText, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-    // Volcado final sin parpadeo
     BitBlt(hdcWindow, kGraphRect.left, kGraphRect.top, w, h, memDc, 0, 0, SRCCOPY);
 
     SelectObject(memDc, oldFont);
@@ -388,6 +407,7 @@ void UpdateTelemetryDisplay() {
     wchar_t txtProc[96]{};
     wchar_t txtRes[96]{};
     wchar_t txtPipe[128]{};
+    wchar_t txtShot[128]{};
 
     if (g_shared) {
         const bool hasApi = (g_shared->activePid != 0 &&
@@ -444,7 +464,6 @@ void UpdateTelemetryDisplay() {
             wcscpy_s(txtRes, L"Resolution: Waiting for Swapchain...");
         }
 
-        // Estado individual verificado para NIS, VRS y Mascara
         const wchar_t* nisStr = L"Off";
         if (g_cfg.upscaling.enabled) {
             if (!hasApi) nisStr = L"Standby";
@@ -472,6 +491,13 @@ void UpdateTelemetryDisplay() {
         }
 
         swprintf_s(txtPipe, L"NIS: %s  |  VRS: %s  |  Mask: %s", nisStr, vrsStr, maskStr);
+
+        if (g_shared->screenshotSavedCount > 0) {
+            swprintf_s(txtShot, L"Screenshot Hotkey: Ctrl + F12 (Saved: %u pair%s in Screenshots\\)",
+                       g_shared->screenshotSavedCount, (g_shared->screenshotSavedCount == 1) ? L"" : L"s");
+        } else {
+            wcscpy_s(txtShot, L"Comparison Screenshot: Press Ctrl + F12 in-game (1.0x & 2.0x .png pair)");
+        }
 
         wchar_t tip[128]{};
         if (hasApi && g_shared->appliedCap > 0.0) {
@@ -502,6 +528,7 @@ void UpdateTelemetryDisplay() {
     if (g_hLblProcess) SetWindowTextW(g_hLblProcess, txtProc);
     if (g_hLblRes) SetWindowTextW(g_hLblRes, txtRes);
     if (g_hLblPipeline) SetWindowTextW(g_hLblPipeline, txtPipe);
+    if (g_hLblShotInfo) SetWindowTextW(g_hLblShotInfo, txtShot);
     if (g_hLblAdvisor) {
         const auto& rep = g_advisor.GetReport();
         SetWindowTextW(g_hLblAdvisor, rep.summaryLine);
@@ -524,6 +551,8 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_STRING | (isHalf ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_RATE_HALF, L"Rate: Half Refresh Rate (Manual Hz / 2)");
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TAKE_SHOT, L"Take Comparison Screenshot (Ctrl+F12)");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_SHOTS, L"Open Screenshots Folder");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_LOG, L"Open Log File");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -603,62 +632,72 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     30, 142, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblAdvisor, g_hFontBold);
 
-    // 2. Seccion Unificada de Optimizaciones de Renderizado
+    // 2. Seccion Unificada de Optimizaciones de Renderizado + Info de Captura Ctrl+F12
     HWND hGrpOpt = CreateWindowExW(0, L"BUTTON", L" Render Pipeline Optimizations ",
                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                   15, 266, 434, 108, hwnd, nullptr, hInst, nullptr);
+                                   15, 264, 434, 128, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpOpt, g_hFontBold);
 
     g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Spatial Upscaling (60% Radius, 0% Sharpness)",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                30, 290, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
+                                30, 286, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
     SetFont(g_hChkNis, g_hFontNormal);
 
     g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"Enable Fixed Foveated Rendering (VRS - D3D11 && D3D12)",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                30, 316, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
+                                30, 311, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
     SetFont(g_hChkFfr, g_hFontNormal);
 
     g_hChkMask = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Render Circular Visibility Mask",
                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 30, 342, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
+                                 30, 336, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
+
+    g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (1.0x & 2.0x .png pair)",
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     30, 364, 404, 18, hwnd, nullptr, hInst, nullptr);
+    SetFont(g_hLblShotInfo, g_hFontSmall);
 
     // 3. Seccion Simplificada de Frame Pacing
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Target Rate Mode ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 384, 434, 118, hwnd, nullptr, hInst, nullptr);
+                                      15, 400, 434, 114, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
     HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Pacing is Always Active (-0.10 FPS offset below refresh target).",
                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                            30, 408, 404, 18, hwnd, nullptr, hInst, nullptr);
+                                            30, 422, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblPacingStatus, g_hFontNormal);
 
     g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"Automatic (Recommended - Native Hz && Auto SSW detection)",
                                  WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                 36, 434, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
+                                 36, 446, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
     SetFont(g_hRadio1x, g_hFontNormal);
 
     g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"Half Refresh Rate (Manual Hz / 2 lock - Force half-rate cap)",
                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                   36, 460, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
+                                   36, 472, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
     SetFont(g_hRadioHalf, g_hFontNormal);
 
-    // 4. Botones de accion inferiores
-    HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize to Tray",
+    // 4. Botones de accion inferiores (4 botones alineados)
+    HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                        15, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
+                                        15, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
+
+    HWND hBtnShots = CreateWindowExW(0, L"BUTTON", L"Screenshots",
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     126, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_SHOTS)), hInst, nullptr);
+    SetFont(hBtnShots, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   163, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
+                                   237, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
-    HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit Application",
+    HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit",
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    311, 516, 138, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
+                                    348, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -669,10 +708,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateUiElements(hwnd, cs->hInstance);
             SyncUiWithConfig();
             RegisterOpenXrImplicitLayer();
+            RegisterHotKey(hwnd, ID_HOTKEY_SCREENSHOT, MOD_CONTROL | MOD_NOREPEAT, VK_F12);
             SetTimer(hwnd, IDT_SCANNER_TIMER, 2000, nullptr);
             SetTimer(hwnd, IDT_TELEMETRY_TIMER, 250, nullptr);
             return 0;
         }
+
+        case WM_HOTKEY:
+            if (wParam == ID_HOTKEY_SCREENSHOT) {
+                TriggerComparisonScreenshot();
+            }
+            return 0;
 
         case WM_TIMER:
             if (wParam == IDT_TELEMETRY_TIMER) {
@@ -757,6 +803,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     UpdateSharedStateFlags();
                     break;
 
+                case ID_TRAY_TAKE_SHOT:
+                    TriggerComparisonScreenshot();
+                    break;
+
+                case ID_BTN_OPEN_SHOTS:
+                case ID_TRAY_OPEN_SHOTS:
+                    OpenScreenshotsFolder();
+                    break;
+
                 case ID_BTN_OPEN_LOG:
                 case ID_TRAY_OPEN_LOG: {
                     const std::wstring logPath = vrpacing::GetLogFilePath();
@@ -817,6 +872,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            UnregisterHotKey(hwnd, ID_HOTKEY_SCREENSHOT);
             KillTimer(hwnd, IDT_SCANNER_TIMER);
             KillTimer(hwnd, IDT_TELEMETRY_TIMER);
             UnregisterOpenXrImplicitLayer();
@@ -874,6 +930,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     vrpacing::SaveConfig(g_cfg);
 
     g_hookPath = ExeDir() + L"\\VRPacingHook.dll";
+    g_screenshotsDir = ExeDir() + L"\\Screenshots";
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -888,7 +945,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 598;
+    const int winH = 608;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 
@@ -922,6 +979,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         g_shared->activePid = 0;
         g_shared->openXrD3D11Pid = 0;
         wcscpy_s(g_shared->activeApi, L"Idle");
+        wcsncpy_s(g_shared->screenshotDir, g_screenshotsDir.c_str(), _TRUNCATE);
     }
 
     ShowWindow(g_hMainWnd, SW_SHOW);

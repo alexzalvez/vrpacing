@@ -1,22 +1,33 @@
-#ifdef _WIN32
+﻿#ifdef _WIN32
 
 #include "nis_upscaler_d3d11.h"
 
-#include <cmath>
+#include <wincodec.h>
+#include <objbase.h>
+
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cwchar>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include "d3d11_helper.h"
 #include "shader_nis_upscale.h"
 #include "common/logging_win.h"
+#include "common/shared_memory_win.h"
 #include "nis/NIS_Config.h"
 
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
+
 namespace vrpacing {
+
 namespace {
 
 struct StagingFallback {
     ID3D11Device* device = nullptr;
-
     ComPtr<ID3D11Texture2D> srcTex;
     ComPtr<ID3D11ShaderResourceView> srcSrv;
     uint32_t srcW = 0;
@@ -45,6 +56,7 @@ struct StagingFallback {
 };
 
 StagingFallback g_fallback;
+SharedMemoryClient g_screenshotShm;
 
 DXGI_FORMAT GetCompatibleUnormFormat(DXGI_FORMAT format) {
     switch (format) {
@@ -71,6 +83,239 @@ DXGI_FORMAT GetCompatibleUnormFormat(DXGI_FORMAT format) {
     }
 }
 
+float HalfToFloat(uint16_t h) noexcept {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+
+    uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FFu;
+            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(float));
+    return out;
+}
+
+uint8_t FloatToSrgbByte(float v) noexcept {
+    const float clamped = (std::max)(0.0f, (std::min)(1.0f, v));
+    const float srgb = (clamped <= 0.0031308f)
+                           ? (clamped * 12.92f)
+                           : (1.055f * std::pow(clamped, 1.0f / 2.4f) - 0.055f);
+    return static_cast<uint8_t>(std::lround(srgb * 255.0f));
+}
+
+bool SaveBgraBufferToPngWic(const std::wstring& filePath, const uint8_t* bgraData, uint32_t width, uint32_t height) {
+    if (!bgraData || width == 0 || height == 0) return false;
+
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool mustUninit = (hrCo == S_OK || hrCo == S_FALSE);
+
+    bool ok = false;
+    {
+        ComPtr<IWICImagingFactory> factory;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.GetAddressOf()));
+        if (SUCCEEDED(hr) && factory) {
+            ComPtr<IWICStream> stream;
+            hr = factory->CreateStream(stream.GetAddressOf());
+            if (SUCCEEDED(hr) && stream) {
+                hr = stream->InitializeFromFilename(filePath.c_str(), GENERIC_WRITE);
+                if (SUCCEEDED(hr)) {
+                    ComPtr<IWICBitmapEncoder> encoder;
+                    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf());
+                    if (SUCCEEDED(hr) && encoder) {
+                        hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+                        if (SUCCEEDED(hr)) {
+                            ComPtr<IWICBitmapFrameEncode> frame;
+                            hr = encoder->CreateNewFrame(frame.GetAddressOf(), nullptr);
+                            if (SUCCEEDED(hr) && frame) {
+                                hr = frame->Initialize(nullptr);
+                                if (SUCCEEDED(hr)) {
+                                    hr = frame->SetSize(width, height);
+                                    if (SUCCEEDED(hr)) {
+                                        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+                                        hr = frame->SetPixelFormat(&fmt);
+                                        if (SUCCEEDED(hr)) {
+                                            const UINT stride = width * 4;
+                                            const UINT totalBytes = stride * height;
+                                            hr = frame->WritePixels(height, stride, totalBytes, const_cast<BYTE*>(bgraData));
+                                            if (SUCCEEDED(hr)) {
+                                                hr = frame->Commit();
+                                                if (SUCCEEDED(hr)) {
+                                                    hr = encoder->Commit();
+                                                    ok = SUCCEEDED(hr);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (mustUninit) {
+        CoUninitialize();
+    }
+    return ok;
+}
+
+bool CaptureTextureRegionToPng(ID3D11Device* device,
+                               ID3D11DeviceContext* ctx,
+                               ID3D11Texture2D* tex,
+                               int arrayIndex,
+                               ViewportRect rect,
+                               const std::wstring& filePath) {
+    if (!device || !ctx || !tex) return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+    if (desc.SampleDesc.Count > 1) return false;
+
+    if (rect.width == 0 || rect.height == 0) {
+        rect.x = 0;
+        rect.y = 0;
+        rect.width = desc.Width;
+        rect.height = desc.Height;
+    }
+
+    if (rect.x >= desc.Width || rect.y >= desc.Height) return false;
+    const uint32_t cropW = (std::min)(rect.width, desc.Width - rect.x);
+    const uint32_t cropH = (std::min)(rect.height, desc.Height - rect.y);
+    if (cropW == 0 || cropH == 0) return false;
+
+    D3D11_TEXTURE2D_DESC stDesc{};
+    stDesc.Width = cropW;
+    stDesc.Height = cropH;
+    stDesc.MipLevels = 1;
+    stDesc.ArraySize = 1;
+    stDesc.Format = desc.Format;
+    stDesc.SampleDesc.Count = 1;
+    stDesc.SampleDesc.Quality = 0;
+    stDesc.Usage = D3D11_USAGE_STAGING;
+    stDesc.BindFlags = 0;
+    stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stDesc.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&stDesc, nullptr, staging.GetAddressOf())) || !staging) {
+        return false;
+    }
+
+    const UINT slice = (arrayIndex >= 0 && static_cast<UINT>(arrayIndex) < desc.ArraySize)
+                           ? static_cast<UINT>(arrayIndex) : 0;
+    const UINT sub = D3D11CalcSubresource(0, slice, desc.MipLevels);
+
+    D3D11_BOX box{};
+    box.left = rect.x;
+    box.top = rect.y;
+    box.front = 0;
+    box.right = rect.x + cropW;
+    box.bottom = rect.y + cropH;
+    box.back = 1;
+
+    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex, sub, &box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+        return false;
+    }
+
+    std::vector<uint8_t> bgra(static_cast<size_t>(cropW) * static_cast<size_t>(cropH) * 4u, 255u);
+    const auto* srcBytes = static_cast<const uint8_t*>(mapped.pData);
+
+    const DXGI_FORMAT baseFmt = GetCompatibleUnormFormat(desc.Format);
+    bool supportedFmt = true;
+
+    for (uint32_t y = 0; y < cropH; ++y) {
+        const uint8_t* row = srcBytes + static_cast<size_t>(y) * mapped.RowPitch;
+        uint8_t* dstRow = bgra.data() + static_cast<size_t>(y) * static_cast<size_t>(cropW) * 4u;
+
+        if (baseFmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            for (uint32_t x = 0; x < cropW; ++x) {
+                dstRow[x * 4 + 0] = row[x * 4 + 2]; // B
+                dstRow[x * 4 + 1] = row[x * 4 + 1]; // G
+                dstRow[x * 4 + 2] = row[x * 4 + 0]; // R
+                dstRow[x * 4 + 3] = 255u;           // A (opaque)
+            }
+        } else if (baseFmt == DXGI_FORMAT_B8G8R8A8_UNORM || baseFmt == DXGI_FORMAT_B8G8R8X8_UNORM) {
+            for (uint32_t x = 0; x < cropW; ++x) {
+                dstRow[x * 4 + 0] = row[x * 4 + 0]; // B
+                dstRow[x * 4 + 1] = row[x * 4 + 1]; // G
+                dstRow[x * 4 + 2] = row[x * 4 + 2]; // R
+                dstRow[x * 4 + 3] = 255u;           // A (opaque)
+            }
+        } else if (baseFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            const auto* p32 = reinterpret_cast<const uint32_t*>(row);
+            for (uint32_t x = 0; x < cropW; ++x) {
+                const uint32_t v = p32[x];
+                dstRow[x * 4 + 2] = static_cast<uint8_t>(((v & 0x3FFu) * 255u + 511u) / 1023u);
+                dstRow[x * 4 + 1] = static_cast<uint8_t>((((v >> 10) & 0x3FFu) * 255u + 511u) / 1023u);
+                dstRow[x * 4 + 0] = static_cast<uint8_t>((((v >> 20) & 0x3FFu) * 255u + 511u) / 1023u);
+                dstRow[x * 4 + 3] = 255u;
+            }
+        } else if (baseFmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            const auto* p16 = reinterpret_cast<const uint16_t*>(row);
+            for (uint32_t x = 0; x < cropW; ++x) {
+                const float r = HalfToFloat(p16[x * 4 + 0]);
+                const float g = HalfToFloat(p16[x * 4 + 1]);
+                const float b = HalfToFloat(p16[x * 4 + 2]);
+                dstRow[x * 4 + 0] = FloatToSrgbByte(b);
+                dstRow[x * 4 + 1] = FloatToSrgbByte(g);
+                dstRow[x * 4 + 2] = FloatToSrgbByte(r);
+                dstRow[x * 4 + 3] = 255u;
+            }
+        } else if (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
+            const auto* p16 = reinterpret_cast<const uint16_t*>(row);
+            for (uint32_t x = 0; x < cropW; ++x) {
+                dstRow[x * 4 + 2] = static_cast<uint8_t>(p16[x * 4 + 0] >> 8);
+                dstRow[x * 4 + 1] = static_cast<uint8_t>(p16[x * 4 + 1] >> 8);
+                dstRow[x * 4 + 0] = static_cast<uint8_t>(p16[x * 4 + 2] >> 8);
+                dstRow[x * 4 + 3] = 255u;
+            }
+        } else {
+            supportedFmt = false;
+            break;
+        }
+    }
+
+    ctx->Unmap(staging.Get(), 0);
+    if (!supportedFmt) return false;
+
+    return SaveBgraBufferToPngWic(filePath, bgra.data(), cropW, cropH);
+}
+
+std::wstring GetCleanProcessStem() {
+    wchar_t modPath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, modPath, MAX_PATH)) {
+        return L"Game";
+    }
+    std::filesystem::path p(modPath);
+    std::wstring stem = p.stem().wstring();
+    for (wchar_t& c : stem) {
+        if (c == L' ' || c == L':' || c == L'/' || c == L'\\') c = L'_';
+    }
+    return stem.empty() ? L"Game" : stem;
+}
+
 } // namespace
 
 void NisUpscalerD3D11::ClearCache() {
@@ -84,11 +329,9 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         LogMessage(LogLevel::Error, "NisUpscalerD3D11: Puntero ID3D11Device nulo.");
         return false;
     }
-
     if (device_.Get() != device) {
         ClearCache();
     }
-
     device_ = device;
 
     HRESULT hr = device_->CreateComputeShader(
@@ -110,12 +353,12 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         td.Width = kFilterSize / 4;
         td.Height = kPhaseCount;
         td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.SampleDesc.Count = 1;
         td.SampleDesc.Quality = 0;
         td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         td.CPUAccessFlags = 0;
         td.MiscFlags = 0;
 
@@ -430,6 +673,54 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
             ctx->CopySubresourceRegion(dst, dstSub, desc.dstRect.x, desc.dstRect.y, 0, g_fallback.dstTex.Get(), 0, &srcBox);
         } else {
             ctx->CopySubresourceRegion(dst, dstSub, 0, 0, 0, g_fallback.dstTex.Get(), 0, nullptr);
+        }
+    }
+
+    // Verificar si el usuario solicito captura comparativa sincrona (Ctrl + F12) en el ojo izquierdo
+    SharedState* shm = g_screenshotShm.OpenOrCreate() ? g_screenshotShm.GetRaw() : nullptr;
+    if (shm && shm->screenshotRequest != 0 && desc.srcArrayIndex == 0 && desc.srcRect.x < (srcDesc.Width / 4)) {
+        shm->screenshotRequest = 0;
+
+        std::filesystem::path outDir = (shm->screenshotDir[0] != L'\0')
+                                           ? std::filesystem::path(shm->screenshotDir)
+                                           : (std::filesystem::path(GetLogFilePath()).parent_path() / L"Screenshots");
+        std::error_code ec;
+        std::filesystem::create_directories(outDir, ec);
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t timeBuf[64]{};
+        swprintf_s(timeBuf, L"%04u%02u%02u_%02u%02u%02u",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        const std::wstring gameStem = GetCleanProcessStem();
+        const uint32_t out1xW = (desc.srcRect.width > 0) ? desc.srcRect.width : srcDesc.Width;
+        const uint32_t out1xH = (desc.srcRect.height > 0) ? desc.srcRect.height : srcDesc.Height;
+        const uint32_t out2xW = (desc.dstRect.width > 0) ? desc.dstRect.width : dstDesc.Width;
+        const uint32_t out2xH = (desc.dstRect.height > 0) ? desc.dstRect.height : dstDesc.Height;
+
+        wchar_t file1x[200]{};
+        wchar_t file2x[200]{};
+        swprintf_s(file1x, L"VRPacing_%s_%s_1_Native_1x_%ux%u.png", timeBuf, gameStem.c_str(), out1xW, out1xH);
+        swprintf_s(file2x, L"VRPacing_%s_%s_2_NIS_2x_%ux%u.png", timeBuf, gameStem.c_str(), out2xW, out2xH);
+
+        const std::wstring path1x = (outDir / file1x).wstring();
+        const std::wstring path2x = (outDir / file2x).wstring();
+
+        ID3D11Texture2D* srcCaptureTex = (srcDesc.SampleDesc.Count > 1 && g_fallback.srcTex) ? g_fallback.srcTex.Get() : src;
+        const int srcCaptureSlice = (srcCaptureTex == g_fallback.srcTex.Get()) ? 0 : desc.srcArrayIndex;
+
+        ID3D11Texture2D* dstCaptureTex = (!directWriteOk && g_fallback.dstTex) ? g_fallback.dstTex.Get() : dst;
+        const int dstCaptureSlice = (dstCaptureTex == g_fallback.dstTex.Get()) ? 0 : desc.dstArrayIndex;
+
+        const bool ok1 = CaptureTextureRegionToPng(device_.Get(), ctx, srcCaptureTex, srcCaptureSlice, desc.srcRect, path1x);
+        const bool ok2 = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, path2x);
+
+        if (ok1 && ok2) {
+            shm->screenshotSavedCount++;
+            LogMessage(LogLevel::Info, "Comparison screenshot pair saved (1.0x Native & 2.0x NIS) in Screenshots folder.");
+        } else {
+            LogMessage(LogLevel::Warn, "Comparison screenshot capture failed for current swapchain format.");
         }
     }
 

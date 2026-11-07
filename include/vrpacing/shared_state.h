@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstdint>
 
@@ -16,7 +16,7 @@ constexpr uint32_t kFlagFfrEnabled = 1 << 4;
 constexpr uint32_t kFlagMaskEnabled = 1 << 5;
 constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6;
 
-constexpr uint32_t kSharedStateVersion = 7;
+constexpr uint32_t kSharedStateVersion = 8;
 
 struct SharedState {
     uint32_t version;
@@ -45,13 +45,18 @@ struct SharedState {
     double onePercentLowFps;
     uint64_t frameCounter;
 
-    // [Fase 2] Extended session telemetry and circular frametimes buffer
+    // Extended session telemetry and circular frametimes buffer
     double rawPanelHz;
     uint32_t sswActive;
     int32_t vrsStatus;
     int32_t maskStatus;
     uint32_t frameTimeWriteIdx;
     float frameTimesMs[256];
+
+    // Synchronous comparison screenshot capture (Ctrl + F12)
+    uint32_t screenshotRequest;
+    uint32_t screenshotSavedCount;
+    wchar_t screenshotDir[260];
 };
 
 } // namespace vrpacing
