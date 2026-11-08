@@ -1,11 +1,17 @@
 // smaa_neighborhood_blend.hlsl
-// SMAA Pass 3 - 1D Dominant-Axis with Opposing-Edge Font/Text Protection (cs_5_0).
+// SMAA Pass 3 - 1D Dominant-Axis Blend with Symmetric Ridge & Opposing-Edge Text Protection (cs_5_0).
 
 #include "smaa_constants.hlsli"
 
 Texture2D<float4>   g_colorTex  : register(t0);
 Texture2D<float4>   g_blendTex  : register(t1);
 RWTexture2D<float4> g_outputTex : register(u0);
+
+static const float3 k_luma = float3(0.2126f, 0.7152f, 0.0722f);
+
+inline float Luma(float3 rgb) {
+    return dot(rgb, k_luma);
+}
 
 [numthreads(8, 8, 1)]
 void main(uint3 dtid : SV_DispatchThreadID) {
@@ -31,8 +37,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float  bottomG = (localPos.y + 1 < dims.y) ? g_blendTex.Load(int3(localPos + int2(0, 1), 0)).g : 0.0f;
     float  rightA  = (localPos.x + 1 < dims.x) ? g_blendTex.Load(int3(localPos + int2(1, 0), 0)).a : 0.0f;
 
-    // a.xy = vertical blend weights (from horizontal edges: top, bottom)
-    // a.zw = horizontal blend weights (from vertical edges: left, right)
+    // a.xy = vertical blend weights (from horizontal edges)
+    // a.zw = horizontal blend weights (from vertical edges)
     float4 a = float4(centerW.r, bottomG, centerW.b, rightA);
     if (dot(a, float4(1.0f, 1.0f, 1.0f, 1.0f)) < 1e-5f) {
         g_outputTex[basePos] = originalColor;
@@ -43,42 +49,72 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     bool horizEdgeDominant = (max(a.x, a.y) > max(a.z, a.w));
 
     float4 blended = originalColor;
+    float lC = Luma(originalColor.rgb);
+
     if (horizEdgeDominant) {
         float w1 = a.x;
         float w2 = a.y;
-
-        // Proteccion de texto fino: si hay borde opuesto simultaneo (trazo de 1 px)
-        // se atenua la mezcla para evitar borrar la letra.
-        // En una arista geometrica normal w2 es 0, por lo que protect = 1.0 (100% AA).
-        float opposing = min(w1, w2);
-        float protect = saturate(1.0f - 2.0f * opposing);
-        float eff_w1 = w1 * protect;
-        float eff_w2 = w2 * protect;
-
-        float wSum = eff_w1 + eff_w2;
+        float wSum = w1 + w2;
         if (wSum > 1e-5f) {
             float4 cT = g_colorTex.Load(int3(clamp(basePos + int2(0, -1), minPos, maxPos), 0));
             float4 cB = g_colorTex.Load(int3(clamp(basePos + int2(0,  1), minPos, maxPos), 0));
-            float4 blendT = lerp(originalColor, cT, eff_w1);
-            float4 blendB = lerp(originalColor, cB, eff_w2);
-            blended = (eff_w1 * blendT + eff_w2 * blendB) / wSum;
+
+            // --- FONT / HUD TEXT PROTECTION SHIELD ---
+            // 1. Opposing edge dampening: real 3D geometry only has an edge on one side (w2 == 0).
+            //    1-pixel font strokes have opposing edges on both sides (w1 > 0 and w2 > 0).
+            float opposing = min(w1, w2);
+            float protectOpposing = saturate(1.0f - 4.0f * opposing);
+
+            // 2. Symmetric luminance ridge test (CMAA2-style):
+            //    If opposite background pixels (cT, cB) are similar, but center stands out sharply,
+            //    this is an isolated font stroke or reticle, not a continuous polygon gradient.
+            float lT = Luma(cT.rgb);
+            float lB = Luma(cB.rgb);
+            float oppDiff = abs(lT - lB);
+            float ctrDiff = min(abs(lC - lT), abs(lC - lB));
+            float protectRidge = (ctrDiff > (2.0f * oppDiff + 0.08f)) ? 0.0f : 1.0f;
+
+            float effFactor = protectOpposing * protectRidge;
+            w1 *= effFactor;
+            w2 *= effFactor;
+            float newSum = w1 + w2;
+
+            if (newSum > 1e-5f) {
+                float4 blendT = lerp(originalColor, cT, w1);
+                float4 blendB = lerp(originalColor, cB, w2);
+                blended = (w1 * blendT + w2 * blendB) / newSum;
+            }
         }
     } else {
         float w1 = a.z;
         float w2 = a.w;
-
-        float opposing = min(w1, w2);
-        float protect = saturate(1.0f - 2.0f * opposing);
-        float eff_w1 = w1 * protect;
-        float eff_w2 = w2 * protect;
-
-        float wSum = eff_w1 + eff_w2;
+        float wSum = w1 + w2;
         if (wSum > 1e-5f) {
             float4 cL = g_colorTex.Load(int3(clamp(basePos + int2(-1, 0), minPos, maxPos), 0));
             float4 cR = g_colorTex.Load(int3(clamp(basePos + int2( 1, 0), minPos, maxPos), 0));
-            float4 blendL = lerp(originalColor, cL, eff_w1);
-            float4 blendR = lerp(originalColor, cR, eff_w2);
-            blended = (eff_w1 * blendL + eff_w2 * blendR) / wSum;
+
+            // --- FONT / HUD TEXT PROTECTION SHIELD ---
+            // 1. Opposing edge dampening
+            float opposing = min(w1, w2);
+            float protectOpposing = saturate(1.0f - 4.0f * opposing);
+
+            // 2. Symmetric luminance ridge test
+            float lL = Luma(cL.rgb);
+            float lR = Luma(cR.rgb);
+            float oppDiff = abs(lL - lR);
+            float ctrDiff = min(abs(lC - lL), abs(lC - lR));
+            float protectRidge = (ctrDiff > (2.0f * oppDiff + 0.08f)) ? 0.0f : 1.0f;
+
+            float effFactor = protectOpposing * protectRidge;
+            w1 *= effFactor;
+            w2 *= effFactor;
+            float newSum = w1 + w2;
+
+            if (newSum > 1e-5f) {
+                float4 blendL = lerp(originalColor, cL, w1);
+                float4 blendR = lerp(originalColor, cR, w2);
+                blended = (w1 * blendL + w2 * blendR) / newSum;
+            }
         }
     }
 
