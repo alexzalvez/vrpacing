@@ -216,7 +216,7 @@ ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
     cb.rtMetrics[1] = 1.0f / static_cast<float>(viewHeight);
     cb.rtMetrics[2] = static_cast<float>(viewWidth);
     cb.rtMetrics[3] = static_cast<float>(viewHeight);
-    cb.threshold = 0.05f;
+    cb.threshold = 0.025f;
     cb.maxSearchSteps = 64;
     cb.fovealRadius = fovealRadius;
     cb.projectionCenter[0] = projCenterX;
