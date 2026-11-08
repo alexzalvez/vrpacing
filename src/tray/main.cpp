@@ -43,6 +43,7 @@ constexpr UINT ID_CHECK_MASK = 2012;
 constexpr UINT ID_CHECK_FFR = 2013;
 constexpr UINT ID_BTN_RESET_STATS = 2015;
 constexpr UINT ID_BTN_OPEN_SHOTS = 2016;
+constexpr UINT ID_CHECK_SMAA = 2017;
 
 // Tray Menu IDs
 constexpr UINT ID_TRAY_OPEN = 3001;
@@ -55,12 +56,14 @@ constexpr UINT ID_TRAY_MASK = 3012;
 constexpr UINT ID_TRAY_FFR = 3013;
 constexpr UINT ID_TRAY_TAKE_SHOT = 3014;
 constexpr UINT ID_TRAY_OPEN_SHOTS = 3015;
+constexpr UINT ID_TRAY_SMAA = 3016;
 
 // Coordenadas del area de la grafica GDI en la ventana principal
 constexpr RECT kGraphRect = { 30, 172, 434, 246 };
 
 NOTIFYICONDATAW g_nid{};
 vrpacing::RuntimeConfig g_cfg;
+bool g_smaaEnabled = false; // Desactivado por defecto (Modo Laboratorio)
 vrpacing::SharedState* g_shared = nullptr;
 HANDLE g_mapFile = nullptr;
 vrpacing::ProcessScanner g_scanner;
@@ -85,6 +88,7 @@ HWND g_hLblShotInfo = nullptr;
 static vrpacing::TelemetryAnalyzer g_advisor;
 
 HWND g_hChkNis = nullptr;
+HWND g_hChkSmaa = nullptr;
 HWND g_hChkFfr = nullptr;
 HWND g_hChkMask = nullptr;
 HWND g_hRadio1x = nullptr;
@@ -185,6 +189,7 @@ void UpdateSharedStateFlags() {
     uint32_t flags = 0;
     if (g_cfg.enabled) flags |= vrpacing::kFlagEnabled;
     if (g_cfg.upscaling.enabled) flags |= vrpacing::kFlagUpscalingEnabled;
+    if (g_smaaEnabled) flags |= vrpacing::kFlagSmaaEnabled;
     if (g_cfg.mask.enabled) flags |= vrpacing::kFlagMaskEnabled;
     if (g_cfg.ffr.enabled) {
         flags |= vrpacing::kFlagFfrEnabled;
@@ -206,6 +211,9 @@ void UpdateSharedStateFlags() {
 void SyncUiWithConfig() {
     if (g_hChkNis) {
         SendMessageW(g_hChkNis, BM_SETCHECK, g_cfg.upscaling.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    if (g_hChkSmaa) {
+        SendMessageW(g_hChkSmaa, BM_SETCHECK, g_smaaEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     if (g_hChkFfr) {
         SendMessageW(g_hChkFfr, BM_SETCHECK, g_cfg.ffr.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -275,6 +283,7 @@ void CheckActiveProcessLiveness() {
             g_shared->sswActive = 0;
             g_shared->vrsStatus = 0;
             g_shared->maskStatus = 0;
+            g_shared->smaaStatus = 0;
             g_shared->frameTimeWriteIdx = 0;
             g_shared->screenshotRequest = 0;
             for (size_t i = 0; i < 256; ++i) {
@@ -300,6 +309,7 @@ void CheckActiveProcessLiveness() {
         g_shared->sswActive = 0;
         g_shared->vrsStatus = 0;
         g_shared->maskStatus = 0;
+        g_shared->smaaStatus = 0;
         g_shared->frameTimeWriteIdx = 0;
         g_shared->screenshotRequest = 0;
         g_advisor.Reset();
@@ -466,10 +476,15 @@ void UpdateTelemetryDisplay() {
 
         const wchar_t* nisStr = L"Off";
         if (g_cfg.upscaling.enabled) {
-            if (!hasApi) nisStr = L"Standby";
-            else if (g_shared->upscaleStatus == 1) nisStr = L"Active (2.0x)";
-            else if (g_shared->upscaleStatus < 0) nisStr = L"Error";
-            else nisStr = L"Standby";
+            if (!hasApi) {
+                nisStr = g_smaaEnabled ? L"Standby (+SMAA)" : L"Standby";
+            } else if (g_shared->upscaleStatus == 1) {
+                nisStr = (g_smaaEnabled && g_shared->smaaStatus == 1) ? L"Active (2.0x+SMAA)" : L"Active (2.0x)";
+            } else if (g_shared->upscaleStatus < 0) {
+                nisStr = L"Error";
+            } else {
+                nisStr = L"Standby";
+            }
         }
 
         const wchar_t* vrsStr = L"Off";
@@ -493,10 +508,10 @@ void UpdateTelemetryDisplay() {
         swprintf_s(txtPipe, L"NIS: %s  |  VRS: %s  |  Mask: %s", nisStr, vrsStr, maskStr);
 
         if (g_shared->screenshotSavedCount > 0) {
-            swprintf_s(txtShot, L"Screenshot Hotkey: Ctrl + F12 (Saved: %u pair%s in Screenshots\\)",
+            swprintf_s(txtShot, L"Screenshot Hotkey: Ctrl + F12 (Saved: %u set%s in Screenshots\\)",
                        g_shared->screenshotSavedCount, (g_shared->screenshotSavedCount == 1) ? L"" : L"s");
         } else {
-            wcscpy_s(txtShot, L"Comparison Screenshot: Press Ctrl + F12 in-game (1.0x & 2.0x .png pair)");
+            wcscpy_s(txtShot, L"Comparison Screenshot: Press Ctrl + F12 in-game (saves .png set)");
         }
 
         wchar_t tip[128]{};
@@ -542,6 +557,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     AppendMenuW(hMenu, MF_STRING | (g_cfg.upscaling.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_NIS, L"Enable NIS 2.0x Spatial Upscaling");
+    AppendMenuW(hMenu, MF_STRING | (g_smaaEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_SMAA, L"Enable Pre-Upscale SMAA 1x (Lab)");
     AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"Enable Fixed Foveated Rendering (VRS)");
     AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"Enable Pre-Render Circular Mask");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -632,10 +648,10 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     30, 142, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblAdvisor, g_hFontBold);
 
-    // 2. Seccion Unificada de Optimizaciones de Renderizado + Info de Captura Ctrl+F12
+    // 2. Seccion de Optimizaciones de Renderizado (incluye SMAA 1x Lab desactivado por defecto)
     HWND hGrpOpt = CreateWindowExW(0, L"BUTTON", L" Render Pipeline Optimizations ",
                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                   15, 264, 434, 128, hwnd, nullptr, hInst, nullptr);
+                                   15, 264, 434, 152, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpOpt, g_hFontBold);
 
     g_hChkNis = CreateWindowExW(0, L"BUTTON", L"Enable NIS 2.0x Spatial Upscaling (60% Radius, 0% Sharpness)",
@@ -643,61 +659,66 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                 30, 286, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
     SetFont(g_hChkNis, g_hFontNormal);
 
+    g_hChkSmaa = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Upscale SMAA 1x (Lab - Anti-Aliasing before NIS 2.0x)",
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 30, 311, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_SMAA)), hInst, nullptr);
+    SetFont(g_hChkSmaa, g_hFontNormal);
+
     g_hChkFfr = CreateWindowExW(0, L"BUTTON", L"Enable Fixed Foveated Rendering (VRS - D3D11 && D3D12)",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                30, 311, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
+                                30, 336, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_FFR)), hInst, nullptr);
     SetFont(g_hChkFfr, g_hFontNormal);
 
     g_hChkMask = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Render Circular Visibility Mask",
                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 30, 336, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
+                                 30, 361, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
 
-    g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (1.0x & 2.0x .png pair)",
+    g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (saves .png set)",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     30, 364, 404, 18, hwnd, nullptr, hInst, nullptr);
+                                     30, 388, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblShotInfo, g_hFontSmall);
 
     // 3. Seccion Simplificada de Frame Pacing
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Target Rate Mode ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                      15, 400, 434, 114, hwnd, nullptr, hInst, nullptr);
+                                      15, 424, 434, 114, hwnd, nullptr, hInst, nullptr);
     SetFont(hGrpPacing, g_hFontBold);
 
     HWND hLblPacingStatus = CreateWindowExW(0, L"STATIC", L"Pacing is Always Active (-0.10 FPS offset below refresh target).",
                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                            30, 422, 404, 18, hwnd, nullptr, hInst, nullptr);
+                                            30, 446, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(hLblPacingStatus, g_hFontNormal);
 
     g_hRadio1x = CreateWindowExW(0, L"BUTTON", L"Automatic (Recommended - Native Hz && Auto SSW detection)",
                                  WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                                 36, 446, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
+                                 36, 470, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_1X)), hInst, nullptr);
     SetFont(g_hRadio1x, g_hFontNormal);
 
     g_hRadioHalf = CreateWindowExW(0, L"BUTTON", L"Half Refresh Rate (Manual Hz / 2 lock - Force half-rate cap)",
                                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                                   36, 472, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
+                                   36, 496, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
     SetFont(g_hRadioHalf, g_hFontNormal);
 
     // 4. Botones de accion inferiores (4 botones alineados)
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                        15, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
+                                        15, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
     SetFont(hBtnMinimize, g_hFontBold);
 
     HWND hBtnShots = CreateWindowExW(0, L"BUTTON", L"Screenshots",
                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     126, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_SHOTS)), hInst, nullptr);
+                                     126, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_SHOTS)), hInst, nullptr);
     SetFont(hBtnShots, g_hFontBold);
 
     HWND hBtnLog = CreateWindowExW(0, L"BUTTON", L"Open Log",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   237, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
+                                   237, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_OPEN_LOG)), hInst, nullptr);
     SetFont(hBtnLog, g_hFontBold);
 
     HWND hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit",
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    348, 526, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
+                                    348, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 }
 
@@ -757,6 +778,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             switch (id) {
                 case ID_CHECK_NIS:
                     g_cfg.upscaling.enabled = (SendMessageW(g_hChkNis, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
+                    break;
+
+                case ID_CHECK_SMAA:
+                    g_smaaEnabled = (SendMessageW(g_hChkSmaa, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
                     UpdateTelemetryDisplay();
                     break;
@@ -834,6 +861,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 case ID_TRAY_NIS:
                     g_cfg.upscaling.enabled = !g_cfg.upscaling.enabled;
+                    SaveAndPropagate();
+                    UpdateTelemetryDisplay();
+                    break;
+
+                case ID_TRAY_SMAA:
+                    g_smaaEnabled = !g_smaaEnabled;
                     SaveAndPropagate();
                     UpdateTelemetryDisplay();
                     break;
@@ -945,7 +978,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int winW = 480;
-    const int winH = 608;
+    const int winH = 632;
     const int posX = (screenW - winW) / 2;
     const int posY = (screenH - winH) / 2;
 

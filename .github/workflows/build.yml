@@ -17,11 +17,14 @@ jobs:
       - name: Setup MSVC developer prompt
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Compile NIS Compute Shader
+      - name: Compile NIS and SMAA Compute Shaders
         shell: pwsh
         run: |
           fxc.exe /nologo /T cs_5_0 /E main /O3 /I third_party/nis /Fh src/gfx/shader_nis_upscale.h /Vn g_NISUpscaleShader third_party/nis/NIS_Upscale.hlsl
-          Write-Host "Compute Shader NIS compilado exitosamente en src/gfx/shader_nis_upscale.h"
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_edge.h /Vn g_SmaaEdgeShader src/smaa/smaa_edge_detection.hlsl
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_blend.h /Vn g_SmaaBlendShader src/smaa/smaa_blend_weight.hlsl
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_neighbor.h /Vn g_SmaaNeighborShader src/smaa/smaa_neighborhood_blend.hlsl
+          Write-Host "Compute Shaders NIS y SMAA compilados exitosamente"
 
       - name: Configure
         run: cmake --preset windows-release -DVRPACING_BUILD_TESTS=ON

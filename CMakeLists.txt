@@ -62,6 +62,7 @@ if(WIN32)
     src/openxr/layer.cpp
     src/openxr/layer_dllmain.cpp
     src/gfx/d3d11_helper.cpp
+    src/gfx/smaa_pass_d3d11.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
     src/gfx/vrs_foveated_d3d12.cpp
@@ -79,6 +80,7 @@ if(WIN32)
     src/openvr/hook_openvr.cpp
     src/oculus/hook_oculus.cpp
     src/gfx/d3d11_helper.cpp
+    src/gfx/smaa_pass_d3d11.cpp
     src/gfx/nis_upscaler_d3d11.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
@@ -113,4 +115,3 @@ if(VRPACING_BUILD_TESTS)
   target_link_libraries(vrpacing_tests PRIVATE vrpacing_core)
   add_test(NAME vrpacing_tests COMMAND vrpacing_tests)
 endif()
-

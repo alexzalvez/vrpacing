@@ -15,8 +15,9 @@ constexpr uint32_t kFlagTelemetryActive = 1 << 3;
 constexpr uint32_t kFlagFfrEnabled = 1 << 4;
 constexpr uint32_t kFlagMaskEnabled = 1 << 5;
 constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6;
+constexpr uint32_t kFlagSmaaEnabled = 1 << 7;
 
-constexpr uint32_t kSharedStateVersion = 8;
+constexpr uint32_t kSharedStateVersion = 9;
 
 struct SharedState {
     uint32_t version;
@@ -53,12 +54,11 @@ struct SharedState {
     uint32_t frameTimeWriteIdx;
     float frameTimesMs[256];
 
-    // Synchronous comparison screenshot capture (Ctrl + F12)
+    // Synchronous comparison screenshot capture (Ctrl + F12) & Lab SMAA state
     uint32_t screenshotRequest;
     uint32_t screenshotSavedCount;
+    int32_t smaaStatus;
     wchar_t screenshotDir[260];
 };
 
 } // namespace vrpacing
-
-

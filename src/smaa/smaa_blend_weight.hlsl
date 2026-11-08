@@ -1,0 +1,154 @@
+﻿// smaa_blend_weight.hlsl
+// SMAA Pass 2 - Calculo morfologico de pesos en patrones L, Z y U (Compute Shader cs_5_0).
+
+#include "smaa_constants.hlsli"
+
+Texture2D<float2>   g_edgesTex  : register(t0);
+Texture2D<float4>   g_areaTex   : register(t1);
+Texture2D<float>    g_searchTex : register(t2);
+
+RWTexture2D<float4> g_blendTex  : register(u0);
+
+SamplerState g_linearSampler : register(s0);
+SamplerState g_pointSampler  : register(s1);
+
+static const float2 k_areaTexMaxDistance = float2(16.0f, 16.0f);
+static const float2 k_areaTexPixelSize   = 1.0f / float2(160.0f, 560.0f);
+
+float2 ReadEdgeClamped(int2 p, int2 dims) {
+    if (p.x < 0 || p.y < 0 || p.x >= dims.x || p.y >= dims.y) {
+        return float2(0.0f, 0.0f);
+    }
+    return g_edgesTex[p];
+}
+
+// Cuantos pixeles adicionales hacia la izquierda continua el borde horizontal superior (.g)
+int SearchHorizontalLeft(int2 ipos, int2 dims) {
+    int d = 0;
+    for (int i = 0; i < g_maxSearchSteps; ++i) {
+        if (ReadEdgeClamped(int2(ipos.x - d, ipos.y), dims).r > 0.5f ||
+            ReadEdgeClamped(int2(ipos.x - d, ipos.y - 1), dims).r > 0.5f) {
+            break;
+        }
+        int nextX = ipos.x - d - 1;
+        if (nextX < 0) break;
+        if (ReadEdgeClamped(int2(nextX, ipos.y), dims).g < 0.5f) break;
+        d++;
+    }
+    return d;
+}
+
+// Cuantos pixeles adicionales hacia la derecha continua el borde horizontal superior (.g)
+int SearchHorizontalRight(int2 ipos, int2 dims) {
+    int d = 0;
+    for (int i = 0; i < g_maxSearchSteps; ++i) {
+        if (ReadEdgeClamped(int2(ipos.x + d + 1, ipos.y), dims).r > 0.5f ||
+            ReadEdgeClamped(int2(ipos.x + d + 1, ipos.y - 1), dims).r > 0.5f) {
+            break;
+        }
+        int nextX = ipos.x + d + 1;
+        if (nextX >= dims.x) break;
+        if (ReadEdgeClamped(int2(nextX, ipos.y), dims).g < 0.5f) break;
+        d++;
+    }
+    return d;
+}
+
+// Cuantos pixeles adicionales hacia arriba continua el borde vertical izquierdo (.r)
+int SearchVerticalUp(int2 ipos, int2 dims) {
+    int d = 0;
+    for (int i = 0; i < g_maxSearchSteps; ++i) {
+        if (ReadEdgeClamped(int2(ipos.x, ipos.y - d), dims).g > 0.5f ||
+            ReadEdgeClamped(int2(ipos.x - 1, ipos.y - d), dims).g > 0.5f) {
+            break;
+        }
+        int nextY = ipos.y - d - 1;
+        if (nextY < 0) break;
+        if (ReadEdgeClamped(int2(ipos.x, nextY), dims).r < 0.5f) break;
+        d++;
+    }
+    return d;
+}
+
+// Cuantos pixeles adicionales hacia abajo continua el borde vertical izquierdo (.r)
+int SearchVerticalDown(int2 ipos, int2 dims) {
+    int d = 0;
+    for (int i = 0; i < g_maxSearchSteps; ++i) {
+        if (ReadEdgeClamped(int2(ipos.x, ipos.y + d + 1), dims).g > 0.5f ||
+            ReadEdgeClamped(int2(ipos.x - 1, ipos.y + d + 1), dims).g > 0.5f) {
+            break;
+        }
+        int nextY = ipos.y + d + 1;
+        if (nextY >= dims.y) break;
+        if (ReadEdgeClamped(int2(ipos.x, nextY), dims).r < 0.5f) break;
+        d++;
+    }
+    return d;
+}
+
+float2 Area(float2 dist, float e1, float e2) {
+    float2 texcoord = k_areaTexMaxDistance * round(4.0f * float2(e1, e2)) + dist;
+    texcoord = (texcoord + 0.5f) * k_areaTexPixelSize;
+    return g_areaTex.SampleLevel(g_linearSampler, texcoord, 0.0f).rg;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID) {
+    int2 ipos = int2(dtid.xy);
+    int2 dims = int2(g_rtMetrics.zw);
+    if (any(ipos >= dims)) {
+        return;
+    }
+
+    float2 edges = g_edgesTex[ipos];
+    if (!any(edges > 0.5f)) {
+        g_blendTex[ipos] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    float4 weights = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // 1. Borde HORIZONTAL en el limite superior del pixel (edges.g > 0.5)
+    if (edges.g > 0.5f) {
+        int dLeft  = SearchHorizontalLeft(ipos, dims);
+        int dRight = SearchHorizontalRight(ipos, dims);
+
+        int leftCol  = ipos.x - dLeft;
+        int rightCol = ipos.x + dRight + 1;
+
+        // Codificacion exacta de bordes cruzados para AreaTex:
+        // 0.00 -> 0 (ninguno), 0.25 -> 1 (arriba), 0.75 -> 3 (abajo), 1.00 -> 4 (ambos)
+        float e1Top = ReadEdgeClamped(int2(leftCol,  ipos.y - 1), dims).r;
+        float e1Bot = ReadEdgeClamped(int2(leftCol,  ipos.y),     dims).r;
+        float e1    = 0.25f * e1Top + 0.75f * e1Bot;
+
+        float e2Top = ReadEdgeClamped(int2(rightCol, ipos.y - 1), dims).r;
+        float e2Bot = ReadEdgeClamped(int2(rightCol, ipos.y),     dims).r;
+        float e2    = 0.25f * e2Top + 0.75f * e2Bot;
+
+        float2 dist = sqrt(clamp(float2(dLeft, dRight), 0.0f, 255.0f));
+        weights.rg = Area(dist, e1, e2);
+    }
+
+    // 2. Borde VERTICAL en el limite izquierdo del pixel (edges.r > 0.5)
+    if (edges.r > 0.5f) {
+        int dUp   = SearchVerticalUp(ipos, dims);
+        int dDown = SearchVerticalDown(ipos, dims);
+
+        int topRow    = ipos.y - dUp;
+        int bottomRow = ipos.y + dDown + 1;
+
+        float e1Left  = ReadEdgeClamped(int2(ipos.x - 1, topRow), dims).g;
+        float e1Right = ReadEdgeClamped(int2(ipos.x,     topRow), dims).g;
+        float e1      = 0.25f * e1Left + 0.75f * e1Right;
+
+        float e2Left  = ReadEdgeClamped(int2(ipos.x - 1, bottomRow), dims).g;
+        float e2Right = ReadEdgeClamped(int2(ipos.x,     bottomRow), dims).g;
+        float e2      = 0.25f * e2Left + 0.75f * e2Right;
+
+        float2 dist = sqrt(clamp(float2(dUp, dDown), 0.0f, 255.0f));
+        weights.ba = Area(dist, e1, e2);
+    }
+
+    g_blendTex[ipos] = weights;
+}
