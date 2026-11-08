@@ -1,5 +1,5 @@
 // smaa_neighborhood_blend.hlsl
-// SMAA Pass 3 - Exact weight neighborhood blending pass (Compute Shader cs_5_0).
+// SMAA Pass 3 - 1D Dominant-Axis Bilinear-Equivalent Neighborhood Blend (cs_5_0).
 
 #include "smaa_constants.hlsli"
 
@@ -31,24 +31,42 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float  bottomG = (localPos.y + 1 < dims.y) ? g_blendTex.Load(int3(localPos + int2(0, 1), 0)).g : 0.0f;
     float  rightA  = (localPos.x + 1 < dims.x) ? g_blendTex.Load(int3(localPos + int2(1, 0), 0)).a : 0.0f;
 
+    // a.xy = vertical blend weights (from horizontal edges)
+    // a.zw = horizontal blend weights (from vertical edges)
     float4 a = float4(centerW.r, bottomG, centerW.b, rightA);
-    float sum = dot(a, float4(1.0f, 1.0f, 1.0f, 1.0f));
-
-    if (sum < 1e-5f) {
+    if (dot(a, float4(1.0f, 1.0f, 1.0f, 1.0f)) < 1e-5f) {
         g_outputTex[basePos] = originalColor;
         return;
     }
 
-    float4 cT = g_colorTex.Load(int3(clamp(basePos + int2( 0, -1), minPos, maxPos), 0));
-    float4 cB = g_colorTex.Load(int3(clamp(basePos + int2( 0,  1), minPos, maxPos), 0));
-    float4 cL = g_colorTex.Load(int3(clamp(basePos + int2(-1,  0), minPos, maxPos), 0));
-    float4 cR = g_colorTex.Load(int3(clamp(basePos + int2( 1,  0), minPos, maxPos), 0));
+    // Strict 1D dominant-axis selection (never blur both horizontally and vertically at once)
+    bool horizEdgeDominant = (max(a.x, a.y) > max(a.z, a.w));
 
-    float4 w = (sum > 1.0f) ? (a / sum) : a;
-    float centerWeight = max(0.0f, 1.0f - sum);
+    float4 blended = originalColor;
+    if (horizEdgeDominant) {
+        float w1 = a.x;
+        float w2 = a.y;
+        float wSum = w1 + w2;
+        if (wSum > 1e-5f) {
+            float4 cT = g_colorTex.Load(int3(clamp(basePos + int2(0, -1), minPos, maxPos), 0));
+            float4 cB = g_colorTex.Load(int3(clamp(basePos + int2(0,  1), minPos, maxPos), 0));
+            float4 blendT = lerp(originalColor, cT, w1);
+            float4 blendB = lerp(originalColor, cB, w2);
+            blended = (w1 * blendT + w2 * blendB) / wSum;
+        }
+    } else {
+        float w1 = a.z;
+        float w2 = a.w;
+        float wSum = w1 + w2;
+        if (wSum > 1e-5f) {
+            float4 cL = g_colorTex.Load(int3(clamp(basePos + int2(-1, 0), minPos, maxPos), 0));
+            float4 cR = g_colorTex.Load(int3(clamp(basePos + int2( 1, 0), minPos, maxPos), 0));
+            float4 blendL = lerp(originalColor, cL, w1);
+            float4 blendR = lerp(originalColor, cR, w2);
+            blended = (w1 * blendL + w2 * blendR) / wSum;
+        }
+    }
 
-    float4 blended = centerWeight * originalColor + w.x * cT + w.y * cB + w.z * cL + w.w * cR;
     blended.a = originalColor.a;
-
     g_outputTex[basePos] = blended;
 }

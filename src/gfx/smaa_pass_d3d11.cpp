@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #include "smaa_pass_d3d11.h"
 
@@ -216,8 +216,8 @@ ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
     cb.rtMetrics[1] = 1.0f / static_cast<float>(viewHeight);
     cb.rtMetrics[2] = static_cast<float>(viewWidth);
     cb.rtMetrics[3] = static_cast<float>(viewHeight);
-    cb.threshold = 0.05f;
-    cb.maxSearchSteps = 32;
+    cb.threshold = 0.10f;
+    cb.maxSearchSteps = 16;
     cb.fovealRadius = fovealRadius;
     cb.projectionCenter[0] = projCenterX;
     cb.projectionCenter[1] = projCenterY;

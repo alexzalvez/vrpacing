@@ -1,5 +1,5 @@
 // smaa_blend_weight.hlsl
-// SMAA Pass 2 - Morphological blend weight evaluation for L, Z and U patterns (Compute Shader cs_5_0).
+// SMAA Pass 2 - Sqrt-compressed AreaTex lookup with Corner/Font protection (cs_5_0).
 
 #include "smaa_constants.hlsli"
 
@@ -82,10 +82,25 @@ int SearchVerticalDown(int2 ipos, int2 dims) {
     return d;
 }
 
+// AreaTex uses sqrt(round(dist)) compressed coordinates inside each 16x16 pattern cell
 float2 Area(float2 dist, float e1, float e2) {
-    float2 texcoord = k_areaTexMaxDistance * round(4.0f * float2(e1, e2)) + dist;
+    float2 compressedDist = min(sqrt(round(dist)), 15.0f);
+    float2 texcoord = k_areaTexMaxDistance * round(4.0f * float2(e1, e2)) + compressedDist;
     texcoord = (texcoord + 0.5f) * k_areaTexPixelSize;
     return g_areaTex.SampleLevel(g_linearSampler, texcoord, 0.0f).rg;
+}
+
+// Preserves sharp font stems/serifs (U/T patterns) while smoothing diagonal Z-sawteeth at 100%
+float CornerPreservationFactor(int d1, int d2, float e1, float e2) {
+    int span = d1 + d2;
+    bool isZStep = ((e1 == 0.25f && e2 == 0.75f) || (e1 == 0.75f && e2 == 0.25f));
+    if (isZStep) {
+        return 1.0f; // True diagonal staircase step -> full smoothing
+    }
+    if (span <= 3) {
+        return 0.0f; // Short U-cap, T-stem or isolated font stroke -> keep 100% sharp
+    }
+    return 0.25f;    // Longer U-corner -> standard SMAA 25% corner rounding
 }
 
 [numthreads(8, 8, 1)]
@@ -120,8 +135,9 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float e2Bot = ReadEdgeClamped(int2(rightCol, ipos.y),     dims).r;
         float e2    = 0.25f * e2Top + 0.75f * e2Bot;
 
-        float2 dist = clamp(float2(dLeft, dRight), 0.0f, 255.0f);
-        weights.rg = Area(dist, e1, e2);
+        float2 w = Area(float2(dLeft, dRight), e1, e2);
+        w *= CornerPreservationFactor(dLeft, dRight, e1, e2);
+        weights.rg = w;
     }
 
     // 2. VERTICAL edge on pixel left boundary (edges.r > 0.5)
@@ -140,8 +156,9 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float e2Right = ReadEdgeClamped(int2(ipos.x,     bottomRow), dims).g;
         float e2      = 0.25f * e2Left + 0.75f * e2Right;
 
-        float2 distV = clamp(float2(dUp, dDown), 0.0f, 255.0f);
-        weights.ba = Area(distV, e1, e2);
+        float2 w = Area(float2(dUp, dDown), e1, e2);
+        w *= CornerPreservationFactor(dUp, dDown, e1, e2);
+        weights.ba = w;
     }
 
     g_blendTex[ipos] = weights;
