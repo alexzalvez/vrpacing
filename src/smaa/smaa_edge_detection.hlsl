@@ -1,5 +1,5 @@
 // smaa_edge_detection.hlsl
-// SMAA Pass 1 - Pure Rec.709 luminance edge detection with local contrast adaptation (cs_5_0).
+// SMAA Pass 1 - Official Rec.709 Luminance Edge Detection with Local Contrast Adaptation (cs_5_0).
 
 #include "smaa_constants.hlsli"
 
