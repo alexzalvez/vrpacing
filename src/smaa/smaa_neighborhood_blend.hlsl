@@ -1,5 +1,5 @@
-﻿// smaa_neighborhood_blend.hlsl
-// SMAA Pass 3 - Mezcla final de vecindad con conservacion exacta de pesos (Compute Shader cs_5_0).
+// smaa_neighborhood_blend.hlsl
+// SMAA Pass 3 - Exact weight neighborhood blending pass (Compute Shader cs_5_0).
 
 #include "smaa_constants.hlsli"
 
@@ -27,11 +27,6 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         return;
     }
 
-    // Lectura alineada con la convencion de Pass 2:
-    // .r = mezcla hacia arriba  (en el propio pixel)
-    // .g = mezcla hacia abajo   (en el vecino inferior)
-    // .b = mezcla hacia izq     (en el propio pixel)
-    // .a = mezcla hacia dcha    (en el vecino derecho)
     float4 centerW = g_blendTex.Load(int3(localPos, 0));
     float  bottomG = (localPos.y + 1 < dims.y) ? g_blendTex.Load(int3(localPos + int2(0, 1), 0)).g : 0.0f;
     float  rightA  = (localPos.x + 1 < dims.x) ? g_blendTex.Load(int3(localPos + int2(1, 0), 0)).a : 0.0f;

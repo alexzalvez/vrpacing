@@ -1,20 +1,19 @@
-﻿// smaa_constants.hlsli
-// Constant buffer compartido por los tres passes de SMAA (alineado a 16 bytes).
+// smaa_constants.hlsli
+// Shared constant buffer for all 3 SMAA compute passes (16-byte aligned).
 
 cbuffer SmaaConstants : register(b0) {
-    float4 g_rtMetrics;        // xy = (1/width, 1/height), zw = (width, height) del viewport activo
-    float  g_threshold;        // Umbral de deteccion de bordes (0.05 = Ultra)
-    int    g_maxSearchSteps;   // Pasos maximos de busqueda ortogonal (32)
-    float  g_fovealRadius;     // Radio foveal (0.60 = mismo cono central que NIS 2.0x)
-    float  _pad0;              // Padding 16-byte
-    float2 g_projectionCenter; // Centro de proyeccion UV [0..1]
-    uint2  g_viewportOffset;   // Offset en pixeles (x, y) dentro de la textura fuente
+    float4 g_rtMetrics;        // xy = (1/w, 1/h), zw = (w, h) of active viewport
+    float  g_threshold;        // Edge detection threshold (0.05 = Ultra)
+    int    g_maxSearchSteps;   // Maximum search steps (32)
+    float  g_fovealRadius;     // Foveal radius (0.60 = 60% central cone)
+    float  _pad0;              // 16-byte boundary padding
+    float2 g_projectionCenter; // UV projection center [0..1]
+    uint2  g_viewportOffset;   // Pixel offset (x, y) inside source swapchain
 };
 
-// Devuelve 1.0 dentro del radio foveal configurado (60%), 0.0 fuera.
 inline float InFovealMask(float2 uv) {
     float2 d = uv - g_projectionCenter;
-    d.x *= (g_rtMetrics.z * g_rtMetrics.y); // Correccion de aspecto (width / height)
+    d.x *= (g_rtMetrics.z * g_rtMetrics.y); // Aspect ratio correction (w / h)
     float r = 0.5f * g_fovealRadius;
     return (dot(d, d) <= (r * r)) ? 1.0f : 0.0f;
 }

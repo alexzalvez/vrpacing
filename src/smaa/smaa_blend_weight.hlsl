@@ -1,5 +1,5 @@
-﻿// smaa_blend_weight.hlsl
-// SMAA Pass 2 - Calculo morfologico de pesos en patrones L, Z y U (Compute Shader cs_5_0).
+// smaa_blend_weight.hlsl
+// SMAA Pass 2 - Morphological blend weight evaluation for L, Z and U patterns (Compute Shader cs_5_0).
 
 #include "smaa_constants.hlsli"
 
@@ -22,7 +22,6 @@ float2 ReadEdgeClamped(int2 p, int2 dims) {
     return g_edgesTex[p];
 }
 
-// Cuantos pixeles adicionales hacia la izquierda continua el borde horizontal superior (.g)
 int SearchHorizontalLeft(int2 ipos, int2 dims) {
     int d = 0;
     for (int i = 0; i < g_maxSearchSteps; ++i) {
@@ -38,7 +37,6 @@ int SearchHorizontalLeft(int2 ipos, int2 dims) {
     return d;
 }
 
-// Cuantos pixeles adicionales hacia la derecha continua el borde horizontal superior (.g)
 int SearchHorizontalRight(int2 ipos, int2 dims) {
     int d = 0;
     for (int i = 0; i < g_maxSearchSteps; ++i) {
@@ -54,7 +52,6 @@ int SearchHorizontalRight(int2 ipos, int2 dims) {
     return d;
 }
 
-// Cuantos pixeles adicionales hacia arriba continua el borde vertical izquierdo (.r)
 int SearchVerticalUp(int2 ipos, int2 dims) {
     int d = 0;
     for (int i = 0; i < g_maxSearchSteps; ++i) {
@@ -70,7 +67,6 @@ int SearchVerticalUp(int2 ipos, int2 dims) {
     return d;
 }
 
-// Cuantos pixeles adicionales hacia abajo continua el borde vertical izquierdo (.r)
 int SearchVerticalDown(int2 ipos, int2 dims) {
     int d = 0;
     for (int i = 0; i < g_maxSearchSteps; ++i) {
@@ -108,7 +104,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     float4 weights = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    // 1. Borde HORIZONTAL en el limite superior del pixel (edges.g > 0.5)
+    // 1. HORIZONTAL edge on pixel top boundary (edges.g > 0.5)
     if (edges.g > 0.5f) {
         int dLeft  = SearchHorizontalLeft(ipos, dims);
         int dRight = SearchHorizontalRight(ipos, dims);
@@ -116,8 +112,6 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         int leftCol  = ipos.x - dLeft;
         int rightCol = ipos.x + dRight + 1;
 
-        // Codificacion exacta de bordes cruzados para AreaTex:
-        // 0.00 -> 0 (ninguno), 0.25 -> 1 (arriba), 0.75 -> 3 (abajo), 1.00 -> 4 (ambos)
         float e1Top = ReadEdgeClamped(int2(leftCol,  ipos.y - 1), dims).r;
         float e1Bot = ReadEdgeClamped(int2(leftCol,  ipos.y),     dims).r;
         float e1    = 0.25f * e1Top + 0.75f * e1Bot;
@@ -126,11 +120,11 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float e2Bot = ReadEdgeClamped(int2(rightCol, ipos.y),     dims).r;
         float e2    = 0.25f * e2Top + 0.75f * e2Bot;
 
-        float2 dist = sqrt(clamp(float2(dLeft, dRight), 0.0f, 255.0f));
+        float2 dist = clamp(float2(dLeft, dRight), 0.0f, 255.0f);
         weights.rg = Area(dist, e1, e2);
     }
 
-    // 2. Borde VERTICAL en el limite izquierdo del pixel (edges.r > 0.5)
+    // 2. VERTICAL edge on pixel left boundary (edges.r > 0.5)
     if (edges.r > 0.5f) {
         int dUp   = SearchVerticalUp(ipos, dims);
         int dDown = SearchVerticalDown(ipos, dims);
@@ -146,8 +140,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float e2Right = ReadEdgeClamped(int2(ipos.x,     bottomRow), dims).g;
         float e2      = 0.25f * e2Left + 0.75f * e2Right;
 
-        float2 dist = sqrt(clamp(float2(dUp, dDown), 0.0f, 255.0f));
-        weights.ba = Area(dist, e1, e2);
+        float2 distV = clamp(float2(dUp, dDown), 0.0f, 255.0f);
+        weights.ba = Area(distV, e1, e2);
     }
 
     g_blendTex[ipos] = weights;

@@ -1,5 +1,5 @@
-﻿// smaa_edge_detection.hlsl
-// SMAA Pass 1 - Deteccion hibrida de bordes por Luma + Color (Compute Shader cs_5_0).
+// smaa_edge_detection.hlsl
+// SMAA Pass 1 - Hybrid Luma + Color edge detection (Compute Shader cs_5_0).
 
 #include "smaa_constants.hlsli"
 
@@ -59,8 +59,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float adaptiveThreshold = max(g_threshold, 0.5f * maxDelta);
 
     float2 outEdges;
-    outEdges.x = (deltaL >= adaptiveThreshold) ? 1.0f : 0.0f; // Borde vertical izquierdo (.r)
-    outEdges.y = (deltaT >= adaptiveThreshold) ? 1.0f : 0.0f; // Borde horizontal superior (.g)
+    outEdges.x = (deltaL >= adaptiveThreshold) ? 1.0f : 0.0f; // Left vertical edge (.r)
+    outEdges.y = (deltaT >= adaptiveThreshold) ? 1.0f : 0.0f; // Top horizontal edge (.g)
 
     g_edgesTex[localPos] = outEdges;
 }
