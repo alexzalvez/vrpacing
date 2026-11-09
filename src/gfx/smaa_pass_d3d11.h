@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #ifdef _WIN32
 
@@ -29,6 +29,7 @@ public:
     void Reset();
 
     ID3D11ShaderResourceView* Apply(
+        ID3D11Device* device,
         ID3D11DeviceContext* context,
         ID3D11ShaderResourceView* inputSrv,
         uint32_t texWidth,

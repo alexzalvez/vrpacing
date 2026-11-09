@@ -1,6 +1,5 @@
 // smaa_neighborhood_blend.hlsl
 // SMAA Pass 3 - Official 1D Dominant-Axis Neighborhood Blend with Continuous Opposing-Stroke Protection (cs_5_0).
-// Eliminates the binary protectRidge switch that caused straight lines to wobble under NIS 2.0x.
 
 #include "smaa_constants.hlsli"
 
@@ -32,24 +31,18 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float  bottomG = (localPos.y + 1 < dims.y) ? g_blendTex.Load(int3(localPos + int2(0, 1), 0)).g : 0.0f;
     float  rightA  = (localPos.x + 1 < dims.x) ? g_blendTex.Load(int3(localPos + int2(1, 0), 0)).a : 0.0f;
 
-    // a.xy = vertical blend weights (from horizontal edges)
-    // a.zw = horizontal blend weights (from vertical edges)
     float4 a = float4(centerW.r, bottomG, centerW.b, rightA);
     if (dot(a, float4(1.0f, 1.0f, 1.0f, 1.0f)) < 1e-5f) {
         g_outputTex[basePos] = originalColor;
         return;
     }
 
-    // Official SMAA 1D dominant-axis selection
     bool horizEdgeDominant = (max(a.x, a.y) > max(a.z, a.w));
-
     float4 blended = originalColor;
 
     if (horizEdgeDominant) {
         float w1 = a.x;
         float w2 = a.y;
-        // Continuous opposing-edge dampening for 1px font strokes:
-        // On normal 3D edges and straight lines, min(w1, w2) == 0.0 -> protectOpposing == 1.0 (zero modulation).
         float opposing = min(w1, w2);
         float protectOpposing = saturate(1.0f - 3.5f * opposing);
         w1 *= protectOpposing;

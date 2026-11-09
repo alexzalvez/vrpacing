@@ -1,12 +1,12 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 
 namespace vrpacing {
 
 constexpr wchar_t kSharedStateName[] = L"Local\\VRPacingSharedState";
-constexpr wchar_t kAppVersionString[] = L"v0.8.1-beta";
-constexpr char kAppVersionAnsi[] = "v0.8.1-beta";
+constexpr wchar_t kAppVersionString[] = L"v0.8.2-beta";
+constexpr char kAppVersionAnsi[] = "v0.8.2-beta";
 
 constexpr uint32_t kFlagEnabled = 1 << 0;
 constexpr uint32_t kFlagUpscalingEnabled = 1 << 1;
@@ -54,7 +54,7 @@ struct SharedState {
     uint32_t frameTimeWriteIdx;
     float frameTimesMs[256];
 
-    // Synchronous comparison screenshot capture (Ctrl + F12) & Lab SMAA state
+    // Synchronous comparison screenshot capture (Ctrl + F12) & SMAA state
     uint32_t screenshotRequest;
     uint32_t screenshotSavedCount;
     int32_t smaaStatus;

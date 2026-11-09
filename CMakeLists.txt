@@ -1,6 +1,6 @@
-﻿cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.22)
 
-project(VRPacing VERSION 0.8.1 LANGUAGES C CXX)
+project(VRPacing VERSION 0.8.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,7 +93,7 @@ if(WIN32)
     src/common/config_json.cpp
     src/common/logging_win.cpp
   )
-  target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32)
+  target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32 comctl32)
   set_target_properties(VRPacingTray PROPERTIES OUTPUT_NAME "VRPacingTray")
 
   if(MSVC)

@@ -31,10 +31,10 @@
 namespace vrpacing {
 namespace {
 
-// Contrato de concurrencia de ProcessScanner:
-// Todas las estructuras de estado de este archivo son accedidas exclusivamente desde el
-// hilo principal de interfaz (UI thread) de VRPacingTray.exe a traves del temporizador
-// WM_TIMER (IDT_SCANNER_TIMER). No existen llamadas concurrentes desde hilos secundarios.
+// 45 seconds in 100-nanosecond FILETIME intervals.
+// Any process older than 45s that has not loaded a VR runtime DLL is cached in
+// s_systemIgnoredPids so background desktop apps are never re-opened or enumerated.
+constexpr uint64_t kMaxStartupScanWindow100ns = 450000000ULL;
 
 struct TrackedProcessInstance {
     DWORD pid = 0;
@@ -82,6 +82,15 @@ uint64_t QueryProcessCreationTime(HANDLE hProc) {
         return uli.QuadPart;
     }
     return 0;
+}
+
+uint64_t GetCurrentSystemTime100ns() {
+    FILETIME ftNow{};
+    GetSystemTimeAsFileTime(&ftNow);
+    ULARGE_INTEGER uli{};
+    uli.LowPart = ftNow.dwLowDateTime;
+    uli.HighPart = ftNow.dwHighDateTime;
+    return uli.QuadPart;
 }
 
 bool HasProcessHandleExited(HANDLE hProc) {
@@ -525,7 +534,6 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
 
 } // namespace
 
-// Nota: Debe invocarse exclusivamente desde el mismo hilo de interfaz que PollAndInject.
 bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::wstring& dllPath) {
     EnableDebugPrivilegeOnce();
     PruneExitedTrackedProcesses();
@@ -550,7 +558,6 @@ bool ProcessScanner::InjectHookDll(const std::wstring& processName, const std::w
     return injected;
 }
 
-// Invocado exclusivamente desde el hilo UI de VRPacingTray.exe mediante WM_TIMER (IDT_SCANNER_TIMER).
 void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
     static std::once_flag s_logInitFlag;
     std::call_once(s_logInitFlag, []() {
@@ -571,77 +578,72 @@ void ProcessScanner::PollAndInject(const std::wstring& dllPath) {
         s_openFailCounts.clear();
     }
 
-    std::vector<PROCESSENTRY32W> processEntries;
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
+    const uint64_t now100ns = GetCurrentSystemTime100ns();
+    const DWORD selfPid = GetCurrentProcessId();
 
-    if (Process32FirstW(hSnap, &pe)) {
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+
+    if (Process32FirstW(hSnap, &entry)) {
         do {
-            processEntries.push_back(pe);
-        } while (Process32NextW(hSnap, &pe));
-    }
-    CloseHandle(hSnap);
+            const DWORD pid = entry.th32ProcessID;
 
-    for (const auto& entry : processEntries) {
-        const DWORD pid = entry.th32ProcessID;
+            if (pid <= 4 || pid == selfPid) continue;
+            if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
+            if (s_hookedInstances.find(pid) != s_hookedInstances.end()) continue;
+            if (s_blockedInstances.find(pid) != s_blockedInstances.end()) continue;
+            if (s_pendingInjections.find(pid) != s_pendingInjections.end()) continue;
 
-        if (pid <= 4 || pid == GetCurrentProcessId()) continue;
-        if (s_hookedInstances.find(pid) != s_hookedInstances.end()) continue;
-        if (s_blockedInstances.find(pid) != s_blockedInstances.end()) continue;
-        if (s_pendingInjections.find(pid) != s_pendingInjections.end()) continue;
-        if (s_systemIgnoredPids.find(pid) != s_systemIgnoredPids.end()) continue;
-
-        if (IsBlacklistedProcess(entry.szExeFile)) {
-            s_systemIgnoredPids.insert(pid);
-            continue;
-        }
-
-        HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (hCheck) {
-            const bool isWinSys = IsSystemWindowsProcess(hCheck);
-            CloseHandle(hCheck);
-            if (isWinSys) {
+            if (IsBlacklistedProcess(entry.szExeFile)) {
                 s_systemIgnoredPids.insert(pid);
                 continue;
             }
-        } else {
-            if (++s_openFailCounts[pid] >= 5) {
-                s_systemIgnoredPids.insert(pid);
-                s_openFailCounts.erase(pid);
+
+            // Single OpenProcess call per uncached candidate process
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid);
+            if (!hProc) {
+                if (++s_openFailCounts[pid] >= 3) {
+                    s_systemIgnoredPids.insert(pid);
+                    s_openFailCounts.erase(pid);
+                }
+                continue;
             }
-            continue;
-        }
 
-        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid);
-        if (!hProc) {
-            if (++s_openFailCounts[pid] >= 5) {
+            s_openFailCounts.erase(pid);
+
+            if (IsSystemWindowsProcess(hProc)) {
+                CloseHandle(hProc);
                 s_systemIgnoredPids.insert(pid);
-                s_openFailCounts.erase(pid);
+                continue;
             }
-            continue;
-        }
 
-        s_openFailCounts.erase(pid);
+            bool alreadyHooked = false;
+            const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
 
-        bool alreadyHooked = false;
-        const bool isVrTarget = HasVrRuntimeModuleLoaded(hProc, alreadyHooked);
+            if (alreadyHooked) {
+                TrackedProcessInstance hooked{};
+                hooked.pid = pid;
+                hooked.creationTime = QueryProcessCreationTime(hProc);
+                hooked.exeName = WideToNarrow(entry.szExeFile);
+                hooked.hProcess = hProc;
+                s_hookedInstances[pid] = hooked;
+                continue;
+            }
 
-        if (alreadyHooked) {
-            TrackedProcessInstance hooked{};
-            hooked.pid = pid;
-            hooked.creationTime = QueryProcessCreationTime(hProc);
-            hooked.exeName = WideToNarrow(entry.szExeFile);
-            hooked.hProcess = hProc;
-            s_hookedInstances[pid] = hooked;
-            continue;
-        }
+            const uint64_t creationTime = QueryProcessCreationTime(hProc);
+            CloseHandle(hProc);
 
-        CloseHandle(hProc);
-
-        if (isVrTarget) {
-            StartOrCompleteInjectionByPid(pid, entry.szExeFile, dllPath, 1500);
-        }
+            if (isVrTarget) {
+                StartOrCompleteInjectionByPid(pid, entry.szExeFile, dllPath, 1500);
+            } else if (creationTime > 0 && now100ns > creationTime &&
+                       (now100ns - creationTime) > kMaxStartupScanWindow100ns) {
+                // Mature desktop process (>45s old) without VR modules -> cache in ignored set
+                s_systemIgnoredPids.insert(pid);
+            }
+        } while (Process32NextW(hSnap, &entry));
     }
+
+    CloseHandle(hSnap);
 }
 
 } // namespace vrpacing

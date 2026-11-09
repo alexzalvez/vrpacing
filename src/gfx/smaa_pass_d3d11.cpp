@@ -185,6 +185,7 @@ bool SmaaPassD3D11::EnsureTextures(uint32_t texWidth, uint32_t texHeight, uint32
 }
 
 ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
+    ID3D11Device* device,
     ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* inputSrv,
     uint32_t texWidth,
@@ -197,13 +198,11 @@ ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
     float projCenterX,
     float projCenterY,
     float fovealRadius) {
-    if (!context || !inputSrv || viewWidth == 0 || viewHeight == 0) {
+    if (!device || !context || !inputSrv || viewWidth == 0 || viewHeight == 0) {
         return inputSrv;
     }
 
-    ComPtr<ID3D11Device> dev;
-    context->GetDevice(dev.GetAddressOf());
-    if (!Initialize(dev.Get())) {
+    if (!Initialize(device)) {
         return inputSrv;
     }
 
@@ -216,7 +215,7 @@ ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
     cb.rtMetrics[1] = 1.0f / static_cast<float>(viewHeight);
     cb.rtMetrics[2] = static_cast<float>(viewWidth);
     cb.rtMetrics[3] = static_cast<float>(viewHeight);
-    cb.threshold = 0.01f;
+    cb.threshold = 0.025f;
     cb.maxSearchSteps = 64;
     cb.fovealRadius = fovealRadius;
     cb.projectionCenter[0] = projCenterX;
@@ -279,10 +278,6 @@ ID3D11ShaderResourceView* SmaaPassD3D11::Apply(
         context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
         context->CSSetShaderResources(0, 2, nullSrvs);
     }
-
-    ID3D11SamplerState* nullSmpls[] = { nullptr, nullptr };
-    context->CSSetSamplers(0, 2, nullSmpls);
-    context->CSSetShader(nullptr, nullptr, 0);
 
     return outputSrv_.Get();
 }

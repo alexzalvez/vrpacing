@@ -1,8 +1,5 @@
 // smaa_blend_weight.hlsl
 // SMAA Pass 2 - Official SMAA 1x Ultra Blend Weight Calculation (cs_5_0).
-// - Restores sqrt(round(dist)) compression for AreaTex orthogonal lookups (up to 64px per side).
-// - Implements faithful mutually-exclusive 45-degree diagonal pattern search (maxSearchStepsDiag = 16).
-// - Applies official SMAA_CORNER_ROUNDING (0.25) only on U-corners while preserving 100% on Z/L steps.
 
 #include "smaa_constants.hlsli"
 
@@ -18,8 +15,8 @@ SamplerState g_pointSampler  : register(s1);
 static const float2 k_areaTexMaxDistance     = float2(16.0f, 16.0f);
 static const float2 k_areaTexMaxDistanceDiag = float2(20.0f, 20.0f);
 static const float2 k_areaTexPixelSize       = 1.0f / float2(160.0f, 560.0f);
-static const int    k_maxSearchStepsDiag     = 16;   // Official SMAA Ultra diagonal reach
-static const float  k_cornerRounding         = 0.25f; // Official SMAA_CORNER_ROUNDING = 25%
+static const int    k_maxSearchStepsDiag     = 16;
+static const float  k_cornerRounding         = 0.25f;
 
 float2 ReadEdgeClamped(int2 p, int2 dims) {
     if (p.x < 0 || p.y < 0 || p.x >= dims.x || p.y >= dims.y) {
@@ -28,9 +25,6 @@ float2 ReadEdgeClamped(int2 p, int2 dims) {
     return g_edgesTex[p];
 }
 
-// -----------------------------------------------------------------------------
-// Orthogonal Searches (Up to 64 pixels per direction in SMAA Ultra)
-// -----------------------------------------------------------------------------
 int SearchHorizontalLeft(int2 ipos, int2 dims) {
     int d = 0;
     for (int i = 0; i < g_maxSearchSteps; ++i) {
@@ -91,11 +85,6 @@ int SearchVerticalDown(int2 ipos, int2 dims) {
     return d;
 }
 
-// -----------------------------------------------------------------------------
-// AreaTex Lookups (Exact Jorge Jimenez Specification)
-// -----------------------------------------------------------------------------
-
-// Orthogonal lookup: uses sqrt(round(dist)) compressed coordinates in left half (x = 0..79)
 float2 AreaOrthogonal(float2 dist, float e1, float e2) {
     float2 sqrtDist = min(sqrt(round(dist)), 15.0f);
     float2 texcoord = k_areaTexMaxDistance * round(4.0f * float2(e1, e2)) + sqrtDist;
@@ -103,17 +92,14 @@ float2 AreaOrthogonal(float2 dist, float e1, float e2) {
     return g_areaTex.SampleLevel(g_linearSampler, texcoord, 0.0f).rg;
 }
 
-// Diagonal lookup: uses linear coordinates in right half of AreaTex (x = 80..159)
 float2 AreaDiagonal(float2 dist, float2 e) {
     float2 clampedDist = clamp(round(dist), 0.0f, 19.0f);
     float2 texcoord = k_areaTexMaxDistanceDiag * e + clampedDist;
     texcoord = (texcoord + 0.5f) * k_areaTexPixelSize;
-    texcoord.x += 0.5f; // Offset to right half of AreaTex
+    texcoord.x += 0.5f;
     return g_areaTex.SampleLevel(g_linearSampler, texcoord, 0.0f).rg;
 }
 
-// Attenuates only closed U-corners (both crossing edges turning in the same direction),
-// leaving Z-staircases and L-steps along straight lines at 100.0% weight.
 float2 ApplyCornerRounding(float2 w, float e1, float e2) {
     bool isUCorner = ((e1 == 0.25f && e2 == 0.25f) || (e1 == 0.75f && e2 == 0.75f));
     if (isUCorner) {
@@ -122,11 +108,6 @@ float2 ApplyCornerRounding(float2 w, float e1, float e2) {
     return w;
 }
 
-// -----------------------------------------------------------------------------
-// 45-Degree Diagonal Pattern Search (Official SMAA Ultra Specification)
-// -----------------------------------------------------------------------------
-
-// Diagonal 1: top-left to bottom-right (\) staircase
 float2 SearchDiag1(int2 ipos, int2 dims, int2 dir, out float2 endEdge) {
     int2 cur = ipos;
     int d = 0;
@@ -145,7 +126,6 @@ float2 SearchDiag1(int2 ipos, int2 dims, int2 dir, out float2 endEdge) {
     return float2(float(d), (endEdge.r > 0.5f || endEdge.g > 0.5f) ? 1.0f : 0.0f);
 }
 
-// Diagonal 2: bottom-left to top-right (/) staircase
 float2 SearchDiag2(int2 ipos, int2 dims, int2 dir, out float2 endEdge) {
     int2 cur = ipos;
     int d = 0;
@@ -168,14 +148,12 @@ float2 SearchDiag2(int2 ipos, int2 dims, int2 dir, out float2 endEdge) {
 float2 CalculateDiagWeights(int2 ipos, int2 dims, float2 edges) {
     float2 weights = float2(0.0f, 0.0f);
 
-    // 1. Check (\) diagonal staircase
     if (edges.r > 0.5f) {
         float2 end1, end2;
         float2 d1 = SearchDiag1(ipos, dims, int2(-1, -1), end1);
         float2 d2 = SearchDiag1(ipos, dims, int2( 1,  1), end2);
         float2 d  = float2(d1.x, d2.x);
 
-        // Require at least a 3-step diagonal staircase (never trigger on 1px corners of straight lines)
         if ((d.x + d.y) > 2.0f) {
             float4 e = float4(
                 (d1.y > 0.5f) ? end1.g : 0.0f,
@@ -188,7 +166,6 @@ float2 CalculateDiagWeights(int2 ipos, int2 dims, float2 edges) {
         }
     }
 
-    // 2. Check (/) diagonal staircase
     float rightR = ReadEdgeClamped(ipos + int2(1, 0), dims).r;
     if (rightR > 0.5f) {
         float2 end1, end2;
@@ -204,7 +181,6 @@ float2 CalculateDiagWeights(int2 ipos, int2 dims, float2 edges) {
                 (d2.y > 0.5f) ? end2.g : 0.0f
             );
             float2 c = float2(2.0f * e.x + e.y, 2.0f * e.z + e.w);
-            // Swap .rg to .gr for (/) diagonal orientation
             weights += AreaDiagonal(d, c).gr;
         }
     }
@@ -228,13 +204,9 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     float4 weights = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    // -------------------------------------------------------------------------
-    // 1. HORIZONTAL EDGE (.g > 0.5): First test 45-deg diagonals; if none, run orthogonal
-    // -------------------------------------------------------------------------
     if (edges.g > 0.5f) {
         weights.rg = CalculateDiagWeights(ipos, dims, edges);
 
-        // Mutually exclusive: only run orthogonal search if not a 45-degree diagonal staircase
         if (dot(weights.rg, float2(1.0f, 1.0f)) == 0.0f) {
             int dLeft  = SearchHorizontalLeft(ipos, dims);
             int dRight = SearchHorizontalRight(ipos, dims);
@@ -255,9 +227,6 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // 2. VERTICAL EDGE (.r > 0.5): Pure orthogonal vertical search into .ba
-    // -------------------------------------------------------------------------
     if (edges.r > 0.5f) {
         int dUp   = SearchVerticalUp(ipos, dims);
         int dDown = SearchVerticalDown(ipos, dims);

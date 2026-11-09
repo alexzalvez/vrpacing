@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #include "nis_upscaler_d3d11.h"
 
@@ -253,17 +253,17 @@ bool CaptureTextureRegionToPng(ID3D11Device* device,
 
         if (baseFmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
             for (uint32_t x = 0; x < cropW; ++x) {
-                dstRow[x * 4 + 0] = row[x * 4 + 2]; // B
-                dstRow[x * 4 + 1] = row[x * 4 + 1]; // G
-                dstRow[x * 4 + 2] = row[x * 4 + 0]; // R
-                dstRow[x * 4 + 3] = 255u;           // A (opaque)
+                dstRow[x * 4 + 0] = row[x * 4 + 2];
+                dstRow[x * 4 + 1] = row[x * 4 + 1];
+                dstRow[x * 4 + 2] = row[x * 4 + 0];
+                dstRow[x * 4 + 3] = 255u;
             }
         } else if (baseFmt == DXGI_FORMAT_B8G8R8A8_UNORM || baseFmt == DXGI_FORMAT_B8G8R8X8_UNORM) {
             for (uint32_t x = 0; x < cropW; ++x) {
-                dstRow[x * 4 + 0] = row[x * 4 + 0]; // B
-                dstRow[x * 4 + 1] = row[x * 4 + 1]; // G
-                dstRow[x * 4 + 2] = row[x * 4 + 2]; // R
-                dstRow[x * 4 + 3] = 255u;           // A (opaque)
+                dstRow[x * 4 + 0] = row[x * 4 + 0];
+                dstRow[x * 4 + 1] = row[x * 4 + 1];
+                dstRow[x * 4 + 2] = row[x * 4 + 2];
+                dstRow[x * 4 + 3] = 255u;
             }
         } else if (baseFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
             const auto* p32 = reinterpret_cast<const uint32_t*>(row);
@@ -499,9 +499,6 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         dstR.height = dstHeight;
     }
 
-    D3D11State state{};
-    StoreD3D11State(ctx, state);
-
     NISConfig constants{};
     NVScalerUpdateConfig(
         constants,
@@ -539,7 +536,11 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     const UINT groupsY = (dstR.height + 23) / 24;
     ctx->Dispatch(groupsX, groupsY, 1);
 
-    RestoreD3D11State(ctx, state);
+    ID3D11UnorderedAccessView* nullUav[1] = { nullptr };
+    ID3D11ShaderResourceView* nullSrvs[3] = { nullptr, nullptr, nullptr };
+    ctx->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+    ctx->CSSetShaderResources(0, 3, nullSrvs);
+
     return true;
 }
 
@@ -578,14 +579,15 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
     }
     SharedState* shm = g_screenshotShm.GetRaw();
     const bool smaaRequested = (shm && (shm->flags & kFlagSmaaEnabled) != 0);
+    const bool takeScreenshotThisFrame = (shm && shm->screenshotRequest != 0 &&
+                                          desc.srcArrayIndex == 0 &&
+                                          desc.srcRect.x < (srcDesc.Width / 4));
 
-    // RUTA 1: Zero-Copy Direct SRV (si es 2D simple sin MSAA ni ArraySlice > 0 cuando SMAA esta activo)
     ComPtr<ID3D11ShaderResourceView> activeSrcSrv;
     if (srcDesc.SampleDesc.Count <= 1 && !(smaaRequested && srcDesc.ArraySize > 1)) {
         activeSrcSrv = GetOrCreateSrv(src, desc.srcArrayIndex);
     }
 
-    // Si la lectura directa no es posible (ej: MSAA o Texture2DArray para SMAA), usar fallback staging 2D
     if (!activeSrcSrv) {
         DXGI_FORMAT srcUnormFmt = GetCompatibleUnormFormat(srcDesc.Format);
         if (!g_fallback.srcTex || g_fallback.srcW != srcDesc.Width || g_fallback.srcH != srcDesc.Height || g_fallback.srcFmt != srcUnormFmt) {
@@ -625,11 +627,9 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         activeSrcSrv = g_fallback.srcSrv;
     }
 
-    // RUTA 2: Zero-Copy Direct UAV (escritura directa en destino si soporta UAV)
     ComPtr<ID3D11UnorderedAccessView> activeDstUav = GetOrCreateUav(dst, desc.dstArrayIndex);
     const bool directWriteOk = (activeDstUav != nullptr);
 
-    // Si el destino no admite UAV directo (ej: swapchain sRGB), usar fallback staging
     if (!directWriteOk) {
         DXGI_FORMAT dstUnormFmt = GetCompatibleUnormFormat(dstDesc.Format);
         if (!g_fallback.dstTex || g_fallback.dstW != dstDesc.Width || g_fallback.dstH != dstDesc.Height || g_fallback.dstFmt != dstUnormFmt) {
@@ -659,7 +659,10 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         activeDstUav = g_fallback.dstUav;
     }
 
-    // Paso Pre-Upscale Opcional (Laboratorio): SMAA 1.0x antes de NIS 2.0x
+    // Consolidated single D3D11 state save/restore block for both SMAA 1x and NIS 2.0x
+    D3D11State state{};
+    StoreD3D11State(ctx, state);
+
     ID3D11ShaderResourceView* srvForNis = activeSrcSrv.Get();
     bool smaaAppliedThisFrame = false;
 
@@ -672,10 +675,8 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
             srcR.height = srcDesc.Height;
         }
 
-        D3D11State smaaState{};
-        StoreD3D11State(ctx, smaaState);
-
         ID3D11ShaderResourceView* smaaSrv = g_smaaPass.Apply(
+            device_.Get(),
             ctx,
             activeSrcSrv.Get(),
             srcDesc.Width,
@@ -690,8 +691,6 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
             desc.radius
         );
 
-        RestoreD3D11State(ctx, smaaState);
-
         if (smaaSrv && smaaSrv != activeSrcSrv.Get()) {
             srvForNis = smaaSrv;
             smaaAppliedThisFrame = true;
@@ -703,12 +702,55 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         if (shm) shm->smaaStatus = 0;
     }
 
-    if (!Upscale(ctx, srvForNis, activeDstUav.Get(),
-                 srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height, desc)) {
+    // Prepare screenshot metadata if requested on this frame
+    std::filesystem::path outDir;
+    wchar_t timeBuf[64]{};
+    std::wstring gameStem;
+    uint32_t out1xW = 0, out1xH = 0, out2xW = 0, out2xH = 0;
+    ID3D11Texture2D* dstCaptureTex = (!directWriteOk && g_fallback.dstTex) ? g_fallback.dstTex.Get() : dst;
+    const int dstCaptureSlice = (dstCaptureTex == g_fallback.dstTex.Get()) ? 0 : desc.dstArrayIndex;
+    bool okNisRaw2x = false;
+
+    if (takeScreenshotThisFrame) {
+        shm->screenshotRequest = 0;
+
+        outDir = (shm->screenshotDir[0] != L'\0')
+                     ? std::filesystem::path(shm->screenshotDir)
+                     : (std::filesystem::path(GetLogFilePath()).parent_path() / L"Screenshots");
+        std::error_code ec;
+        std::filesystem::create_directories(outDir, ec);
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        swprintf_s(timeBuf, L"%04u%02u%02u_%02u%02u%02u",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        gameStem = GetCleanProcessStem();
+        out1xW = (desc.srcRect.width > 0) ? desc.srcRect.width : srcDesc.Width;
+        out1xH = (desc.srcRect.height > 0) ? desc.srcRect.height : srcDesc.Height;
+        out2xW = (desc.dstRect.width > 0) ? desc.dstRect.width : dstDesc.Width;
+        out2xH = (desc.dstRect.height > 0) ? desc.dstRect.height : dstDesc.Height;
+
+        // If SMAA is active, first dispatch NIS 2.0x on raw 1x Native to capture #3 (NIS_2x without SMAA)
+        if (smaaAppliedThisFrame) {
+            if (Upscale(ctx, activeSrcSrv.Get(), activeDstUav.Get(),
+                        srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height, desc)) {
+                wchar_t file3[220]{};
+                swprintf_s(file3, L"VRPacing_%s_%s_3_NIS_2x_%ux%u.png", timeBuf, gameStem.c_str(), out2xW, out2xH);
+                okNisRaw2x = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, (outDir / file3).wstring());
+            }
+        }
+    }
+
+    const bool upscaleOk = Upscale(ctx, srvForNis, activeDstUav.Get(),
+                                   srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height, desc);
+
+    RestoreD3D11State(ctx, state);
+
+    if (!upscaleOk) {
         return false;
     }
 
-    // Si usamos staging en destino, transferir resultado al swapchain
     if (!directWriteOk) {
         const UINT dstSlice = (desc.dstArrayIndex >= 0 && static_cast<UINT>(desc.dstArrayIndex) < dstDesc.ArraySize)
                               ? static_cast<UINT>(desc.dstArrayIndex) : 0;
@@ -730,57 +772,38 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         }
     }
 
-    // Verificar si el usuario solicito captura comparativa sincrona (Ctrl + F12) en el ojo izquierdo
-    if (shm && shm->screenshotRequest != 0 && desc.srcArrayIndex == 0 && desc.srcRect.x < (srcDesc.Width / 4)) {
-        shm->screenshotRequest = 0;
-
-        std::filesystem::path outDir = (shm->screenshotDir[0] != L'\0')
-                                           ? std::filesystem::path(shm->screenshotDir)
-                                           : (std::filesystem::path(GetLogFilePath()).parent_path() / L"Screenshots");
-        std::error_code ec;
-        std::filesystem::create_directories(outDir, ec);
-
-        SYSTEMTIME st{};
-        GetLocalTime(&st);
-        wchar_t timeBuf[64]{};
-        swprintf_s(timeBuf, L"%04u%02u%02u_%02u%02u%02u",
-                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-        const std::wstring gameStem = GetCleanProcessStem();
-        const uint32_t out1xW = (desc.srcRect.width > 0) ? desc.srcRect.width : srcDesc.Width;
-        const uint32_t out1xH = (desc.srcRect.height > 0) ? desc.srcRect.height : srcDesc.Height;
-        const uint32_t out2xW = (desc.dstRect.width > 0) ? desc.dstRect.width : dstDesc.Width;
-        const uint32_t out2xH = (desc.dstRect.height > 0) ? desc.dstRect.height : dstDesc.Height;
-
+    // Complete synchronous screenshot suite (2 files when SMAA is off; 4 files when SMAA is on)
+    if (takeScreenshotThisFrame) {
         ID3D11Texture2D* srcCaptureTex = ((srcDesc.SampleDesc.Count > 1 || (smaaRequested && srcDesc.ArraySize > 1)) && g_fallback.srcTex)
                                              ? g_fallback.srcTex.Get() : src;
         const int srcCaptureSlice = (srcCaptureTex == g_fallback.srcTex.Get()) ? 0 : desc.srcArrayIndex;
-
-        ID3D11Texture2D* dstCaptureTex = (!directWriteOk && g_fallback.dstTex) ? g_fallback.dstTex.Get() : dst;
-        const int dstCaptureSlice = (dstCaptureTex == g_fallback.dstTex.Get()) ? 0 : desc.dstArrayIndex;
 
         wchar_t file1x[220]{};
         swprintf_s(file1x, L"VRPacing_%s_%s_1_Native_1x_%ux%u.png", timeBuf, gameStem.c_str(), out1xW, out1xH);
         const bool ok1 = CaptureTextureRegionToPng(device_.Get(), ctx, srcCaptureTex, srcCaptureSlice, desc.srcRect, (outDir / file1x).wstring());
 
-        bool ok2 = false;
+        bool okFinal = false;
         if (smaaAppliedThisFrame && g_smaaPass.GetOutputTexture()) {
-            wchar_t fileSmaa1x[220]{};
-            wchar_t fileSmaa2x[220]{};
-            swprintf_s(fileSmaa1x, L"VRPacing_%s_%s_2_SMAA_1x_%ux%u.png", timeBuf, gameStem.c_str(), out1xW, out1xH);
-            swprintf_s(fileSmaa2x, L"VRPacing_%s_%s_3_SMAA_NIS_2x_%ux%u.png", timeBuf, gameStem.c_str(), out2xW, out2xH);
+            wchar_t file2[220]{};
+            wchar_t file4[220]{};
+            swprintf_s(file2, L"VRPacing_%s_%s_2_SMAA_1x_%ux%u.png", timeBuf, gameStem.c_str(), out1xW, out1xH);
+            swprintf_s(file4, L"VRPacing_%s_%s_4_SMAA_NIS_2x_%ux%u.png", timeBuf, gameStem.c_str(), out2xW, out2xH);
 
-            CaptureTextureRegionToPng(device_.Get(), ctx, g_smaaPass.GetOutputTexture(), 0, desc.srcRect, (outDir / fileSmaa1x).wstring());
-            ok2 = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, (outDir / fileSmaa2x).wstring());
+            const bool ok2 = CaptureTextureRegionToPng(device_.Get(), ctx, g_smaaPass.GetOutputTexture(), 0, desc.srcRect, (outDir / file2).wstring());
+            const bool ok4 = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, (outDir / file4).wstring());
+            okFinal = (ok1 && ok2 && okNisRaw2x && ok4);
         } else {
             wchar_t file2x[220]{};
             swprintf_s(file2x, L"VRPacing_%s_%s_2_NIS_2x_%ux%u.png", timeBuf, gameStem.c_str(), out2xW, out2xH);
-            ok2 = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, (outDir / file2x).wstring());
+            const bool ok2 = CaptureTextureRegionToPng(device_.Get(), ctx, dstCaptureTex, dstCaptureSlice, desc.dstRect, (outDir / file2x).wstring());
+            okFinal = (ok1 && ok2);
         }
 
-        if (ok1 && ok2) {
+        if (okFinal) {
             shm->screenshotSavedCount++;
-            LogMessage(LogLevel::Info, "Comparison screenshot set saved in Screenshots folder.");
+            LogMessage(LogLevel::Info, smaaAppliedThisFrame
+                ? "4-image comparison screenshot suite (1x Native, 1x SMAA, 2x NIS, 2x SMAA+NIS) saved in Screenshots folder."
+                : "2-image comparison screenshot pair (1x Native, 2x NIS) saved in Screenshots folder.");
         } else {
             LogMessage(LogLevel::Warn, "Comparison screenshot capture failed for current swapchain format.");
         }

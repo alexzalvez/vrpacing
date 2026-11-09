@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -8,6 +8,7 @@
 #endif
 
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include "vrpacing/shared_state.h"
 #include "vrpacing/telemetry_advisor.h"
 
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace {
@@ -58,12 +60,14 @@ constexpr UINT ID_TRAY_TAKE_SHOT = 3014;
 constexpr UINT ID_TRAY_OPEN_SHOTS = 3015;
 constexpr UINT ID_TRAY_SMAA = 3016;
 
-// Coordenadas del area de la grafica GDI en la ventana principal
 constexpr RECT kGraphRect = { 30, 172, 434, 246 };
 
 NOTIFYICONDATAW g_nid{};
+wchar_t g_lastTrayTip[128]{};
+bool g_uiIdleRendered = false;
+
 vrpacing::RuntimeConfig g_cfg;
-bool g_smaaEnabled = false; // Desactivado por defecto (Modo Laboratorio)
+bool g_smaaEnabled = false; // Always unchecked on startup by design
 vrpacing::SharedState* g_shared = nullptr;
 HANDLE g_mapFile = nullptr;
 vrpacing::ProcessScanner g_scanner;
@@ -71,9 +75,17 @@ std::wstring g_hookPath;
 std::wstring g_screenshotsDir;
 
 HWND g_hMainWnd = nullptr;
+HWND g_hTooltip = nullptr;
 HFONT g_hFontNormal = nullptr;
 HFONT g_hFontBold = nullptr;
 HFONT g_hFontSmall = nullptr;
+
+// Cached GDI objects for zero-allocation graph rendering
+HBRUSH g_hBrushGraphBg = nullptr;
+HPEN g_hPenGraphBorder = nullptr;
+HPEN g_hPenGraphGrid = nullptr;
+HPEN g_hPenGraphTarget = nullptr;
+HPEN g_hPenGraphLine = nullptr;
 
 HWND g_hLblApi = nullptr;
 HWND g_hLblHz = nullptr;
@@ -85,6 +97,16 @@ HWND g_hLblPipeline = nullptr;
 HWND g_hLblAdvisor = nullptr;
 HWND g_hLblShotInfo = nullptr;
 
+std::wstring g_cacheApi;
+std::wstring g_cacheHz;
+std::wstring g_cacheCap;
+std::wstring g_cacheFps;
+std::wstring g_cacheProc;
+std::wstring g_cacheRes;
+std::wstring g_cachePipe;
+std::wstring g_cacheAdvisor;
+std::wstring g_cacheShot;
+
 static vrpacing::TelemetryAnalyzer g_advisor;
 
 HWND g_hChkNis = nullptr;
@@ -93,6 +115,37 @@ HWND g_hChkFfr = nullptr;
 HWND g_hChkMask = nullptr;
 HWND g_hRadio1x = nullptr;
 HWND g_hRadioHalf = nullptr;
+
+void SetWindowTextIfChanged(HWND hCtrl, const wchar_t* newText, std::wstring& cache) {
+    if (!hCtrl || !newText) return;
+    if (cache != newText) {
+        cache = newText;
+        SetWindowTextW(hCtrl, newText);
+    }
+}
+
+void UpdateTrayTooltipIfChanged(const wchar_t* newTip) {
+    if (!newTip) return;
+    if (wcscmp(g_lastTrayTip, newTip) != 0) {
+        wcscpy_s(g_lastTrayTip, newTip);
+        wcscpy_s(g_nid.szTip, newTip);
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+}
+
+void AttachControlTooltip(HWND hParent, HWND hCtrl, const wchar_t* text) {
+    if (!g_hTooltip || !hCtrl || !text) return;
+    TTTOOLINFOW ti{};
+    ti.cbSize = sizeof(TTTOOLINFOW);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = hParent;
+    ti.uId = reinterpret_cast<UINT_PTR>(hCtrl);
+    ti.lpszText = const_cast<LPWSTR>(text);
+    if (!SendMessageW(g_hTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti))) {
+        ti.cbSize = TTTOOLINFOW_V1_SIZE;
+        SendMessageW(g_hTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
+}
 
 bool IsCurrentProcessElevated() {
     HANDLE hToken = nullptr;
@@ -158,7 +211,7 @@ void RegisterOpenXrImplicitLayer() {
     }
 
     HKEY hKeyCu = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyCu, nullptr) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, &hKeyCu) == ERROR_SUCCESS) {
         RegSetValueExW(hKeyCu, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKeyCu);
         vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registered in HKCU.");
@@ -250,6 +303,42 @@ void SaveAndPropagate() {
     vrpacing::SaveConfig(g_cfg);
     UpdateSharedStateFlags();
     SyncUiWithConfig();
+    g_uiIdleRendered = false; // Force immediate label refresh on user toggle
+}
+
+void ResetSharedSessionToIdle() {
+    if (!g_shared) return;
+    const DWORD deadPid = g_shared->activePid;
+    g_shared->activePid = 0;
+    if (g_shared->openXrD3D11Pid == deadPid) {
+        g_shared->openXrD3D11Pid = 0;
+    }
+    wcscpy_s(g_shared->activeApi, L"Idle");
+    wcscpy_s(g_shared->hookedProcess, L"None");
+    g_shared->effectiveHz = 0.0;
+    g_shared->inputWidth = 0;
+    g_shared->inputHeight = 0;
+    g_shared->outputWidth = 0;
+    g_shared->outputHeight = 0;
+    g_shared->dxgiFormat = 0;
+    g_shared->upscaleStatus = 0;
+    g_shared->lastHResult = 0;
+    g_shared->appliedCap = 0.0;
+    g_shared->avgFps = 0.0;
+    g_shared->onePercentLowFps = 0.0;
+    g_shared->frameCounter = 0;
+    g_shared->rawPanelHz = 0.0;
+    g_shared->sswActive = 0;
+    g_shared->vrsStatus = 0;
+    g_shared->maskStatus = 0;
+    g_shared->smaaStatus = 0;
+    g_shared->frameTimeWriteIdx = 0;
+    g_shared->screenshotRequest = 0;
+    for (size_t i = 0; i < 256; ++i) {
+        g_shared->frameTimesMs[i] = 0.0f;
+    }
+    g_advisor.Reset();
+    g_uiIdleRendered = false;
 }
 
 void CheckActiveProcessLiveness() {
@@ -260,59 +349,11 @@ void CheckActiveProcessLiveness() {
         DWORD waitRes = WaitForSingleObject(hProc, 0);
         CloseHandle(hProc);
         if (waitRes == WAIT_OBJECT_0) {
-            const DWORD deadPid = g_shared->activePid;
-            g_shared->activePid = 0;
-            if (g_shared->openXrD3D11Pid == deadPid) {
-                g_shared->openXrD3D11Pid = 0;
-            }
-            wcscpy_s(g_shared->activeApi, L"Idle");
-            wcscpy_s(g_shared->hookedProcess, L"None");
-            g_shared->effectiveHz = 0.0;
-            g_shared->inputWidth = 0;
-            g_shared->inputHeight = 0;
-            g_shared->outputWidth = 0;
-            g_shared->outputHeight = 0;
-            g_shared->dxgiFormat = 0;
-            g_shared->upscaleStatus = 0;
-            g_shared->lastHResult = 0;
-            g_shared->appliedCap = 0.0;
-            g_shared->avgFps = 0.0;
-            g_shared->onePercentLowFps = 0.0;
-            g_shared->frameCounter = 0;
-            g_shared->rawPanelHz = 0.0;
-            g_shared->sswActive = 0;
-            g_shared->vrsStatus = 0;
-            g_shared->maskStatus = 0;
-            g_shared->smaaStatus = 0;
-            g_shared->frameTimeWriteIdx = 0;
-            g_shared->screenshotRequest = 0;
-            for (size_t i = 0; i < 256; ++i) {
-                g_shared->frameTimesMs[i] = 0.0f;
-            }
+            ResetSharedSessionToIdle();
             vrpacing::LogMessage(vrpacing::LogLevel::Info, "VR game closed. Telemetry and IPC state reset to Idle.");
-            g_advisor.Reset();
         }
     } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
-        const DWORD deadPid = g_shared->activePid;
-        g_shared->activePid = 0;
-        if (g_shared->openXrD3D11Pid == deadPid) {
-            g_shared->openXrD3D11Pid = 0;
-        }
-        wcscpy_s(g_shared->activeApi, L"Idle");
-        wcscpy_s(g_shared->hookedProcess, L"None");
-        g_shared->effectiveHz = 0.0;
-        g_shared->appliedCap = 0.0;
-        g_shared->avgFps = 0.0;
-        g_shared->onePercentLowFps = 0.0;
-        g_shared->frameCounter = 0;
-        g_shared->rawPanelHz = 0.0;
-        g_shared->sswActive = 0;
-        g_shared->vrsStatus = 0;
-        g_shared->maskStatus = 0;
-        g_shared->smaaStatus = 0;
-        g_shared->frameTimeWriteIdx = 0;
-        g_shared->screenshotRequest = 0;
-        g_advisor.Reset();
+        ResetSharedSessionToIdle();
     }
 }
 
@@ -326,12 +367,9 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     HGDIOBJ oldBmp = SelectObject(memDc, memBmp);
 
     RECT rcLocal{ 0, 0, w, h };
-    HBRUSH bgBrush = CreateSolidBrush(RGB(22, 26, 32));
-    FillRect(memDc, &rcLocal, bgBrush);
-    DeleteObject(bgBrush);
+    FillRect(memDc, &rcLocal, g_hBrushGraphBg);
 
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(65, 72, 84));
-    HGDIOBJ oldPen = SelectObject(memDc, borderPen);
+    HGDIOBJ oldPen = SelectObject(memDc, g_hPenGraphBorder);
     HGDIOBJ oldBrush = SelectObject(memDc, GetStockObject(NULL_BRUSH));
     Rectangle(memDc, 0, 0, w, h);
 
@@ -342,8 +380,7 @@ void DrawFrametimeGraph(HDC hdcWindow) {
         return (h - 2) - static_cast<int>( std::lround(norm * static_cast<float>(h - 4)) );
     };
 
-    HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(40, 46, 56));
-    SelectObject(memDc, gridPen);
+    SelectObject(memDc, g_hPenGraphGrid);
     const float kGuides[] = { 8.33f, 11.11f, 16.67f, 22.22f };
     for (float gMs : kGuides) {
         const int y = MsToY(gMs);
@@ -355,16 +392,13 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     if (hasActiveSession) {
         const float targetMs = static_cast<float>(1000.0 / g_shared->appliedCap);
         const int yTarget = MsToY(targetMs);
-        HPEN targetPen = CreatePen(PS_SOLID, 1, RGB(50, 185, 85));
-        SelectObject(memDc, targetPen);
+        SelectObject(memDc, g_hPenGraphTarget);
         MoveToEx(memDc, 1, yTarget, nullptr);
         LineTo(memDc, w - 1, yTarget);
-        DeleteObject(targetPen);
     }
 
     const auto& history = g_advisor.GetGraphHistory();
-    HPEN linePen = CreatePen(PS_SOLID, 1, RGB(80, 205, 255));
-    SelectObject(memDc, linePen);
+    SelectObject(memDc, g_hPenGraphLine);
 
     POINT pts[180]{};
     int validCount = 0;
@@ -398,17 +432,48 @@ void DrawFrametimeGraph(HDC hdcWindow) {
     SelectObject(memDc, oldFont);
     SelectObject(memDc, oldBrush);
     SelectObject(memDc, oldPen);
-    DeleteObject(linePen);
-    DeleteObject(gridPen);
-    DeleteObject(borderPen);
-
     SelectObject(memDc, oldBmp);
     DeleteObject(memBmp);
     DeleteDC(memDc);
 }
 
-void UpdateTelemetryDisplay() {
-    if (!IsWindowVisible(g_hMainWnd)) return;
+void UpdateTelemetryDisplay(bool forceUpdate = false) {
+    if (!g_shared) return;
+
+    const bool hasApi = (g_shared->activePid != 0 &&
+                         g_shared->activeApi[0] != L'\0' &&
+                         wcscmp(g_shared->activeApi, L"Idle") != 0 &&
+                         wcscmp(g_shared->activeApi, L"none") != 0);
+
+    // Zero-CPU Idle Gate: if no VR game is active and the Idle state is already rendered, do nothing
+    if (!hasApi && g_uiIdleRendered && !forceUpdate) {
+        return;
+    }
+
+    wchar_t tip[128]{};
+    if (hasApi && g_shared->appliedCap > 0.0) {
+        bool isSsw = false;
+        double targetHz = g_shared->effectiveHz;
+        double panelHz = g_shared->rawPanelHz;
+        vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
+        if (isSsw) {
+            swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f/%.0f Hz SSW)",
+                       vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, targetHz, panelHz);
+        } else {
+            swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f Hz Native)",
+                       vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, panelHz);
+        }
+    } else if (hasApi) {
+        swprintf_s(tip, L"VRPacing %s [%s] | Active", vrpacing::kAppVersionString, g_shared->activeApi);
+    } else {
+        swprintf_s(tip, L"VRPacing %s [Idle - Monitoring]", vrpacing::kAppVersionString);
+    }
+    UpdateTrayTooltipIfChanged(tip);
+
+    if (!IsWindowVisible(g_hMainWnd)) {
+        if (!hasApi) g_uiIdleRendered = true;
+        return;
+    }
 
     wchar_t txtApi[64]{};
     wchar_t txtHz[64]{};
@@ -419,135 +484,113 @@ void UpdateTelemetryDisplay() {
     wchar_t txtPipe[128]{};
     wchar_t txtShot[128]{};
 
-    if (g_shared) {
-        const bool hasApi = (g_shared->activePid != 0 &&
-                             g_shared->activeApi[0] != L'\0' &&
-                             wcscmp(g_shared->activeApi, L"Idle") != 0 &&
-                             wcscmp(g_shared->activeApi, L"none") != 0);
-
-        if (hasApi) {
-            swprintf_s(txtApi, L"Active API: %s", g_shared->activeApi);
-        } else {
-            wcscpy_s(txtApi, L"Active API: Idle (No VR Session)");
-        }
-
-        if (hasApi && g_shared->effectiveHz > 10.0) {
-            bool isSsw = false;
-            double targetHz = g_shared->effectiveHz;
-            double panelHz = g_shared->rawPanelHz;
-            vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
-            if (isSsw) {
-                swprintf_s(txtHz, L"HMD Refresh: %.0f / %.0f Hz (SSW)", targetHz, panelHz);
-            } else {
-                swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (Native)", panelHz);
-            }
-        } else {
-            wcscpy_s(txtHz, L"HMD Refresh: Waiting...");
-        }
-
-        if (hasApi && g_shared->appliedCap > 0.0) {
-            swprintf_s(txtCap, L"Active Cap: %.2f FPS", g_shared->appliedCap);
-        } else {
-            wcscpy_s(txtCap, L"Active Cap: Armed (-0.10 FPS)");
-        }
-
-        if (hasApi && g_shared->avgFps > 5.0) {
-            swprintf_s(txtFps, L"Avg FPS: %.1f  |  1%% Low: %.1f FPS", g_shared->avgFps, g_shared->onePercentLowFps);
-        } else if (hasApi) {
-            swprintf_s(txtFps, L"FPS: Measuring... (Frames: %llu)", g_shared->frameCounter);
-        } else {
-            wcscpy_s(txtFps, L"Avg FPS: --  |  1% Low: --");
-        }
-
-        if (hasApi && g_shared->hookedProcess[0] != L'\0' && wcscmp(g_shared->hookedProcess, L"None") != 0) {
-            swprintf_s(txtProc, L"Process: %s", g_shared->hookedProcess);
-        } else {
-            wcscpy_s(txtProc, L"Process: Monitoring for VR games...");
-        }
-
-        if (hasApi && g_shared->inputWidth > 0 && g_shared->outputWidth > 0) {
-            swprintf_s(txtRes, L"Resolution: %ux%u -> %ux%u | FMT: %u",
-                       g_shared->inputWidth, g_shared->inputHeight,
-                       g_shared->outputWidth, g_shared->outputHeight,
-                       g_shared->dxgiFormat);
-        } else {
-            wcscpy_s(txtRes, L"Resolution: Waiting for Swapchain...");
-        }
-
-        const wchar_t* nisStr = L"Off";
-        if (g_cfg.upscaling.enabled) {
-            if (!hasApi) {
-                nisStr = g_smaaEnabled ? L"Standby (+SMAA)" : L"Standby";
-            } else if (g_shared->upscaleStatus == 1) {
-                nisStr = (g_smaaEnabled && g_shared->smaaStatus == 1) ? L"Active (2.0x+SMAA)" : L"Active (2.0x)";
-            } else if (g_shared->upscaleStatus < 0) {
-                nisStr = L"Error";
-            } else {
-                nisStr = L"Standby";
-            }
-        }
-
-        const wchar_t* vrsStr = L"Off";
-        if (g_cfg.ffr.enabled) {
-            if (!hasApi) vrsStr = L"Standby";
-            else if (g_shared->vrsStatus == 1) vrsStr = L"D3D11 NVAPI";
-            else if (g_shared->vrsStatus == 2) vrsStr = L"D3D12 Tier-2";
-            else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded (OC)";
-            else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
-            else vrsStr = L"Standby";
-        }
-
-        const wchar_t* maskStr = L"Off";
-        if (g_cfg.mask.enabled) {
-            if (!hasApi) maskStr = L"Standby";
-            else if (g_shared->maskStatus == 1) maskStr = L"Active";
-            else if (g_shared->maskStatus == -1) maskStr = L"Excluded (OC)";
-            else maskStr = L"Standby";
-        }
-
-        swprintf_s(txtPipe, L"NIS: %s  |  VRS: %s  |  Mask: %s", nisStr, vrsStr, maskStr);
-
-        if (g_shared->screenshotSavedCount > 0) {
-            swprintf_s(txtShot, L"Screenshot Hotkey: Ctrl + F12 (Saved: %u set%s in Screenshots\\)",
-                       g_shared->screenshotSavedCount, (g_shared->screenshotSavedCount == 1) ? L"" : L"s");
-        } else {
-            wcscpy_s(txtShot, L"Comparison Screenshot: Press Ctrl + F12 in-game (saves .png set)");
-        }
-
-        wchar_t tip[128]{};
-        if (hasApi && g_shared->appliedCap > 0.0) {
-            bool isSsw = false;
-            double targetHz = g_shared->effectiveHz;
-            double panelHz = g_shared->rawPanelHz;
-            vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
-            if (isSsw) {
-                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f/%.0f Hz SSW)",
-                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, targetHz, panelHz);
-            } else {
-                swprintf_s(tip, L"VRPacing %s [%s] | %.2f FPS (%.0f Hz Native)",
-                           vrpacing::kAppVersionString, g_shared->activeApi, g_shared->appliedCap, panelHz);
-            }
-        } else if (hasApi) {
-            swprintf_s(tip, L"VRPacing %s [%s] | Active", vrpacing::kAppVersionString, g_shared->activeApi);
-        } else {
-            swprintf_s(tip, L"VRPacing %s [Idle - Monitoring]", vrpacing::kAppVersionString);
-        }
-        wcscpy_s(g_nid.szTip, tip);
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    if (hasApi) {
+        swprintf_s(txtApi, L"Active API: %s", g_shared->activeApi);
+    } else {
+        wcscpy_s(txtApi, L"Active API: Idle (No VR Session)");
     }
 
-    if (g_hLblApi) SetWindowTextW(g_hLblApi, txtApi);
-    if (g_hLblHz) SetWindowTextW(g_hLblHz, txtHz);
-    if (g_hLblCap) SetWindowTextW(g_hLblCap, txtCap);
-    if (g_hLblFps) SetWindowTextW(g_hLblFps, txtFps);
-    if (g_hLblProcess) SetWindowTextW(g_hLblProcess, txtProc);
-    if (g_hLblRes) SetWindowTextW(g_hLblRes, txtRes);
-    if (g_hLblPipeline) SetWindowTextW(g_hLblPipeline, txtPipe);
-    if (g_hLblShotInfo) SetWindowTextW(g_hLblShotInfo, txtShot);
+    if (hasApi && g_shared->effectiveHz > 10.0) {
+        bool isSsw = false;
+        double targetHz = g_shared->effectiveHz;
+        double panelHz = g_shared->rawPanelHz;
+        vrpacing::TelemetryAnalyzer::ResolveDisplayMode(*g_shared, isSsw, targetHz, panelHz);
+        if (isSsw) {
+            swprintf_s(txtHz, L"HMD Refresh: %.0f / %.0f Hz (SSW)", targetHz, panelHz);
+        } else {
+            swprintf_s(txtHz, L"HMD Refresh: %.0f Hz (Native)", panelHz);
+        }
+    } else {
+        wcscpy_s(txtHz, L"HMD Refresh: Waiting...");
+    }
+
+    if (hasApi && g_shared->appliedCap > 0.0) {
+        swprintf_s(txtCap, L"Active Cap: %.2f FPS", g_shared->appliedCap);
+    } else {
+        wcscpy_s(txtCap, L"Active Cap: Armed (-0.10 FPS)");
+    }
+
+    if (hasApi && g_shared->avgFps > 5.0) {
+        swprintf_s(txtFps, L"Avg FPS: %.1f  |  1%% Low: %.1f FPS", g_shared->avgFps, g_shared->onePercentLowFps);
+    } else if (hasApi) {
+        swprintf_s(txtFps, L"FPS: Measuring... (Frames: %llu)", g_shared->frameCounter);
+    } else {
+        wcscpy_s(txtFps, L"Avg FPS: --  |  1% Low: --");
+    }
+
+    if (hasApi && g_shared->hookedProcess[0] != L'\0' && wcscmp(g_shared->hookedProcess, L"None") != 0) {
+        swprintf_s(txtProc, L"Process: %s", g_shared->hookedProcess);
+    } else {
+        wcscpy_s(txtProc, L"Process: Monitoring for VR games...");
+    }
+
+    if (hasApi && g_shared->inputWidth > 0 && g_shared->outputWidth > 0) {
+        swprintf_s(txtRes, L"Resolution: %ux%u -> %ux%u | FMT: %u",
+                   g_shared->inputWidth, g_shared->inputHeight,
+                   g_shared->outputWidth, g_shared->outputHeight,
+                   g_shared->dxgiFormat);
+    } else {
+        wcscpy_s(txtRes, L"Resolution: Waiting for Swapchain...");
+    }
+
+    const wchar_t* nisStr = L"Off";
+    if (g_cfg.upscaling.enabled) {
+        if (!hasApi) {
+            nisStr = g_smaaEnabled ? L"Standby (+SMAA)" : L"Standby";
+        } else if (g_shared->upscaleStatus == 1) {
+            nisStr = (g_smaaEnabled && g_shared->smaaStatus == 1) ? L"Active (2.0x+SMAA)" : L"Active (2.0x)";
+        } else if (g_shared->upscaleStatus < 0) {
+            nisStr = L"Error";
+        } else {
+            nisStr = L"Standby";
+        }
+    }
+
+    const wchar_t* vrsStr = L"Off";
+    if (g_cfg.ffr.enabled) {
+        if (!hasApi) vrsStr = L"Standby";
+        else if (g_shared->vrsStatus == 1) vrsStr = L"D3D11 NVAPI";
+        else if (g_shared->vrsStatus == 2) vrsStr = L"D3D12 Tier-2";
+        else if (g_shared->vrsStatus == -1) vrsStr = L"Excluded (OC)";
+        else if (g_shared->vrsStatus == -2) vrsStr = L"Unsupported";
+        else vrsStr = L"Standby";
+    }
+
+    const wchar_t* maskStr = L"Off";
+    if (g_cfg.mask.enabled) {
+        if (!hasApi) maskStr = L"Standby";
+        else if (g_shared->maskStatus == 1) maskStr = L"Active";
+        else if (g_shared->maskStatus == -1) maskStr = L"Excluded (OC)";
+        else maskStr = L"Standby";
+    }
+
+    swprintf_s(txtPipe, L"NIS: %s  |  VRS: %s  |  Mask: %s", nisStr, vrsStr, maskStr);
+
+    if (g_shared->screenshotSavedCount > 0) {
+        swprintf_s(txtShot, L"Screenshot Hotkey: Ctrl + F12 (Saved: %u set%s in Screenshots\\)",
+                   g_shared->screenshotSavedCount, (g_shared->screenshotSavedCount == 1) ? L"" : L"s");
+    } else if (g_smaaEnabled) {
+        wcscpy_s(txtShot, L"Comparison Screenshot: Ctrl + F12 saves 4-image suite (1x/2x + SMAA)");
+    } else {
+        wcscpy_s(txtShot, L"Comparison Screenshot: Press Ctrl + F12 in-game (saves 1x/2x .png pair)");
+    }
+
+    SetWindowTextIfChanged(g_hLblApi, txtApi, g_cacheApi);
+    SetWindowTextIfChanged(g_hLblHz, txtHz, g_cacheHz);
+    SetWindowTextIfChanged(g_hLblCap, txtCap, g_cacheCap);
+    SetWindowTextIfChanged(g_hLblFps, txtFps, g_cacheFps);
+    SetWindowTextIfChanged(g_hLblProcess, txtProc, g_cacheProc);
+    SetWindowTextIfChanged(g_hLblRes, txtRes, g_cacheRes);
+    SetWindowTextIfChanged(g_hLblPipeline, txtPipe, g_cachePipe);
+    SetWindowTextIfChanged(g_hLblShotInfo, txtShot, g_cacheShot);
+
     if (g_hLblAdvisor) {
         const auto& rep = g_advisor.GetReport();
-        SetWindowTextW(g_hLblAdvisor, rep.summaryLine);
+        SetWindowTextIfChanged(g_hLblAdvisor, rep.summaryLine, g_cacheAdvisor);
     }
+
+    InvalidateRect(g_hMainWnd, &kGraphRect, FALSE);
+    g_uiIdleRendered = !hasApi;
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -557,7 +600,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     AppendMenuW(hMenu, MF_STRING | (g_cfg.upscaling.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_NIS, L"Enable NIS 2.0x Spatial Upscaling");
-    AppendMenuW(hMenu, MF_STRING | (g_smaaEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_SMAA, L"Enable Pre-Upscale SMAA 1x (Lab)");
+    AppendMenuW(hMenu, MF_STRING | (g_smaaEnabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_SMAA, L"Enable Pre-Upscale SMAA 1x (for MSAA / FXAA / No AA)");
     AppendMenuW(hMenu, MF_STRING | (g_cfg.ffr.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_FFR, L"Enable Fixed Foveated Rendering (VRS)");
     AppendMenuW(hMenu, MF_STRING | (g_cfg.mask.enabled ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_MASK, L"Enable Pre-Render Circular Mask");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -593,11 +636,17 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
+    g_hBrushGraphBg   = CreateSolidBrush(RGB(22, 26, 32));
+    g_hPenGraphBorder = CreatePen(PS_SOLID, 1, RGB(65, 72, 84));
+    g_hPenGraphGrid   = CreatePen(PS_SOLID, 1, RGB(40, 46, 56));
+    g_hPenGraphTarget = CreatePen(PS_SOLID, 1, RGB(50, 185, 85));
+    g_hPenGraphLine   = CreatePen(PS_SOLID, 1, RGB(80, 205, 255));
+
     auto SetFont = [](HWND hCtrl, HFONT hFont) {
         SendMessageW(hCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
     };
 
-    // 1. Seccion de Telemetria, Asesor y Grafica GDI
+    // 1. Telemetry & Real-Time Diagnostics Group
     HWND hGrpStatus = CreateWindowExW(0, L"BUTTON", L" Telemetry && Real-Time Diagnostics ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       15, 8, 434, 248, hwnd, nullptr, hInst, nullptr);
@@ -648,7 +697,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     30, 142, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblAdvisor, g_hFontBold);
 
-    // 2. Seccion de Optimizaciones de Renderizado (incluye SMAA 1x Lab desactivado por defecto)
+    // 2. Render Pipeline Optimizations Group
     HWND hGrpOpt = CreateWindowExW(0, L"BUTTON", L" Render Pipeline Optimizations ",
                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                    15, 264, 434, 152, hwnd, nullptr, hInst, nullptr);
@@ -659,7 +708,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                 30, 286, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_NIS)), hInst, nullptr);
     SetFont(g_hChkNis, g_hFontNormal);
 
-    g_hChkSmaa = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Upscale SMAA 1x (Lab - Anti-Aliasing before NIS 2.0x)",
+    g_hChkSmaa = CreateWindowExW(0, L"BUTTON", L"Enable Pre-Upscale SMAA 1x (Anti-Aliasing before NIS 2.0x)",
                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                                  30, 311, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_SMAA)), hInst, nullptr);
     SetFont(g_hChkSmaa, g_hFontNormal);
@@ -674,12 +723,12 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                  30, 361, 404, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_CHECK_MASK)), hInst, nullptr);
     SetFont(g_hChkMask, g_hFontNormal);
 
-    g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (saves .png set)",
+    g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (saves 1x/2x .png pair)",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      30, 388, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblShotInfo, g_hFontSmall);
 
-    // 3. Seccion Simplificada de Frame Pacing
+    // 3. Frame Pacing & Target Rate Mode Group
     HWND hGrpPacing = CreateWindowExW(0, L"BUTTON", L" Frame Pacing && Target Rate Mode ",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       15, 424, 434, 114, hwnd, nullptr, hInst, nullptr);
@@ -700,7 +749,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                    36, 496, 400, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_RADIO_HALF)), hInst, nullptr);
     SetFont(g_hRadioHalf, g_hFontNormal);
 
-    // 4. Botones de accion inferiores (4 botones alineados)
+    // 4. Bottom Action Buttons
     HWND hBtnMinimize = CreateWindowExW(0, L"BUTTON", L"Minimize",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                         15, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_MINIMIZE)), hInst, nullptr);
@@ -720,6 +769,26 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                     348, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
+
+    // 5. Native Win32 Floating Tooltips
+    g_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                 WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                 hwnd, nullptr, hInst, nullptr);
+    if (g_hTooltip) {
+        SetWindowPos(g_hTooltip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SendMessageW(g_hTooltip, TTM_SETMAXTIPWIDTH, 0, 390);
+        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 200);
+        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 18000);
+
+        AttachControlTooltip(hwnd, g_hChkSmaa,
+            L"Pre-Upscale SMAA 1x (Subpixel Morphological Anti-Aliasing):\r\n"
+            L"• Recommended when the game uses MSAA, FXAA, or No Anti-Aliasing. Smooths high-contrast edges, foliage, and specular aliasing at 1.0x before NIS 2.0x reconstruction.\r\n"
+            L"• Not recommended in combination with TAA, DLSS, FSR 2+, TSR, or temporal upscalers in general.");
+
+        AttachControlTooltip(hwnd, g_hChkNis,
+            L"Reconstructs the central 60% foveal cone at an exact 2.0x integer ratio with 0% artificial sharpening prior to VR compositor barrel distortion.");
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -743,19 +812,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_TIMER:
             if (wParam == IDT_TELEMETRY_TIMER) {
-                if (g_shared) {
+                if (g_shared && g_shared->activePid != 0) {
+                    const uint32_t prevShots = g_shared->screenshotSavedCount;
                     g_advisor.Ingest(*g_shared);
                     g_shared->avgFps = g_advisor.GetAvgFps();
                     g_shared->onePercentLowFps = g_advisor.GetOnePercentLowFps();
-                }
-                UpdateTelemetryDisplay();
-                if (IsWindowVisible(hwnd)) {
-                    InvalidateRect(hwnd, &kGraphRect, FALSE);
+                    (void)prevShots;
+                    UpdateTelemetryDisplay(true);
+                } else {
+                    UpdateTelemetryDisplay(false);
                 }
             } else if (wParam == IDT_SCANNER_TIMER) {
                 CheckActiveProcessLiveness();
-                g_scanner.PollAndInject(g_hookPath);
-                UpdateTelemetryDisplay();
+                if (!g_shared || g_shared->activePid == 0) {
+                    g_scanner.PollAndInject(g_hookPath);
+                }
+                UpdateTelemetryDisplay(false);
             }
             return 0;
 
@@ -779,13 +851,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_CHECK_NIS:
                     g_cfg.upscaling.enabled = (SendMessageW(g_hChkNis, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_CHECK_SMAA:
                     g_smaaEnabled = (SendMessageW(g_hChkSmaa, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_CHECK_FFR: {
@@ -793,14 +865,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_cfg.ffr.enabled = checked;
                     g_cfg.ffr.openxrEnabled = checked;
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
                 }
 
                 case ID_CHECK_MASK:
                     g_cfg.mask.enabled = (SendMessageW(g_hChkMask, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_RADIO_1X:
@@ -821,8 +893,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g_shared->avgFps = 0.0;
                         g_shared->onePercentLowFps = 0.0;
                     }
-                    UpdateTelemetryDisplay();
-                    InvalidateRect(hwnd, &kGraphRect, FALSE);
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_BTN_MINIMIZE:
@@ -855,33 +926,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
                     UpdateSharedStateFlags();
-                    UpdateTelemetryDisplay();
-                    InvalidateRect(hwnd, &kGraphRect, FALSE);
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_TRAY_NIS:
                     g_cfg.upscaling.enabled = !g_cfg.upscaling.enabled;
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_TRAY_SMAA:
                     g_smaaEnabled = !g_smaaEnabled;
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_TRAY_FFR:
                     g_cfg.ffr.enabled = !g_cfg.ffr.enabled;
                     g_cfg.ffr.openxrEnabled = g_cfg.ffr.enabled;
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
 
                 case ID_TRAY_MASK:
                     g_cfg.mask.enabled = !g_cfg.mask.enabled;
                     SaveAndPropagate();
-                    UpdateTelemetryDisplay();
+                    UpdateTelemetryDisplay(true);
                     break;
             }
             return 0;
@@ -892,8 +962,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
                 UpdateSharedStateFlags();
-                UpdateTelemetryDisplay();
-                InvalidateRect(hwnd, &kGraphRect, FALSE);
+                UpdateTelemetryDisplay(true);
             } else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
                 ShowTrayMenu(hwnd);
             }
@@ -913,6 +982,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_hFontNormal) DeleteObject(g_hFontNormal);
             if (g_hFontBold) DeleteObject(g_hFontBold);
             if (g_hFontSmall) DeleteObject(g_hFontSmall);
+            if (g_hBrushGraphBg) DeleteObject(g_hBrushGraphBg);
+            if (g_hPenGraphBorder) DeleteObject(g_hPenGraphBorder);
+            if (g_hPenGraphGrid) DeleteObject(g_hPenGraphGrid);
+            if (g_hPenGraphTarget) DeleteObject(g_hPenGraphTarget);
+            if (g_hPenGraphLine) DeleteObject(g_hPenGraphLine);
             PostQuitMessage(0);
             return 0;
     }
@@ -941,10 +1015,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
+    INITCOMMONCONTROLSEX icex{};
+    icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
+    icex.dwICC = ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icex);
+
     vrpacing::InitLogging();
     vrpacing::LogMessage(vrpacing::LogLevel::Info, "VRPacingTray starting...");
 
     g_cfg = vrpacing::LoadConfig();
+    g_smaaEnabled = false; // Always unchecked on startup
     g_cfg.upscaling.scale = 2.0f;
     g_cfg.upscaling.radius = 0.60f;
     g_cfg.upscaling.sharpness = 0.0f;
@@ -1000,7 +1080,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    swprintf_s(g_nid.szTip, L"VRPacing %s [Starting...]", vrpacing::kAppVersionString);
+    swprintf_s(g_nid.szTip, L"VRPacing %s [Idle - Monitoring]", vrpacing::kAppVersionString);
+    wcscpy_s(g_lastTrayTip, g_nid.szTip);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     g_mapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(vrpacing::SharedState), vrpacing::kSharedStateName);
@@ -1018,7 +1099,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ShowWindow(g_hMainWnd, SW_SHOW);
     UpdateWindow(g_hMainWnd);
     UpdateSharedStateFlags();
-    UpdateTelemetryDisplay();
+    UpdateTelemetryDisplay(true);
+
+    // Run one initial scan on startup so pre-existing processes are classified immediately
+    g_scanner.PollAndInject(g_hookPath);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {

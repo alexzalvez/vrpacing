@@ -1,4 +1,4 @@
-﻿# VRPacing (`v0.8.1-beta`)
+# VRPacing (`v0.8.2-beta`)
 
 **System-wide PCVR utility for tight Frame Pacing (`-0.10 FPS` cap), 2.0x Integer Spatial Reconstruction (NVIDIA Image Scaling, NIS), and Fixed Foveated Rendering (D3D11 / D3D12).**
 
