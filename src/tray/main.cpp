@@ -211,7 +211,7 @@ void RegisterOpenXrImplicitLayer() {
     }
 
     HKEY hKeyCu = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, &hKeyCu) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyCu, nullptr) == ERROR_SUCCESS) {
         RegSetValueExW(hKeyCu, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKeyCu);
         vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registered in HKCU.");
