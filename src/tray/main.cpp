@@ -303,7 +303,7 @@ void SaveAndPropagate() {
     vrpacing::SaveConfig(g_cfg);
     UpdateSharedStateFlags();
     SyncUiWithConfig();
-    g_uiIdleRendered = false; // Force immediate label refresh on user toggle
+    g_uiIdleRendered = false;
 }
 
 void ResetSharedSessionToIdle() {
@@ -724,7 +724,7 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
     SetFont(g_hChkMask, g_hFontNormal);
 
     g_hLblShotInfo = CreateWindowExW(0, L"STATIC", L"Comparison Screenshot: Press Ctrl + F12 in-game (saves 1x/2x .png pair)",
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
                                      30, 388, 404, 18, hwnd, nullptr, hInst, nullptr);
     SetFont(g_hLblShotInfo, g_hFontSmall);
 
@@ -770,24 +770,72 @@ void CreateUiElements(HWND hwnd, HINSTANCE hInst) {
                                     348, 550, 101, 32, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ID_BTN_EXIT)), hInst, nullptr);
     SetFont(hBtnExit, g_hFontBold);
 
-    // 5. Native Win32 Floating Tooltips
+    // 5. Native Win32 Floating Tooltips across all interactive options and buttons
     g_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                  WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                                  hwnd, nullptr, hInst, nullptr);
     if (g_hTooltip) {
         SetWindowPos(g_hTooltip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        SendMessageW(g_hTooltip, TTM_SETMAXTIPWIDTH, 0, 390);
-        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 200);
-        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 18000);
+        SendMessageW(g_hTooltip, TTM_SETMAXTIPWIDTH, 0, 410);
+        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 180);
+        SendMessageW(g_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+
+        AttachControlTooltip(hwnd, g_hChkNis,
+            L"NIS 2.0x Spatial Reconstruction (NVIDIA Image Scaling):\r\n"
+            L"\x2022 Reconstructs the central 60% foveal region at an exact 2.0x integer scale factor prior to VR compositor lens distortion.\r\n"
+            L"\x2022 Operates at 0% artificial sharpening to preserve natural gradients and prevent edge ringing or shimmering artifacts.");
 
         AttachControlTooltip(hwnd, g_hChkSmaa,
             L"Pre-Upscale SMAA 1x (Subpixel Morphological Anti-Aliasing):\r\n"
-            L"• Recommended when the game uses MSAA, FXAA, or No Anti-Aliasing. Smooths high-contrast edges, foliage, and specular aliasing at 1.0x before NIS 2.0x reconstruction.\r\n"
-            L"• Not recommended in combination with TAA, DLSS, FSR 2+, TSR, or temporal upscalers in general.");
+            L"\x2022 Executes a 3-pass morphological filter (64px orthogonal & 45\x00B0 diagonal pattern search) at 1.0x native resolution right before NIS 2.0x upscaling.\r\n"
+            L"\x2022 Recommended for: Games using MSAA, FXAA, or No Anti-Aliasing. Smooths high-contrast geometry edges, alpha-test foliage, and specular aliasing while preserving 1px UI text.\r\n"
+            L"\x2022 Not recommended for: Games already using TAA, DLSS, FSR 2+, TSR, or temporal upscalers.");
 
-        AttachControlTooltip(hwnd, g_hChkNis,
-            L"Reconstructs the central 60% foveal cone at an exact 2.0x integer ratio with 0% artificial sharpening prior to VR compositor barrel distortion.");
+        AttachControlTooltip(hwnd, g_hChkFfr,
+            L"Fixed Foveated Rendering (Variable Rate Shading):\r\n"
+            L"\x2022 Reduces peripheral pixel shading rates (2x2 / 4x4) outside the central 60% foveal zone while maintaining 100% native shading quality in the center.\r\n"
+            L"\x2022 Uses hardware-accelerated NVIDIA NVAPI on Direct3D 11 and native Tier-2 VRS on Direct3D 12 to lower GPU frame times.");
+
+        AttachControlTooltip(hwnd, g_hChkMask,
+            L"Pre-Render Circular Visibility Mask:\r\n"
+            L"\x2022 Writes an early depth/stencil rejection mask over the outer corners of the eye buffer that fall outside the visible optical aperture.\r\n"
+            L"\x2022 Saves GPU rasterization and pixel shader bandwidth without affecting the visible field of view.");
+
+        AttachControlTooltip(hwnd, g_hRadio1x,
+            L"Automatic Refresh Rate Tracking:\r\n"
+            L"\x2022 Locks frame delivery to -0.10 FPS below the active HMD refresh rate (e.g., 89.90 FPS at 90 Hz, 119.90 FPS at 120 Hz) for flat frame times.\r\n"
+            L"\x2022 Automatically detects active motion reprojection / half-rate synthesis and adjusts the target cap dynamically (e.g., 44.90 FPS at 90 Hz).");
+
+        AttachControlTooltip(hwnd, g_hRadioHalf,
+            L"Manual Half Refresh Rate Lock (Hz / 2):\r\n"
+            L"\x2022 Forces the frame rate limiter to half of the HMD refresh rate minus 0.10 FPS (e.g., 44.90 FPS at 90 Hz, 59.90 FPS at 120 Hz).\r\n"
+            L"\x2022 Useful for demanding titles where maintaining a locked half-rate cadence prevents transitions between full and half refresh rates.");
+
+        const wchar_t* kScreenshotTip =
+            L"Synchronous Comparison Screenshots (Ctrl + F12):\r\n"
+            L"\x2022 Press Ctrl + F12 in-game to capture lossless .png images from the exact same rendered frame.\r\n"
+            L"\x2022 Saves a 2-image pair (1x Native, 2x NIS) when SMAA is off, or a 4-image suite (1x Native, 1x SMAA, 2x NIS, 2x SMAA+NIS) when SMAA is enabled.\r\n"
+            L"\x2022 Click 'Screenshots' to open the output folder in Windows Explorer.";
+
+        AttachControlTooltip(hwnd, g_hLblShotInfo, kScreenshotTip);
+        AttachControlTooltip(hwnd, hBtnShots, kScreenshotTip);
+
+        AttachControlTooltip(hwnd, hBtnReset,
+            L"Reset Telemetry & Advisor Statistics:\r\n"
+            L"\x2022 Clears accumulated FPS averages, 1% Low percentiles, frametime graph history, and advisor diagnostics to start a fresh measurement.");
+
+        AttachControlTooltip(hwnd, hBtnMinimize,
+            L"Minimize to System Tray:\r\n"
+            L"\x2022 Hides the diagnostic window to the Windows notification area while keeping all VR hooks and optimizations active in the background.");
+
+        AttachControlTooltip(hwnd, hBtnLog,
+            L"Open Diagnostic Log:\r\n"
+            L"\x2022 Opens VRPacing.log in your default text editor to inspect API hook events, swapchain formats, and runtime status messages.");
+
+        AttachControlTooltip(hwnd, hBtnExit,
+            L"Exit VRPacing:\r\n"
+            L"\x2022 Unregisters the OpenXR implicit layer and closes VRPacingTray.");
     }
 }
 
@@ -813,11 +861,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == IDT_TELEMETRY_TIMER) {
                 if (g_shared && g_shared->activePid != 0) {
-                    const uint32_t prevShots = g_shared->screenshotSavedCount;
                     g_advisor.Ingest(*g_shared);
                     g_shared->avgFps = g_advisor.GetAvgFps();
                     g_shared->onePercentLowFps = g_advisor.GetOnePercentLowFps();
-                    (void)prevShots;
                     UpdateTelemetryDisplay(true);
                 } else {
                     UpdateTelemetryDisplay(false);

@@ -10,7 +10,7 @@ option(VRPACING_BUILD_TESTS "Build portable core tests" ON)
 option(VRPACING_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 
 if(MSVC)
-  add_compile_options(/W4 /permissive- /Zc:__cplusplus)
+  add_compile_options(/W4 /permissive- /Zc:__cplusplus /utf-8)
   if(VRPACING_WARNINGS_AS_ERRORS)
     add_compile_options(/WX)
   endif()
