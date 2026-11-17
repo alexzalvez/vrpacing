@@ -4,6 +4,7 @@
 #include <dxgiformat.h>
 #include <cmath>
 #include <cstdint>
+#include <string_view>
 
 namespace vrpacing {
 
@@ -135,6 +136,13 @@ inline VrsFilterOutput EvaluateVrsCandidate(const VrsFilterInput& in) {
     out.isArray = isArrayTarget;
     out.label = doubleWide ? "DOUBLEWIDE" : (isArrayTarget ? "ARRAY" : "SINGLE");
     return out;
+}
+
+inline bool IsVrsAutoExcludedExeName(std::wstring_view exeLower) {
+    return exeLower == L"hlvr.exe" ||
+           exeLower == L"thelab.exe" ||
+           exeLower == L"stormland.exe" ||
+           exeLower == L"bettervr_launcher.exe";
 }
 
 } // namespace vrpacing

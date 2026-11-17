@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cwchar>
 #include <filesystem>
 #include <string>
@@ -306,6 +307,15 @@ void SaveAndPropagate() {
     g_uiIdleRendered = false;
 }
 
+std::string WideToUtf8String(const wchar_t* wstr) {
+    if (!wstr || wstr[0] == L'\0') return {};
+    const int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return {};
+    std::string out(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
 void ResetSharedSessionToIdle() {
     if (!g_shared) return;
     const DWORD deadPid = g_shared->activePid;
@@ -341,6 +351,38 @@ void ResetSharedSessionToIdle() {
     g_uiIdleRendered = false;
 }
 
+void LogSessionSummaryAndReset() {
+    if (!g_shared) return;
+    std::string procUtf8 = WideToUtf8String(g_shared->hookedProcess);
+    if (procUtf8.empty() || procUtf8 == "None") {
+        procUtf8 = "PID " + std::to_string(g_shared->activePid);
+    }
+
+    const double avgFps = g_advisor.GetAvgFps();
+    const double onePctLow = g_advisor.GetOnePercentLowFps();
+    const auto rep = g_advisor.GetReport();
+    std::string advisorUtf8 = WideToUtf8String(rep.summaryLine);
+    if (advisorUtf8.empty()) {
+        advisorUtf8 = "Advisor: No verdict recorded";
+    }
+
+    char summaryBuf[512]{};
+    if (avgFps > 1.0) {
+        const double avgMs = 1000.0 / avgFps;
+        std::snprintf(summaryBuf, sizeof(summaryBuf),
+                      "Session Summary [%s]: Avg=%.1f FPS (%.1f ms) | 1%% Low=%.1f FPS | %s",
+                      procUtf8.c_str(), avgFps, avgMs, onePctLow, advisorUtf8.c_str());
+    } else {
+        std::snprintf(summaryBuf, sizeof(summaryBuf),
+                      "Session Summary [%s]: %s",
+                      procUtf8.c_str(), advisorUtf8.c_str());
+    }
+
+    vrpacing::LogMessage(vrpacing::LogLevel::Info, summaryBuf);
+    ResetSharedSessionToIdle();
+    vrpacing::LogMessage(vrpacing::LogLevel::Info, "VR game closed. Telemetry and IPC state reset to Idle.");
+}
+
 void CheckActiveProcessLiveness() {
     if (!g_shared || g_shared->activePid == 0) return;
 
@@ -349,11 +391,10 @@ void CheckActiveProcessLiveness() {
         DWORD waitRes = WaitForSingleObject(hProc, 0);
         CloseHandle(hProc);
         if (waitRes == WAIT_OBJECT_0) {
-            ResetSharedSessionToIdle();
-            vrpacing::LogMessage(vrpacing::LogLevel::Info, "VR game closed. Telemetry and IPC state reset to Idle.");
+            LogSessionSummaryAndReset();
         }
     } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
-        ResetSharedSessionToIdle();
+        LogSessionSummaryAndReset();
     }
 }
 

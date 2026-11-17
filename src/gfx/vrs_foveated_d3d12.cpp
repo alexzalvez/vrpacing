@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "minhook/include/MinHook.h"
@@ -31,8 +33,37 @@ namespace {
 
 constexpr uint32_t kSlot_Device_CreateRenderTargetView = 20;
 constexpr uint32_t kSlot_Device_CreateDepthStencilView = 21;
+constexpr uint32_t kSlot_Device_CopyDescriptors        = 23;
+constexpr uint32_t kSlot_Device_CopyDescriptorsSimple  = 24;
+constexpr uint32_t kSlot_CmdList_Reset                 = 10;
 constexpr uint32_t kSlot_CmdList_OMSetRenderTargets    = 46;
 constexpr uint32_t kSlot_CmdList4_BeginRenderPass      = 68;
+
+bool IsCurrentProcessVrsAutoExcludedD3D12() {
+    static int s_cached = -1;
+    if (s_cached != -1) return (s_cached == 1);
+
+    wchar_t modPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    std::wstring p(modPath);
+    const auto pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p = p.substr(pos + 1);
+    std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+
+    if (IsVrsAutoExcludedExeName(p)) {
+        s_cached = 1;
+        std::string utf8Name;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            utf8Name.resize(static_cast<size_t>(n - 1));
+            WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, utf8Name.data(), n, nullptr, nullptr);
+        }
+        LogMessage(LogLevel::Info, "VRS12: Auto-excluded for " + utf8Name + " (preserving NIS, SMAA and Pacing).");
+        return true;
+    }
+    s_cached = 0;
+    return false;
+}
 
 struct __declspec(uuid("ADEC44E2-61F0-45C3-AD9F-1B37379284FF")) StreamlineRetrieveBaseInterface : IUnknown {};
 
@@ -62,6 +93,28 @@ using CreateDepthStencilViewFn = void(STDMETHODCALLTYPE*)(
     const D3D12_DEPTH_STENCIL_VIEW_DESC*,
     D3D12_CPU_DESCRIPTOR_HANDLE);
 
+using CopyDescriptorsFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*,
+    const UINT*,
+    UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*,
+    const UINT*,
+    D3D12_DESCRIPTOR_HEAP_TYPE);
+
+using CopyDescriptorsSimpleFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    UINT,
+    D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE);
+
+using CmdListResetFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    ID3D12CommandAllocator*,
+    ID3D12PipelineState*);
+
 using OMSetRenderTargets12Fn = void(STDMETHODCALLTYPE*)(
     ID3D12GraphicsCommandList*,
     UINT,
@@ -78,6 +131,9 @@ using BeginRenderPassFn = void(STDMETHODCALLTYPE*)(
 
 CreateRenderTargetViewFn g_origCreateRTV = nullptr;
 CreateDepthStencilViewFn g_origCreateDSV = nullptr;
+CopyDescriptorsFn g_origCopyDescriptors = nullptr;
+CopyDescriptorsSimpleFn g_origCopyDescriptorsSimple = nullptr;
+CmdListResetFn g_origCmdListReset = nullptr;
 OMSetRenderTargets12Fn g_origOMSetRT12 = nullptr;
 BeginRenderPassFn g_origBeginRP = nullptr;
 
@@ -105,6 +161,50 @@ void STDMETHODCALLTYPE Hooked_CreateDepthStencilView(
     }
     if (g_vrsDetaching.load(std::memory_order_relaxed)) return;
     VrsFoveatedD3D12::Instance().OnCreateDepthStencilView(self, pResource, pDesc, destDescriptor);
+}
+
+void STDMETHODCALLTYPE Hooked_CopyDescriptors(
+    ID3D12Device* self,
+    UINT numDestDescriptorRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts,
+    const UINT* pDestDescriptorRangeSizes,
+    UINT numSrcDescriptorRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts,
+    const UINT* pSrcDescriptorRangeSizes,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptorHeapsType) {
+    if (g_origCopyDescriptors) {
+        g_origCopyDescriptors(self, numDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
+                              numSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes, descriptorHeapsType);
+    }
+    if (g_vrsDetaching.load(std::memory_order_relaxed)) return;
+    VrsFoveatedD3D12::Instance().OnCopyDescriptors(
+        self, numDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
+        numSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes, descriptorHeapsType);
+}
+
+void STDMETHODCALLTYPE Hooked_CopyDescriptorsSimple(
+    ID3D12Device* self,
+    UINT numDescriptors,
+    D3D12_CPU_DESCRIPTOR_HANDLE destDescriptorRangeStart,
+    D3D12_CPU_DESCRIPTOR_HANDLE srcDescriptorRangeStart,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptorHeapsType) {
+    if (g_origCopyDescriptorsSimple) {
+        g_origCopyDescriptorsSimple(self, numDescriptors, destDescriptorRangeStart, srcDescriptorRangeStart, descriptorHeapsType);
+    }
+    if (g_vrsDetaching.load(std::memory_order_relaxed)) return;
+    VrsFoveatedD3D12::Instance().OnCopyDescriptorsSimple(
+        self, numDescriptors, destDescriptorRangeStart, srcDescriptorRangeStart, descriptorHeapsType);
+}
+
+HRESULT STDMETHODCALLTYPE Hooked_CmdListReset(
+    ID3D12GraphicsCommandList* self,
+    ID3D12CommandAllocator* pAllocator,
+    ID3D12PipelineState* pInitialState) {
+    const HRESULT hr = g_origCmdListReset ? g_origCmdListReset(self, pAllocator, pInitialState) : S_OK;
+    if (SUCCEEDED(hr) && !g_vrsDetaching.load(std::memory_order_relaxed)) {
+        VrsFoveatedD3D12::Instance().OnCommandListReset(self);
+    }
+    return hr;
 }
 
 void STDMETHODCALLTYPE Hooked_OMSetRenderTargets12(
@@ -211,6 +311,7 @@ void VrsFoveatedD3D12::OnSessionCreated(ID3D12Device* dev, const std::string& ex
     ID3D12Device* realDev = UnwrapStreamlineObject(dev, "ID3D12Device");
     device_ = realDev;
     rtvDescriptorSize_ = realDev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    dsvDescriptorSize_ = realDev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     ParseExtraFormatsLocked(extraFormatsCsv);
 
@@ -293,7 +394,7 @@ void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
 
     (void)dummyList->Close();
 
-    bool okRtv = false, okDsv = false, okOmsrt = false, okBrp = false;
+    bool okRtv = false, okDsv = false, okCopyDesc = false, okCopySimple = false, okClReset = false, okOmsrt = false, okBrp = false;
 
     if (devVtbl[kSlot_Device_CreateRenderTargetView]) {
         if (MH_CreateHook(devVtbl[kSlot_Device_CreateRenderTargetView],
@@ -308,6 +409,30 @@ void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
                           reinterpret_cast<void*>(&Hooked_CreateDepthStencilView),
                           reinterpret_cast<void**>(&g_origCreateDSV)) == MH_OK) {
             okDsv = (MH_EnableHook(devVtbl[kSlot_Device_CreateDepthStencilView]) == MH_OK);
+        }
+    }
+
+    if (devVtbl[kSlot_Device_CopyDescriptors]) {
+        if (MH_CreateHook(devVtbl[kSlot_Device_CopyDescriptors],
+                          reinterpret_cast<void*>(&Hooked_CopyDescriptors),
+                          reinterpret_cast<void**>(&g_origCopyDescriptors)) == MH_OK) {
+            okCopyDesc = (MH_EnableHook(devVtbl[kSlot_Device_CopyDescriptors]) == MH_OK);
+        }
+    }
+
+    if (devVtbl[kSlot_Device_CopyDescriptorsSimple]) {
+        if (MH_CreateHook(devVtbl[kSlot_Device_CopyDescriptorsSimple],
+                          reinterpret_cast<void*>(&Hooked_CopyDescriptorsSimple),
+                          reinterpret_cast<void**>(&g_origCopyDescriptorsSimple)) == MH_OK) {
+            okCopySimple = (MH_EnableHook(devVtbl[kSlot_Device_CopyDescriptorsSimple]) == MH_OK);
+        }
+    }
+
+    if (listVtbl && listVtbl[kSlot_CmdList_Reset]) {
+        if (MH_CreateHook(listVtbl[kSlot_CmdList_Reset],
+                          reinterpret_cast<void*>(&Hooked_CmdListReset),
+                          reinterpret_cast<void**>(&g_origCmdListReset)) == MH_OK) {
+            okClReset = (MH_EnableHook(listVtbl[kSlot_CmdList_Reset]) == MH_OK);
         }
     }
 
@@ -330,6 +455,9 @@ void VrsFoveatedD3D12::InstallHooksLocked(ID3D12Device* rawDevice) {
     hooksInstalled_ = okRtv && okDsv && okOmsrt;
     LogMessage(LogLevel::Info, std::string("VRS12: hooks CreateRTV=") + (okRtv ? "OK" : "FAIL") +
                " CreateDSV=" + (okDsv ? "OK" : "FAIL") +
+               " CopyDesc=" + (okCopyDesc ? "OK" : "FAIL") +
+               " CopySimple=" + (okCopySimple ? "OK" : "FAIL") +
+               " CmdReset=" + (okClReset ? "OK" : "FAIL") +
                " OMSetRT=" + (okOmsrt ? "OK" : "FAIL") +
                " BeginRP=" + (okBrp ? "OK" : "FAIL"));
 }
@@ -658,6 +786,10 @@ void VrsFoveatedD3D12::UpdateTarget(ID3D12Device* dev,
                                     uint32_t eyeWidth,
                                     uint32_t eyeHeight,
                                     int debugMode) {
+    if (IsCurrentProcessVrsAutoExcludedD3D12()) {
+        enabled = false;
+    }
+
     if (deviceRemovedLogged_.load(std::memory_order_relaxed)) {
         enabled_.store(false, std::memory_order_relaxed);
         return;
@@ -760,6 +892,123 @@ void VrsFoveatedD3D12::OnCreateDepthStencilView(
     dsvMap_[destDescriptor.ptr] = pod;
 }
 
+bool VrsFoveatedD3D12::IsListVrsBound(ID3D12GraphicsCommandList* cmdList) noexcept {
+    const size_t shardIdx = (reinterpret_cast<uintptr_t>(cmdList) >> 4) & (kBoundListShardCount - 1);
+    auto& shard = boundListShards_[shardIdx];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    return shard.lists.find(cmdList) != shard.lists.end();
+}
+
+void VrsFoveatedD3D12::SetListVrsBound(ID3D12GraphicsCommandList* cmdList, bool bound) noexcept {
+    const size_t shardIdx = (reinterpret_cast<uintptr_t>(cmdList) >> 4) & (kBoundListShardCount - 1);
+    auto& shard = boundListShards_[shardIdx];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (bound) {
+        shard.lists.insert(cmdList);
+    } else {
+        shard.lists.erase(cmdList);
+    }
+}
+
+void VrsFoveatedD3D12::ClearAllBoundLists() noexcept {
+    for (auto& shard : boundListShards_) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.lists.clear();
+    }
+}
+
+void VrsFoveatedD3D12::OnCommandListReset(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList || !tier2Supported_) return;
+    SetListVrsBound(cmdList, false);
+}
+
+void VrsFoveatedD3D12::OnCopyDescriptors(
+    ID3D12Device* /*dev*/,
+    UINT numDestRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pDestStarts,
+    const UINT* pDestSizes,
+    UINT numSrcRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcStarts,
+    const UINT* pSrcSizes,
+    D3D12_DESCRIPTOR_HEAP_TYPE heapType) {
+    if (heapType != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && heapType != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return;
+    if (!pDestStarts || !pSrcStarts || numDestRanges == 0 || numSrcRanges == 0) return;
+
+    const bool isRtv = (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const uint32_t stride = isRtv ? rtvDescriptorSize_ : dsvDescriptorSize_;
+    if (stride == 0) return;
+
+    std::shared_mutex& mapMutex = isRtv ? rtvMapMutex_ : dsvMapMutex_;
+    std::unordered_map<size_t, DescriptorPod>& map = isRtv ? rtvMap_ : dsvMap_;
+
+    std::unique_lock<std::shared_mutex> lock(mapMutex);
+    std::vector<std::pair<bool, DescriptorPod>> copied;
+    for (UINT r = 0; r < numSrcRanges; ++r) {
+        const UINT count = pSrcSizes ? pSrcSizes[r] : 1u;
+        const size_t basePtr = pSrcStarts[r].ptr;
+        for (UINT n = 0; n < count; ++n) {
+            if (copied.size() >= 65536) return;
+            const auto it = map.find(basePtr + static_cast<SIZE_T>(n) * stride);
+            if (it != map.end()) {
+                copied.emplace_back(true, it->second);
+            } else {
+                copied.emplace_back(false, DescriptorPod{});
+            }
+        }
+    }
+
+    size_t idx = 0;
+    for (UINT r = 0; r < numDestRanges && idx < copied.size(); ++r) {
+        const UINT count = pDestSizes ? pDestSizes[r] : 1u;
+        const size_t basePtr = pDestStarts[r].ptr;
+        for (UINT n = 0; n < count && idx < copied.size(); ++n, ++idx) {
+            const size_t dstPtr = basePtr + static_cast<SIZE_T>(n) * stride;
+            if (copied[idx].first) {
+                map[dstPtr] = copied[idx].second;
+            } else {
+                map.erase(dstPtr);
+            }
+        }
+    }
+}
+
+void VrsFoveatedD3D12::OnCopyDescriptorsSimple(
+    ID3D12Device* /*dev*/,
+    UINT numDescriptors,
+    D3D12_CPU_DESCRIPTOR_HANDLE destStart,
+    D3D12_CPU_DESCRIPTOR_HANDLE srcStart,
+    D3D12_DESCRIPTOR_HEAP_TYPE heapType) {
+    if (numDescriptors == 0) return;
+    if (heapType != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && heapType != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return;
+
+    const bool isRtv = (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const uint32_t stride = isRtv ? rtvDescriptorSize_ : dsvDescriptorSize_;
+    if (stride == 0) return;
+
+    std::shared_mutex& mapMutex = isRtv ? rtvMapMutex_ : dsvMapMutex_;
+    std::unordered_map<size_t, DescriptorPod>& map = isRtv ? rtvMap_ : dsvMap_;
+
+    std::unique_lock<std::shared_mutex> lock(mapMutex);
+    std::vector<std::pair<bool, DescriptorPod>> copied;
+    copied.reserve((std::min)(numDescriptors, 4096u));
+    for (UINT i = 0; i < numDescriptors; ++i) {
+        const auto it = map.find(srcStart.ptr + static_cast<SIZE_T>(i) * stride);
+        if (it != map.end()) {
+            copied.emplace_back(true, it->second);
+        } else {
+            copied.emplace_back(false, DescriptorPod{});
+        }
+    }
+    for (UINT i = 0; i < numDescriptors; ++i) {
+        const size_t dstPtr = destStart.ptr + static_cast<SIZE_T>(i) * stride;
+        if (copied[i].first) {
+            map[dstPtr] = copied[i].second;
+        } else {
+            map.erase(dstPtr);
+        }
+    }
+}
+
 void VrsFoveatedD3D12::OnBeginRenderPass() {
     beginRpCount_.fetch_add(1, std::memory_order_relaxed);
 }
@@ -785,22 +1034,22 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     const uint32_t eyeW = targetEyeW_.load(std::memory_order_relaxed);
     const uint32_t eyeH = targetEyeH_.load(std::memory_order_relaxed);
 
-    ID3D12GraphicsCommandList5* cl5 = nullptr;
-    ComPtr<ID3D12GraphicsCommandList5> qiList5;
-
-    if (mode != 1) {
+    auto resolveCmdList5 = [&]() -> ID3D12GraphicsCommandList5* {
+        if (mode == 1) return nullptr;
         void** vtbl = *reinterpret_cast<void***>(cmdList);
         bool useDirectCast = false;
         bool supported5 = false;
+        bool entryChecked = false;
         {
             std::shared_lock<std::shared_mutex> rLock(vtblCacheMutex_);
             auto it = cmdList5VtblCache_.find(vtbl);
             if (it != cmdList5VtblCache_.end() && it->second.checked) {
+                entryChecked = true;
                 supported5 = it->second.supported;
                 useDirectCast = it->second.pointerEqualsThis;
             }
         }
-        if (!supported5) {
+        if (!entryChecked) {
             std::unique_lock<std::shared_mutex> wLock(vtblCacheMutex_);
             auto& entry = cmdList5VtblCache_[vtbl];
             if (!entry.checked) {
@@ -819,31 +1068,43 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
             supported5 = entry.supported;
             useDirectCast = entry.pointerEqualsThis;
         }
-        if (supported5) {
-            if (useDirectCast) {
-                cl5 = reinterpret_cast<ID3D12GraphicsCommandList5*>(cmdList);
-            } else if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(qiList5.GetAddressOf())))) {
+        if (supported5 && useDirectCast) {
+            return reinterpret_cast<ID3D12GraphicsCommandList5*>(cmdList);
+        }
+        return nullptr;
+    };
+
+    // [Z1] Select SingleEye or DoubleWide texture when binding; skip redundant resets unless VRS was bound on this cmdList
+    auto bindOrResetVrs = [&](bool isCandidate, bool isDoubleWide) {
+        if (mode == 1) return;
+        ID3D12Resource* texToBind = isDoubleWide ? currentVrsTextureDw_ : currentVrsTexture_;
+        const bool shouldBind = (isCandidate && isEnabled && isReady && texToBind != nullptr);
+        if (!shouldBind && !IsListVrsBound(cmdList)) {
+            return;
+        }
+
+        ComPtr<ID3D12GraphicsCommandList5> qiList5;
+        ID3D12GraphicsCommandList5* cl5 = resolveCmdList5();
+        if (!cl5) {
+            if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(qiList5.GetAddressOf()))) && qiList5) {
                 cl5 = qiList5.Get();
             }
         }
-    }
+        if (!cl5) return;
 
-    // [Z1] Select SingleEye or DoubleWide texture when binding
-    auto bindOrResetVrs = [&](bool isCandidate, bool isDoubleWide) {
-        if (mode == 1 || !cl5) return;
-
-        ID3D12Resource* texToBind = isDoubleWide ? currentVrsTextureDw_ : currentVrsTexture_;
-        if (isCandidate && isEnabled && isReady && texToBind) {
+        if (shouldBind) {
             static const D3D12_SHADING_RATE_COMBINER c[D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT] = {
                 D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
                 D3D12_SHADING_RATE_COMBINER_OVERRIDE
             };
             cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
             cl5->RSSetShadingRateImage(texToBind);
+            SetListVrsBound(cmdList, true);
             bindsCount_.fetch_add(1, std::memory_order_relaxed);
         } else {
             cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
             cl5->RSSetShadingRateImage(nullptr);
+            SetListVrsBound(cmdList, false);
             resetsCount_.fetch_add(1, std::memory_order_relaxed);
         }
     };
@@ -1048,6 +1309,7 @@ void VrsFoveatedD3D12::EndFrame() {
 void VrsFoveatedD3D12::Shutdown(const char* reason) {
     if (!capabilityChecked_) return;
     enabled_.store(false, std::memory_order_relaxed);
+    ClearAllBoundLists();
     shutdownLogged_.store(true, std::memory_order_relaxed);
     LogMessage(LogLevel::Info, std::string("VRS12: Shutdown (reason=") + (reason ? reason : "DestroySession") + ")");
 }
@@ -1056,6 +1318,7 @@ void VrsFoveatedD3D12::ShutdownOnProcessDetach() {
     if (!capabilityChecked_) return;
     if (!shutdownLogged_.exchange(true, std::memory_order_relaxed)) {
         enabled_.store(false, std::memory_order_relaxed);
+        ClearAllBoundLists();
         LogMessage(LogLevel::Info, "VRS12: Shutdown (reason=ProcessDetach)");
     }
 }

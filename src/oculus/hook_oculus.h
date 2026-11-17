@@ -2,6 +2,6 @@
 
 #ifdef _WIN32
 namespace vrpacing {
-void InstallOculusHooks();
+bool InstallOculusHooks();
 }
 #endif

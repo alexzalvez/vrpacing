@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include <cwctype>
 #include "minhook/include/MinHook.h"
 #include "common/logging_win.h"
 #include "common/vrs_filter.h"
@@ -30,6 +31,32 @@ namespace {
 
 constexpr uint32_t kMaxNvFailLogs = 5;
 constexpr UINT kMaxViewports = 16;
+
+bool IsCurrentProcessVrsAutoExcludedD3D11() {
+    static int s_cached = -1;
+    if (s_cached != -1) return (s_cached == 1);
+
+    wchar_t modPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    std::wstring p(modPath);
+    const auto pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p = p.substr(pos + 1);
+    std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+
+    if (IsVrsAutoExcludedExeName(p)) {
+        s_cached = 1;
+        std::string utf8Name;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            utf8Name.resize(static_cast<size_t>(n - 1));
+            WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, utf8Name.data(), n, nullptr, nullptr);
+        }
+        LogMessage(LogLevel::Info, "VRS: Auto-excluded for " + utf8Name + " (preserving NIS, SMAA and Pacing).");
+        return true;
+    }
+    s_cached = 0;
+    return false;
+}
 
 thread_local int g_vrsSuppressDepth = 0;
 thread_local bool g_inVrsHook = false;
@@ -222,6 +249,10 @@ bool VrsFoveatedD3D11::EnsureInitializedLocked(ID3D11Device* dev, ID3D11DeviceCo
     if (device_.Get() != dev) {
         ClearPatternCacheLocked();
         vrsCurrentlyBound_ = false;
+        drsDetected_ = false;
+        lastDrsW_ = 0;
+        lastDrsH_ = 0;
+        drsRecentSamples_.clear();
         fastBound_.store(false, std::memory_order_relaxed);
         loggedUniqueRts_.clear();
         rtHistogram_.clear();
@@ -343,6 +374,9 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
                                     int debugMode,
                                     bool debugLogging) {
     debugLogging_.store(debugLogging, std::memory_order_relaxed);
+    if (IsCurrentProcessVrsAutoExcludedD3D11()) {
+        enabled = false;
+    }
     if (!enabled && !fastEnabled_.load(std::memory_order_relaxed)) {
         return;
     }
@@ -350,6 +384,9 @@ void VrsFoveatedD3D11::UpdateTarget(ID3D11Device* dev,
     std::lock_guard<std::mutex> lock(mutex_);
 
     debugMode_ = debugMode;
+    if (drsDetected_) {
+        enabled = false;
+    }
 
     if (!enabled || !dev || !ctx || eyeWidth == 0 || eyeHeight == 0) {
         if (enabled_ && context_) {
@@ -446,6 +483,10 @@ void VrsFoveatedD3D11::Shutdown(const char* reason) {
     context_.Reset();
     device_.Reset();
     enabled_ = false;
+    drsDetected_ = false;
+    lastDrsW_ = 0;
+    lastDrsH_ = 0;
+    drsRecentSamples_.clear();
     vrsCurrentlyBound_ = false;
     targetEyeWidth_ = 0;
     targetEyeHeight_ = 0;
@@ -477,7 +518,7 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
         return;
     }
 
-    if (!enabled_ || targetEyeWidth_ == 0 || targetEyeHeight_ == 0 ||
+    if (!enabled_ || drsDetected_ || targetEyeWidth_ == 0 || targetEyeHeight_ == 0 ||
         numViews == 0 || !ppRenderTargetViews || !ppRenderTargetViews[0]) {
         DisableVRSLocked(ctx, false);
         return;
@@ -569,6 +610,51 @@ void VrsFoveatedD3D11::OnPostOMSetRenderTargets(
     if (!fOut.accepted) {
         DisableVRSLocked(ctx, false);
         return;
+    }
+
+    // Sub-viewport filter (e.g. Source 2 Adaptive Quality rendering into a corner of a larger RT)
+    UINT numVp = kMaxViewports;
+    D3D11_VIEWPORT vps[kMaxViewports]{};
+    ctx->RSGetViewports(&numVp, vps);
+    if (numVp > 0) {
+        const float expectedEyeW = fOut.doubleWide ? (static_cast<float>(td.Width) * 0.5f) : static_cast<float>(td.Width);
+        if (vps[0].Width < expectedEyeW * 0.95f || vps[0].Height < static_cast<float>(td.Height) * 0.95f) {
+            DisableVRSLocked(ctx, false);
+            return;
+        }
+    }
+
+    // Dynamic Resolution Scaling (DRS) detector: >3 distinct candidate resolutions within 5000 ms
+    if (td.Width != lastDrsW_ || td.Height != lastDrsH_) {
+        lastDrsW_ = td.Width;
+        lastDrsH_ = td.Height;
+        const uint64_t nowTick = GetTickCount64();
+        drsRecentSamples_.erase(
+            std::remove_if(drsRecentSamples_.begin(), drsRecentSamples_.end(),
+                [nowTick](const DrsSample& s) { return (nowTick - s.tickMs) > kDrsWindowMs; }),
+            drsRecentSamples_.end()
+        );
+        bool updated = false;
+        for (auto& s : drsRecentSamples_) {
+            if (s.w == td.Width && s.h == td.Height) {
+                s.tickMs = nowTick;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            drsRecentSamples_.push_back({ td.Width, td.Height, nowTick });
+        }
+        if (drsRecentSamples_.size() > kDrsDistinctThreshold) {
+            drsDetected_ = true;
+            enabled_ = false;
+            fastEnabled_.store(false, std::memory_order_relaxed);
+            DisableVRSLocked(ctx, true);
+            ClearPatternCacheLocked();
+            drsRecentSamples_.clear();
+            LogMessage(LogLevel::Info, "VRS: Dynamic Resolution Scaling detected; VRS auto-disabled for stability.");
+            return;
+        }
     }
 
     candidateBinds_.fetch_add(1, std::memory_order_relaxed);
@@ -706,13 +792,13 @@ ID3D11NvShadingRateResourceView* VrsFoveatedD3D11::GetOrCreatePatternLocked(
         }
     }
 
-    if (cache.size() >= kMaxPatternsPerLayout) {
-        if (!cacheFullLogged_) {
-            cacheFullLogged_ = true;
-            LogMessage(LogLevel::Warn, "VRS: pattern cache full, RT " +
-                       std::to_string(rtWidth) + "x" + std::to_string(rtHeight) + " skipped");
+    while (cache.size() >= kMaxPatternsPerLayout) {
+        if (cache.front().view.Get() == lastBoundView_ && context_) {
+            DisableVRSLocked(context_.Get(), true);
         }
-        return nullptr;
+        cache.front().view.Reset();
+        cache.front().tex.Reset();
+        cache.erase(cache.begin());
     }
 
     const bool doubleWide = (layout == VrsLayout::Combined);

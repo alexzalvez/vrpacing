@@ -113,9 +113,17 @@ private:
         }
     };
 
+    struct DrsSample {
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint64_t tickMs = 0;
+    };
+
     static constexpr size_t kMaxPatternsPerLayout = 4;
     static constexpr size_t kMaxUniqueRtLogs = 64;
     static constexpr size_t kMaxHistogramEntries = 8; // [P3]
+    static constexpr uint64_t kDrsWindowMs = 5000;
+    static constexpr size_t kDrsDistinctThreshold = 3;
 
     VrsFoveatedD3D11() = default;
     ~VrsFoveatedD3D11() = default;
@@ -158,8 +166,12 @@ private:
     bool hookInstallAttempted_ = false;
 
     bool enabled_ = false;
+    bool drsDetected_ = false;
     int debugMode_ = 0;
     bool vrsCurrentlyBound_ = false;
+    uint32_t lastDrsW_ = 0;
+    uint32_t lastDrsH_ = 0;
+    std::vector<DrsSample> drsRecentSamples_;
     uint32_t targetEyeWidth_ = 0;
     uint32_t targetEyeHeight_ = 0;
 

@@ -51,6 +51,20 @@ public:
                                   ID3D12Resource* pResource,
                                   const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc,
                                   D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor);
+    void OnCopyDescriptors(ID3D12Device* dev,
+                           UINT numDestRanges,
+                           const D3D12_CPU_DESCRIPTOR_HANDLE* pDestStarts,
+                           const UINT* pDestSizes,
+                           UINT numSrcRanges,
+                           const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcStarts,
+                           const UINT* pSrcSizes,
+                           D3D12_DESCRIPTOR_HEAP_TYPE heapType);
+    void OnCopyDescriptorsSimple(ID3D12Device* dev,
+                                 UINT numDescriptors,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE destStart,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE srcStart,
+                                 D3D12_DESCRIPTOR_HEAP_TYPE heapType);
+    void OnCommandListReset(ID3D12GraphicsCommandList* cmdList);
     void OnPostOMSetRenderTargets(ID3D12GraphicsCommandList* cmdList,
                                   UINT numRenderTargetDescriptors,
                                   const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargetDescriptors,
@@ -100,11 +114,21 @@ private:
         bool pointerEqualsThis = false;
     };
 
+    struct BoundListShard {
+        std::mutex mutex;
+        std::unordered_set<ID3D12GraphicsCommandList*> lists;
+    };
+
     static constexpr size_t kMaxDistinctRtLogs = 32;
     static constexpr size_t kMaxHistEntries = 16;
+    static constexpr size_t kBoundListShardCount = 16;
 
     VrsFoveatedD3D12() = default;
     ~VrsFoveatedD3D12() = default;
+
+    bool IsListVrsBound(ID3D12GraphicsCommandList* cmdList) noexcept;
+    void SetListVrsBound(ID3D12GraphicsCommandList* cmdList, bool bound) noexcept;
+    void ClearAllBoundLists() noexcept;
 
     void InstallHooksLocked(ID3D12Device* rawDevice);
     bool EnsureUploadObjectsLocked();
@@ -121,12 +145,14 @@ private:
     std::unordered_map<size_t, DescriptorPod> dsvMap_;
     std::unordered_set<ID3D12Resource*> swapchainTextures_;
     std::unordered_map<void**, CmdList5VtableEntry> cmdList5VtblCache_;
+    BoundListShard boundListShards_[kBoundListShardCount];
 
     DXGI_FORMAT extraFormats_[16]{};
     std::atomic<uint32_t> extraFormatsCount_{ 0 };
 
     ID3D12Device* device_ = nullptr;
     uint32_t rtvDescriptorSize_ = 0;
+    uint32_t dsvDescriptorSize_ = 0;
     bool capabilityChecked_ = false;
     bool tier2Supported_ = false;
     bool hooksInstalled_ = false;

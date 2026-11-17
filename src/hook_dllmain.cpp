@@ -42,6 +42,7 @@ struct LifecycleState {
     BackendStatus openvrStatus = BackendStatus::NotPresent;
     int openvrFailures = 0;
     BackendStatus oculusStatus = BackendStatus::NotPresent;
+    int oculusFailures = 0;
 };
 
 constexpr int kMaxOpenVrInstallAttempts = 10;
@@ -189,12 +190,38 @@ void AdvanceHookLifecycleLocked() {
         }
     }
 
-    // 2. Ruta Oculus (instalador void sin retorno verificable; no afirma Ready)
-    if (hasOculusMod && g_state.oculusStatus == BackendStatus::NotPresent) {
-        vrpacing::InstallOculusHooks();
-        g_state.oculusStatus = BackendStatus::UnverifiedInvoked;
-        vrpacing::LogMessage(vrpacing::LogLevel::Info,
-                             "HookLifecycle: Oculus LibOVR installer invoked (unverified status; Ready event not asserted).");
+    // 2. Ruta Oculus LibOVR verificada
+    if (hasOculusMod &&
+        g_state.oculusStatus != BackendStatus::ReadyVerified &&
+        g_state.oculusStatus != BackendStatus::TerminalFailure) {
+        if (vrpacing::InstallOculusHooks()) {
+            g_state.oculusStatus = BackendStatus::ReadyVerified;
+            g_state.oculusFailures = 0;
+        } else {
+            g_state.oculusFailures++;
+            if (g_state.oculusFailures >= kMaxOpenVrInstallAttempts) {
+                g_state.oculusStatus = BackendStatus::TerminalFailure;
+                vrpacing::LogMessage(vrpacing::LogLevel::Error,
+                                     "HookLifecycle: Oculus LibOVR hook installation reached terminal failure after " +
+                                     std::to_string(g_state.oculusFailures) + " attempts.");
+            } else {
+                g_state.oculusStatus = BackendStatus::TransientFailure;
+            }
+        }
+    }
+
+    if (g_state.oculusStatus == BackendStatus::ReadyVerified &&
+        !g_state.readySignaled && !g_state.failedSignaled) {
+        if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent)) {
+            g_state.readySignaled = true;
+            vrpacing::LogMessage(vrpacing::LogLevel::Info,
+                                 "HookLifecycle: Oculus LibOVR hooks verified READY.");
+        }
+    } else if (g_state.oculusStatus == BackendStatus::TerminalFailure && !hasOpenVrMod &&
+               !g_state.readySignaled && !g_state.failedSignaled) {
+        if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookFailed_", g_hFailedEvent)) {
+            g_state.failedSignaled = true;
+        }
     }
 }
 
@@ -209,17 +236,26 @@ DWORD WINAPI HookWatcherThread(LPVOID) {
             const bool openvrSettled =
                 (g_state.openvrStatus == BackendStatus::ReadyVerified && g_state.readySignaled) ||
                 (g_state.openvrStatus == BackendStatus::TerminalFailure && g_state.failedSignaled);
-            const bool oculusSettled = (g_state.oculusStatus == BackendStatus::UnverifiedInvoked);
+            const bool oculusSettled =
+                (g_state.oculusStatus == BackendStatus::ReadyVerified && g_state.readySignaled) ||
+                (g_state.oculusStatus == BackendStatus::TerminalFailure && g_state.failedSignaled);
+            const bool anyReady =
+                ((g_state.openvrStatus == BackendStatus::ReadyVerified ||
+                  g_state.oculusStatus == BackendStatus::ReadyVerified) &&
+                 g_state.readySignaled);
+            const bool anyTerminalFailed =
+                ((g_state.openvrStatus == BackendStatus::TerminalFailure ||
+                  g_state.oculusStatus == BackendStatus::TerminalFailure) &&
+                 g_state.failedSignaled);
             const bool pinFailSettled = (g_state.pinFailedTerminal && g_state.failedSignaled);
 
             if (g_state.loadedSignaled &&
-                (pinFailSettled ||
-                 (g_state.openvrStatus == BackendStatus::TerminalFailure && g_state.failedSignaled) ||
-                 (openvrSettled && oculusSettled))) {
+                (pinFailSettled || anyTerminalFailed || (openvrSettled && oculusSettled))) {
                 shouldExitLoop = true;
             } else if ((g_state.pinFailedTerminal ||
-                        g_state.openvrStatus == BackendStatus::ReadyVerified ||
-                        g_state.openvrStatus == BackendStatus::TerminalFailure) &&
+                        anyReady ||
+                        g_state.openvrStatus == BackendStatus::TerminalFailure ||
+                        g_state.oculusStatus == BackendStatus::TerminalFailure) &&
                        ++postSettleSignalRetries >= 20) {
                 shouldExitLoop = true;
             }

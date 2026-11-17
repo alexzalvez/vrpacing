@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -36,6 +36,7 @@
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
 #include "common/visibility_mask.h"
+#include "common/vrs_filter.h"
 #include "gfx/nis_upscaler_d3d11.h"
 #include "gfx/vrs_foveated_d3d11.h"
 #include "gfx/vrs_foveated_d3d12.h"
@@ -141,8 +142,34 @@ bool IsCurrentProcessBlacklisted() {
     if (pos != std::wstring::npos) p = p.substr(pos + 1);
     std::transform(p.begin(), p.end(), p.begin(), ::towlower);
 
-    if (p == L"cemu.exe" || p == L"bettervr_launcher.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe") {
+    if (p == L"cemu.exe" || p == L"ofxrbridgetray.exe" || p == L"ofxrbridge.exe") {
         s_cached = 1;
+        return true;
+    }
+    s_cached = 0;
+    return false;
+}
+
+bool IsCurrentProcessVrsAutoExcluded() {
+    static int s_cached = -1;
+    if (s_cached != -1) return (s_cached == 1);
+
+    wchar_t modPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modPath, MAX_PATH);
+    std::wstring p(modPath);
+    const auto pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p = p.substr(pos + 1);
+    std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+
+    if (IsVrsAutoExcludedExeName(p)) {
+        s_cached = 1;
+        std::string utf8Name;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            utf8Name.resize(static_cast<size_t>(n - 1));
+            WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, utf8Name.data(), n, nullptr, nullptr);
+        }
+        LogMessage(LogLevel::Info, "OpenXR Layer: VRS auto-excluded for " + utf8Name + " (NIS, SMAA and Pacing remain active).");
         return true;
     }
     s_cached = 0;
@@ -959,7 +986,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
 
     const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (VDXR Bridge)";
     int32_t vrsStatus = 0;
-    if (IsOpenCompositeActive()) {
+    if (IsOpenCompositeActive() || IsCurrentProcessVrsAutoExcluded()) {
         vrsStatus = -1;
     } else if (g_d3d12Device) {
         const int32_t st12 = VrsFoveatedD3D12::Instance().GetVrsStatus();
@@ -1063,7 +1090,7 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
                 }
             }
             if (projEyeW > 0 && projEyeH > 0) {
-                const bool ffr12Enabled = !IsOpenCompositeActive() && (g_cfg.ffr.openxrEnabled || (g_cfg.vrs12.debugMode > 0));
+                const bool ffr12Enabled = !IsOpenCompositeActive() && !IsCurrentProcessVrsAutoExcluded() && (g_cfg.ffr.openxrEnabled || (g_cfg.vrs12.debugMode > 0));
                 const int dbg12 = g_cfg.vrs12.debugMode;
                 if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) {
                     LogMessage(LogLevel::Info, "VRS12: OpenXR target eye " + std::to_string(projEyeW) + "x" + std::to_string(projEyeH) + " (from projection layer)");
@@ -1121,7 +1148,7 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
         }
 
         if (projEyeW > 0 && projEyeH > 0) {
-            const bool ffrEnabled = !IsOpenCompositeActive() && (g_cfg.ffr.openxrEnabled || (g_cfg.ffr.debugMode > 0));
+            const bool ffrEnabled = !IsOpenCompositeActive() && !IsCurrentProcessVrsAutoExcluded() && (g_cfg.ffr.openxrEnabled || (g_cfg.ffr.debugMode > 0));
             const int dbgMode = g_cfg.ffr.debugMode;
 
             if (projEyeW != g_vrsTargetEyeW || projEyeH != g_vrsTargetEyeH) {

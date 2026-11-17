@@ -191,9 +191,7 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"secure system",
         L"registry",
         L"memory compression",
-        L"cemu.exe",
-        L"bettervr_launcher.exe",
-        L"ofxrbridgetray.exe",
+        L"cemu.exe", L"ofxrbridgetray.exe",
         L"ofxrbridge.exe",
         L"vrserver.exe",
         L"vrcompositor.exe",
@@ -390,7 +388,7 @@ void UpdatePendingInjections() {
             if (!entry.readyLogged &&
                 IsNamedInstanceEventSignaled(L"Local\\VRPacingHookReady_", entry.pid, entry.creationTime)) {
                 entry.readyLogged = true;
-                LogMessage(LogLevel::Info, "ProcessScanner: OpenVR VR_GetGenericInterface hook confirmed READY in " +
+                LogMessage(LogLevel::Info, "ProcessScanner: VR runtime hook confirmed READY in " +
                            entry.exeName + " [PID " + std::to_string(entry.pid) + "].");
             }
 
@@ -503,7 +501,7 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
         if (loaded) entry.loadedLogged = true;
         if (ready) {
             entry.readyLogged = true;
-            LogMessage(LogLevel::Info, "ProcessScanner: OpenVR VR_GetGenericInterface hook confirmed READY in " +
+            LogMessage(LogLevel::Info, "ProcessScanner: VR runtime hook confirmed READY in " +
                        exeName + " [PID " + std::to_string(pid) + "].");
             PromoteToHookedInstance(entry);
             return true;

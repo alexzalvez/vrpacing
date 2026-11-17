@@ -851,7 +851,7 @@ ovrResult __cdecl Hooked_ovrEndFrame(ovrSession session,
 
 } // namespace
 
-void InstallOculusHooks() {
+bool InstallOculusHooks() {
     HMODULE mod = nullptr;
     const wchar_t* dllNames[] = {
         L"LibOVRRT64_1.dll",
@@ -865,14 +865,17 @@ void InstallOculusHooks() {
     }
 
     if (!mod) {
-        return;
+        return false;
     }
 
     static std::mutex s_installMutex;
     std::lock_guard<std::mutex> lock(s_installMutex);
 
-    static std::atomic<bool> s_installed{ false };
-    if (s_installed.exchange(true)) return;
+    static bool s_installed = false;
+    static bool s_installSucceeded = false;
+    if (s_installed) {
+        return s_installSucceeded;
+    }
 
     InitLogging();
     g_cfg = LoadConfig();
@@ -895,45 +898,43 @@ void InstallOculusHooks() {
     auto getSize = reinterpret_cast<ovrGetFovTextureSizeFn>(GetProcAddress(mod, "ovr_GetFovTextureSize"));
     auto getStencil = reinterpret_cast<ovrGetFovStencilFn>(GetProcAddress(mod, "ovr_GetFovStencil"));
 
-    MH_Initialize();
-
-    if (initFn) {
-        MH_CreateHook(reinterpret_cast<void*>(initFn), reinterpret_cast<void*>(&Hooked_ovrInitialize), reinterpret_cast<void**>(&g_origInitialize));
-        MH_EnableHook(reinterpret_cast<void*>(initFn));
+    const MH_STATUS stInit = MH_Initialize();
+    if (stInit != MH_OK && stInit != MH_ERROR_ALREADY_INITIALIZED) {
+        LogMessage(LogLevel::Error, std::string("Oculus Hook: MH_Initialize failed: ") + MH_StatusToString(stInit));
+        return false;
     }
 
-    if (submit) {
-        MH_CreateHook(reinterpret_cast<void*>(submit), reinterpret_cast<void*>(&Hooked_ovrSubmitFrame), reinterpret_cast<void**>(&g_origSubmit));
-        MH_EnableHook(reinterpret_cast<void*>(submit));
-    }
+    auto enableHook = [](void* target, void* detour, void** orig) -> bool {
+        if (!target) return false;
+        const MH_STATUS stCreate = MH_CreateHook(target, detour, orig);
+        if (stCreate != MH_OK && stCreate != MH_ERROR_ALREADY_CREATED) {
+            return false;
+        }
+        const MH_STATUS stEnable = MH_EnableHook(target);
+        return (stEnable == MH_OK || stEnable == MH_ERROR_ENABLED);
+    };
 
-    if (submit2 && submit2 != submit) {
-        MH_CreateHook(reinterpret_cast<void*>(submit2), reinterpret_cast<void*>(&Hooked_ovrSubmitFrame2), reinterpret_cast<void**>(&g_origSubmit2));
-        MH_EnableHook(reinterpret_cast<void*>(submit2));
-    }
-
-    if (endFrame && endFrame != submit && endFrame != submit2) {
-        MH_CreateHook(reinterpret_cast<void*>(endFrame), reinterpret_cast<void*>(&Hooked_ovrEndFrame), reinterpret_cast<void**>(&g_origEndFrame));
-        MH_EnableHook(reinterpret_cast<void*>(endFrame));
-    }
-
-    if (waitBegin) {
-        MH_CreateHook(reinterpret_cast<void*>(waitBegin), reinterpret_cast<void*>(&Hooked_ovrWaitToBeginFrame), reinterpret_cast<void**>(&g_origWaitToBeginFrame));
-        MH_EnableHook(reinterpret_cast<void*>(waitBegin));
-    }
-
-    if (getSize) {
-        MH_CreateHook(reinterpret_cast<void*>(getSize), reinterpret_cast<void*>(&Hooked_ovrGetFovTextureSize), reinterpret_cast<void**>(&g_origGetFovTextureSize));
-        MH_EnableHook(reinterpret_cast<void*>(getSize));
-    }
-
+    (void)enableHook(reinterpret_cast<void*>(initFn), reinterpret_cast<void*>(&Hooked_ovrInitialize), reinterpret_cast<void**>(&g_origInitialize));
+    const bool okSubmit = enableHook(reinterpret_cast<void*>(submit), reinterpret_cast<void*>(&Hooked_ovrSubmitFrame), reinterpret_cast<void**>(&g_origSubmit));
+    const bool okSubmit2 = (submit2 && submit2 != submit)
+        ? enableHook(reinterpret_cast<void*>(submit2), reinterpret_cast<void*>(&Hooked_ovrSubmitFrame2), reinterpret_cast<void**>(&g_origSubmit2))
+        : false;
+    const bool okEndFrame = (endFrame && endFrame != submit && endFrame != submit2)
+        ? enableHook(reinterpret_cast<void*>(endFrame), reinterpret_cast<void*>(&Hooked_ovrEndFrame), reinterpret_cast<void**>(&g_origEndFrame))
+        : false;
+    (void)enableHook(reinterpret_cast<void*>(waitBegin), reinterpret_cast<void*>(&Hooked_ovrWaitToBeginFrame), reinterpret_cast<void**>(&g_origWaitToBeginFrame));
+    (void)enableHook(reinterpret_cast<void*>(getSize), reinterpret_cast<void*>(&Hooked_ovrGetFovTextureSize), reinterpret_cast<void**>(&g_origGetFovTextureSize));
     // [C6] Hook ovr_GetFovStencil passively
-    if (getStencil) {
-        MH_CreateHook(reinterpret_cast<void*>(getStencil), reinterpret_cast<void*>(&Hooked_ovrGetFovStencil), reinterpret_cast<void**>(&g_origGetFovStencil));
-        MH_EnableHook(reinterpret_cast<void*>(getStencil));
-    }
+    (void)enableHook(reinterpret_cast<void*>(getStencil), reinterpret_cast<void*>(&Hooked_ovrGetFovStencil), reinterpret_cast<void**>(&g_origGetFovStencil));
 
-    LogMessage(LogLevel::Info, "Oculus LibOVR hooks installed with full D3D11 NIS support (SubmitFrame, SubmitFrame2, EndFrame, GetFovStencil).");
+    s_installSucceeded = (okSubmit || okSubmit2 || okEndFrame);
+    if (s_installSucceeded) {
+        s_installed = true;
+        LogMessage(LogLevel::Info, "Oculus LibOVR hooks installed with full D3D11 NIS support (SubmitFrame, SubmitFrame2, EndFrame, GetFovStencil).");
+    } else {
+        LogMessage(LogLevel::Warn, "Oculus LibOVR hooks could not hook SubmitFrame/SubmitFrame2/EndFrame yet.");
+    }
+    return s_installSucceeded;
 }
 
 } // namespace vrpacing
