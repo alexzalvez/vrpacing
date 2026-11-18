@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(VRPacing VERSION 0.8.2 LANGUAGES C CXX)
+project(VRPacing VERSION 0.9.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -5,8 +5,8 @@
 namespace vrpacing {
 
 constexpr wchar_t kSharedStateName[] = L"Local\\VRPacingSharedState";
-constexpr wchar_t kAppVersionString[] = L"v0.8.2-beta";
-constexpr char kAppVersionAnsi[] = "v0.8.2-beta";
+constexpr wchar_t kAppVersionString[] = L"v0.9.0";
+constexpr char kAppVersionAnsi[] = "v0.9.0";
 
 constexpr uint32_t kFlagEnabled = 1 << 0;
 constexpr uint32_t kFlagUpscalingEnabled = 1 << 1;

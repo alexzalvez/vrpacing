@@ -1061,6 +1061,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            if (g_shared && g_shared->activePid != 0) {
+                LogSessionSummaryAndReset();
+            }
             UnregisterHotKey(hwnd, ID_HOTKEY_SCREENSHOT);
             KillTimer(hwnd, IDT_SCANNER_TIMER);
             KillTimer(hwnd, IDT_TELEMETRY_TIMER);
