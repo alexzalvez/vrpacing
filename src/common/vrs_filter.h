@@ -87,7 +87,8 @@ inline VrsFilterOutput EvaluateVrsCandidate(const VrsFilterInput& in) {
 
     const float a1 = static_cast<float>(in.rtW) / static_cast<float>(in.rtH);
     const float a2 = (static_cast<float>(in.rtW) * 0.5f) / static_cast<float>(in.rtH);
-    const bool allowDw = in.allowArrayAndDoubleWide || in.allowDoubleWideOnly; // const bool doubleWide = allowDw && (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
+    const bool allowDw = in.allowArrayAndDoubleWide || in.allowDoubleWideOnly; // 
+    const bool doubleWide = allowDw && (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
     const bool single = !doubleWide && (std::abs(a1 - targetAspect) <= kVrsAspectTolerance);
 
     if (!doubleWide && !single) {

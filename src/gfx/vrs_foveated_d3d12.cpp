@@ -1186,7 +1186,9 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     fIn.targetEyeW = eyeW;
     fIn.targetEyeH = eyeH;
     fIn.allowArrayAndDoubleWide = false;
-    fIn.allowDoubleWideOnly = true; // VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
+    fIn.allowDoubleWideOnly = true; // 
+
+    VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
     if (needDistinctLog || fOut.accepted) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1250,7 +1252,8 @@ void VrsFoveatedD3D12::EndFrame() {
         const uint64_t omsrt = omsrtCount_.load(std::memory_order_relaxed);
         const uint64_t direct = directCount_.load(std::memory_order_relaxed);
         const uint64_t candidates = candidatesCount_.load(std::memory_order_relaxed);
-        const uint64_t dw = dwCount_.load(std::memory_order_relaxed); // const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
+        const uint64_t dw = dwCount_.load(std::memory_order_relaxed); // 
+        const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
         const uint64_t resets = resetsCount_.load(std::memory_order_relaxed);
         const uint64_t rtvUnk = rtvUnknownCount_.load(std::memory_order_relaxed);
         const uint64_t beginRp = beginRpCount_.load(std::memory_order_relaxed);

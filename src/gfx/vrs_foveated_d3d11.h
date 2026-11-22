@@ -121,7 +121,8 @@ private:
 
     static constexpr size_t kMaxPatternsPerLayout = 4;
     static constexpr size_t kMaxUniqueRtLogs = 64;
-    static constexpr size_t kMaxHistogramEntries = 8; // static constexpr uint64_t kDrsWindowMs = 5000;
+    static constexpr size_t kMaxHistogramEntries = 8; // 
+    static constexpr uint64_t kDrsWindowMs = 5000;
     static constexpr size_t kDrsDistinctThreshold = 3;
 
     VrsFoveatedD3D11() = default;
