@@ -1195,16 +1195,18 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         if (loggedDistinctRtHandles_.size() < kMaxDistinctRtLogs) {
             if (loggedDistinctRtHandles_.insert(rt0Handle.ptr).second) {
                 distinctRtLogCount_.store(loggedDistinctRtHandles_.size(), std::memory_order_relaxed);
-                LogMessage(LogLevel::Info, "VRS12: RT " + std::to_string(rtPod.w) + "x" + std::to_string(rtPod.h) +
-                           " arr=" + std::to_string(rtPod.arraySize) +
-                           " fmt=" + std::to_string(static_cast<uint32_t>(rtPod.resourceFmt)) +
-                           " rtvfmt=" + std::to_string(static_cast<uint32_t>(rtPod.viewFmt)) +
-                           " ms=" + std::to_string(rtPod.samples) +
-                           " dim=" + std::to_string(rtPod.dim) +
-                           " dsv=" + (hasValidDsv ? "1" : "0") +
-                           " sc=" + (rtPod.isSwapchain ? "1" : "0") +
-                           mrtFormatsStr +
-                           " -> " + std::string(fOut.label));
+                if (fOut.accepted || mode > 0) {
+                    LogMessage(LogLevel::Info, "VRS12: RT " + std::to_string(rtPod.w) + "x" + std::to_string(rtPod.h) +
+                               " arr=" + std::to_string(rtPod.arraySize) +
+                               " fmt=" + std::to_string(static_cast<uint32_t>(rtPod.resourceFmt)) +
+                               " rtvfmt=" + std::to_string(static_cast<uint32_t>(rtPod.viewFmt)) +
+                               " ms=" + std::to_string(rtPod.samples) +
+                               " dim=" + std::to_string(rtPod.dim) +
+                               " dsv=" + (hasValidDsv ? "1" : "0") +
+                               " sc=" + (rtPod.isSwapchain ? "1" : "0") +
+                               mrtFormatsStr +
+                               " -> " + std::string(fOut.label));
+                }
             }
         }
         if (fOut.accepted) {

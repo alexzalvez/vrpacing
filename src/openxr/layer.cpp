@@ -644,8 +644,8 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
         const bool widthMatchesSingle = (createInfo->width >= 720) &&
                                         (createInfo->width >= (g_nativeViewW / 2)) &&
                                         (createInfo->width <= (g_nativeViewW * 8 / 5));
-        const bool widthMatchesSbs = (createInfo->width >= 1440) &&
-                                     (createInfo->width >= g_nativeViewW) &&
+        const bool widthMatchesSbs = (createInfo->arraySize <= 1) &&
+                                     (createInfo->width >= (g_nativeViewW * 8 / 5)) &&
                                      (createInfo->width <= (g_nativeViewW * 16 / 5));
         const float nativeAspect = static_cast<float>(g_nativeViewW) / static_cast<float>(g_nativeViewH);
         const float swapAspect = (createInfo->height > 0)
