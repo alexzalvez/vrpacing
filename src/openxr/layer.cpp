@@ -221,7 +221,11 @@ void EnsureHookDllLoadedForVdxrBridge() {
         if (fn) {
             fn();
         }
+#ifdef _WIN64
         LogMessage(LogLevel::Info, "OpenXR Layer (Pure VDXR Bridge): Linked VRPacingHook.dll for post-render D3D11 NIS upscaling.");
+#else
+        LogMessage(LogLevel::Info, "OpenXR Layer (Pure VDXR Bridge): Linked VRPacingHook32.dll for post-render D3D11 NIS upscaling.");
+#endif
     }
 }
 
@@ -634,12 +638,15 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
 
     bool isEyeResolution = false;
     if (g_nativeViewW > 0 && g_nativeViewH > 0) {
-        const bool heightMatches = (createInfo->height >= (g_nativeViewH * 4 / 5)) &&
-                                   (createInfo->height <= (g_nativeViewH * 6 / 5));
-        const bool widthMatchesSingle = (createInfo->width >= (g_nativeViewW * 4 / 5)) &&
-                                        (createInfo->width <= (g_nativeViewW * 6 / 5));
-        const bool widthMatchesSbs = (createInfo->width >= (g_nativeViewW * 8 / 5)) &&
-                                     (createInfo->width <= (g_nativeViewW * 12 / 5));
+        const bool heightMatches = (createInfo->height >= 720) &&
+                                   (createInfo->height >= (g_nativeViewH / 2)) &&
+                                   (createInfo->height <= (g_nativeViewH * 8 / 5));
+        const bool widthMatchesSingle = (createInfo->width >= 720) &&
+                                        (createInfo->width >= (g_nativeViewW / 2)) &&
+                                        (createInfo->width <= (g_nativeViewW * 8 / 5));
+        const bool widthMatchesSbs = (createInfo->width >= 1440) &&
+                                     (createInfo->width >= g_nativeViewW) &&
+                                     (createInfo->width <= (g_nativeViewW * 16 / 5));
         const float nativeAspect = static_cast<float>(g_nativeViewW) / static_cast<float>(g_nativeViewH);
         const float swapAspect = (createInfo->height > 0)
             ? (static_cast<float>(createInfo->width) / static_cast<float>(createInfo->height))

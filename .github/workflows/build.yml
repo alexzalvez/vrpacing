@@ -119,3 +119,10 @@ jobs:
         with:
           name: VRPacing-windows-x64
           path: dist/VRPacing/
+
+      - name: Remove temporary partial artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          names: |
+            VRPacing-part-x64
+            VRPacing-part-x86

@@ -149,7 +149,7 @@ typedef enum ovrLayerFlags_ {
     ovrLayerFlag_HeadLocked = 0x04
 } ovrLayerFlags;
 
-// Definición moderna (SDK v25+)
+// Definici-n moderna (SDK v25+)
 struct ovrLayerHeader {
     ovrLayerType Type;
     unsigned Flags;
@@ -182,7 +182,7 @@ struct ovrLayerEyeFovDepth {
     ovrTimewarpProjectionDesc ProjectionDesc;
 };
 
-// Definición legacy (< v25)
+// Definici-n legacy (< v25)
 struct ovrOldLayerHeader {
     ovrLayerType Type;
     unsigned Flags;

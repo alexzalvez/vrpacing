@@ -167,7 +167,7 @@ std::string PtrToHex(const void* ptr) {
     return std::string(buf);
 }
 
-// [Z3] Check whether debug logging is explicitly enabled in config
+// Check whether debug logging is explicitly enabled in config
 bool IsDebugLoggingEnabled() {
     const std::string& lvl = g_cfg.logging.level;
     return (lvl == "debug" || lvl == "DEBUG" || lvl == "Debug");
@@ -485,7 +485,7 @@ void EnsureInit() {
     });
 }
 
-// [Z2, Z3] Release defaults: LineLoop probe/dump only when debug logging is enabled;
+// Release defaults: LineLoop probe/dump only when debug logging is enabled;
 // mode=2 replaces ONLY when original=EMPTY unless mask.openvrForce != 0.
 template <typename CallOrigFn>
 vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
@@ -539,7 +539,7 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         maskKind = VisibilityMaskKind::LineLoop;
     }
 
-    // [Z3] LineLoop probe and vertex dump only when debug logging is enabled
+    // LineLoop probe and vertex dump only when debug logging is enabled
     const bool debugLog = IsDebugLoggingEnabled();
     const bool wantSmallDump = debugLog && (g_hamSmallTrisDumpCount.load(std::memory_order_relaxed) < 2);
     vr::HiddenAreaMesh_t loopMesh{};
@@ -570,7 +570,7 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         }
     }
 
-    // [Z3] Single call to the original per HAM request in release
+    // Single call to the original per HAM request in release
     vr::HiddenAreaMesh_t* origRes = ret;
     if (!callOrigSeh(ret, effectiveType, &origRes, &sehCode)) {
         LogSehAndLatchPassthrough("original GHAM", sehCode);
@@ -636,7 +636,7 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
         return origRes;
     }
 
-    // [Z2] In mode=2, replace ONLY when original=EMPTY unless mask.openvrForce != 0
+    // In mode=2, replace ONLY when original=EMPTY unless mask.openvrForce != 0
     if (!isEmpty && g_cfg.mask.openvrForce == 0) {
         std::lock_guard<std::mutex> lock(g_hamMutex);
         if (!g_hamReplaceLogged[eyeIdx][typeIdx]) {

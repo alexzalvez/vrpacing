@@ -88,7 +88,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D11NvShadingRateResourceView> view;
     };
 
-    // [P3] Estructura clave para el histograma de RTs aceptados
+    // Estructura clave para el histograma de RTs aceptados
     struct RtHistogramKey {
         uint32_t w = 0;
         uint32_t h = 0;
@@ -121,8 +121,7 @@ private:
 
     static constexpr size_t kMaxPatternsPerLayout = 4;
     static constexpr size_t kMaxUniqueRtLogs = 64;
-    static constexpr size_t kMaxHistogramEntries = 8; // [P3]
-    static constexpr uint64_t kDrsWindowMs = 5000;
+    static constexpr size_t kMaxHistogramEntries = 8; // static constexpr uint64_t kDrsWindowMs = 5000;
     static constexpr size_t kDrsDistinctThreshold = 3;
 
     VrsFoveatedD3D11() = default;
@@ -175,7 +174,7 @@ private:
     uint32_t targetEyeWidth_ = 0;
     uint32_t targetEyeHeight_ = 0;
 
-    // [P1] Puntero crudo de la ultima vista enlazada para evitar llamadas redundantes
+    // Puntero crudo de la ultima vista enlazada para evitar llamadas redundantes
     ID3D11NvShadingRateResourceView* lastBoundView_ = nullptr;
     int lastBoundDebugMode_ = -1;
 
@@ -189,12 +188,12 @@ private:
 
     std::unordered_set<uint64_t> loggedUniqueRts_;
 
-    // [P3] Histograma acotado de asignaciones aceptadas
+    // Histograma acotado de asignaciones aceptadas
     std::unordered_map<RtHistogramKey, uint64_t, RtHistogramKeyHash> rtHistogram_;
 
     std::atomic<uint64_t> framesCount_{ 0 };
     std::atomic<uint64_t> candidateBinds_{ 0 };
-    std::atomic<uint64_t> actualNvapiBinds_{ 0 }; // [P1] Contador real de llamadas a NVAPI
+    std::atomic<uint64_t> actualNvapiBinds_{ 0 }; // Contador real de llamadas a NVAPI
     std::atomic<uint64_t> enableCount_{ 0 };
     std::atomic<uint64_t> disableCount_{ 0 };
     std::atomic<uint64_t> nvFailCount_{ 0 };

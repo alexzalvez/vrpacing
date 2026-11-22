@@ -36,7 +36,7 @@ using Microsoft::WRL::ComPtr;
 namespace vrpacing {
 namespace {
 
-// [C6] Minimal local ABI structs for ovr_GetFovStencil from OVR_CAPI.h
+// Minimal local ABI structs for ovr_GetFovStencil from OVR_CAPI.h
 struct ovrVector2f_Local {
     float x;
     float y;
@@ -186,7 +186,7 @@ void EnsureInit() {
     });
 }
 
-// [C6] Passive hook for ovr_GetFovStencil: always passes through, logs first 4 calls
+// Passive hook for ovr_GetFovStencil: always passes through, logs first 4 calls
 ovrResult __cdecl Hooked_ovrGetFovStencil(ovrSession session,
                                           const ovrFovStencilDesc_Local* fovStencilDesc,
                                           ovrFovStencilMeshBuffer_Local* meshBuffer) {
@@ -936,7 +936,7 @@ bool InstallOculusHooks() {
         : false;
     (void)enableHook(reinterpret_cast<void*>(waitBegin), reinterpret_cast<void*>(&Hooked_ovrWaitToBeginFrame), reinterpret_cast<void**>(&g_origWaitToBeginFrame));
     (void)enableHook(reinterpret_cast<void*>(getSize), reinterpret_cast<void*>(&Hooked_ovrGetFovTextureSize), reinterpret_cast<void**>(&g_origGetFovTextureSize));
-    // [C6] Hook ovr_GetFovStencil passively
+    // Hook ovr_GetFovStencil passively
     (void)enableHook(reinterpret_cast<void*>(getStencil), reinterpret_cast<void*>(&Hooked_ovrGetFovStencil), reinterpret_cast<void**>(&g_origGetFovStencil));
 
     s_installSucceeded = (okSubmit || okSubmit2 || okEndFrame);

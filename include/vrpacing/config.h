@@ -15,8 +15,8 @@ struct UpscalingConfig {
 
 struct MaskConfig {
     bool enabled = true;
-    int openvrMode = 2;  // [Z2] Release default: 2 (replaces only when original=EMPTY unless openvrForce!=0)
-    int openvrForce = 0; // [Z2] 0=passthrough when original=MESH, 1=force replace even when original=MESH
+    int openvrMode = 2;  // Release default: 2 (replaces only when original=EMPTY unless openvrForce!=0)
+    int openvrForce = 0; // 0=passthrough when original=MESH, 1=force replace even when original=MESH
     float radiusX = 1.0f;
     float radiusY = 1.0f;
     float centerX = 0.0f;

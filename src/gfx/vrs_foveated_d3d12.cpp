@@ -495,7 +495,7 @@ bool VrsFoveatedD3D12::EnsureUploadObjectsLocked() {
     return true;
 }
 
-// [C3, C4, Z1] Allocate and upload both SingleEye and DoubleWide pattern textures on our internal queue
+// Allocate and upload both SingleEye and DoubleWide pattern textures on our internal queue
 bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t eyeH, int mode, bool reuploadInPlace) {
     if (!EnsureUploadObjectsLocked() || eyeW == 0 || eyeH == 0 || tileSize_ == 0) return false;
 
@@ -520,7 +520,7 @@ bool VrsFoveatedD3D12::AllocateAndUploadVrsTextureLocked(uint32_t eyeW, uint32_t
         tilesW = (std::max)(1u, (capW + tileSize_ - 1) / tileSize_);
         tilesH = (std::max)(1u, (capH + tileSize_ - 1) / tileSize_);
 
-        // [Z1] DoubleWide capacity: ceil(2 * eyeW * 1.5) x ceil(eyeH * 1.5)
+        // DoubleWide capacity: ceil(2 * eyeW * 1.5) x ceil(eyeH * 1.5)
         capDwW = static_cast<uint32_t>(std::ceil(static_cast<double>(eyeW) * 2.0 * static_cast<double>(kVrsMaxScale)));
         capDwH = capH;
         tilesDwW = (std::max)(1u, (capDwW + tileSize_ - 1) / tileSize_);
@@ -1074,7 +1074,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         return nullptr;
     };
 
-    // [Z1] Select SingleEye or DoubleWide texture when binding; skip redundant resets unless VRS was bound on this cmdList
+    // Select SingleEye or DoubleWide texture when binding; skip redundant resets unless VRS was bound on this cmdList
     auto bindOrResetVrs = [&](bool isCandidate, bool isDoubleWide) {
         if (mode == 1) return;
         ID3D12Resource* texToBind = isDoubleWide ? currentVrsTextureDw_ : currentVrsTexture_;
@@ -1163,7 +1163,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
         }
     }
 
-    // [Z1] Enable DOUBLEWIDE parity with D3D11; require sc=0 for DOUBLEWIDE
+    // Enable DOUBLEWIDE parity with D3D11; require sc=0 for DOUBLEWIDE
     const float targetAspect = (eyeH > 0) ? (static_cast<float>(eyeW) / static_cast<float>(eyeH)) : 1.0f;
     const float a2 = (rtPod.h > 0) ? ((static_cast<float>(rtPod.w) * 0.5f) / static_cast<float>(rtPod.h)) : 0.0f;
     const bool isDwAspect = (std::abs(a2 - targetAspect) <= kVrsAspectTolerance);
@@ -1186,9 +1186,7 @@ void VrsFoveatedD3D12::OnPostOMSetRenderTargets(
     fIn.targetEyeW = eyeW;
     fIn.targetEyeH = eyeH;
     fIn.allowArrayAndDoubleWide = false;
-    fIn.allowDoubleWideOnly = true; // [Z1]
-
-    VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
+    fIn.allowDoubleWideOnly = true; // VrsFilterOutput fOut = EvaluateVrsCandidate(fIn);
 
     if (needDistinctLog || fOut.accepted) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1252,8 +1250,7 @@ void VrsFoveatedD3D12::EndFrame() {
         const uint64_t omsrt = omsrtCount_.load(std::memory_order_relaxed);
         const uint64_t direct = directCount_.load(std::memory_order_relaxed);
         const uint64_t candidates = candidatesCount_.load(std::memory_order_relaxed);
-        const uint64_t dw = dwCount_.load(std::memory_order_relaxed); // [Z1]
-        const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
+        const uint64_t dw = dwCount_.load(std::memory_order_relaxed); // const uint64_t binds = bindsCount_.load(std::memory_order_relaxed);
         const uint64_t resets = resetsCount_.load(std::memory_order_relaxed);
         const uint64_t rtvUnk = rtvUnknownCount_.load(std::memory_order_relaxed);
         const uint64_t beginRp = beginRpCount_.load(std::memory_order_relaxed);

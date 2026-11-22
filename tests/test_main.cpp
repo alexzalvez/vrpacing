@@ -34,12 +34,12 @@ void TestMaskGeometry() {
     auto tris = vrpacing::BuildEllipseOutsideMaskTriangles(p);
     auto mesh = vrpacing::BuildEllipseOutsideMaskIndexed(p);
 
-    Check(tris.size() == 128, "mask: 2 triangulos por segmento");
-    Check(mesh.vertices.size() == 128, "mask: vertices indexados esperados");
-    Check(mesh.indices.size() == 384, "mask: indices esperados");
+    Check(tris.size() == 128, "mask: 2 triangles per segment");
+    Check(mesh.vertices.size() == 128, "mask: expected indexed vertices");
+    Check(mesh.indices.size() == 384, "mask: expected indices");
 
-    Check(vrpacing::IsPointInsideEllipse(0.0f, 0.0f, p), "mask: centro dentro");
-    Check(!vrpacing::IsPointInsideEllipse(1.0f, 1.0f, p), "mask: esquina fuera");
+    Check(vrpacing::IsPointInsideEllipse(0.0f, 0.0f, p), "mask: center inside");
+    Check(!vrpacing::IsPointInsideEllipse(1.0f, 1.0f, p), "mask: corner outside");
 }
 
 void TestLimiterMath() {
@@ -89,8 +89,8 @@ void TestHzTracker() {
 }
 
 void TestSharedStateAbi() {
-    Check(sizeof(vrpacing::SharedState) == 1944, "shared_state: tamano fijo 1944 bytes en x86/x64");
-    Check(offsetof(vrpacing::SharedState, avgFps) == 336, "shared_state: offset exacto de avgFps");
+    Check(sizeof(vrpacing::SharedState) == 1944, "shared_state: fixed 1944-byte size across x86/x64");
+    Check(offsetof(vrpacing::SharedState, avgFps) == 336, "shared_state: exact avgFps offset");
 }
 
 } // namespace
@@ -107,10 +107,10 @@ int main() {
     }
 
     if (g_failed == 0) {
-        std::cout << "Todos los tests pasaron.\n";
+        std::cout << "All unit tests passed.\n";
         return 0;
     }
 
-    std::cout << "Fallos: " << g_failed << "\n";
+    std::cout << "Failures: " << g_failed << "\n";
     return 1;
 }

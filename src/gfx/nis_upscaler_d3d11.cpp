@@ -18,7 +18,14 @@
 #include "shader_nis_upscale.h"
 #include "common/logging_win.h"
 #include "common/shared_memory_win.h"
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4305 4324)
+#endif
 #include "nis/NIS_Config.h"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -329,7 +336,7 @@ void NisUpscalerD3D11::ClearCache() {
 
 bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
     if (!device) {
-        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Puntero ID3D11Device nulo.");
+        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Null ID3D11Device pointer.");
         return false;
     }
     if (device_.Get() != device) {
@@ -344,7 +351,7 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         upscaleShader_.ReleaseAndGetAddressOf()
     );
     if (FAILED(hr)) {
-        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error al crear el Compute Shader de NIS. HR=" + std::to_string(hr));
+        LogMessage(LogLevel::Error, "NisUpscalerD3D11: Failed to create NIS Compute Shader. HR=" + std::to_string(hr));
         return false;
     }
 
@@ -369,15 +376,15 @@ bool NisUpscalerD3D11::Initialize(ID3D11Device* device) {
         texData.pSysMem = coef_scale;
         texData.SysMemPitch = kFilterSize * 4;
         texData.SysMemSlicePitch = kFilterSize * 4 * kPhaseCount;
-        CheckResult("creando textura coeficientes scaler", device_->CreateTexture2D(&td, &texData, scalerCoeffTexture_.ReleaseAndGetAddressOf()));
+        CheckResult("creating scaler coefficient texture", device_->CreateTexture2D(&td, &texData, scalerCoeffTexture_.ReleaseAndGetAddressOf()));
 
         texData.pSysMem = coef_usm;
-        CheckResult("creando textura coeficientes USM", device_->CreateTexture2D(&td, &texData, usmCoeffTexture_.ReleaseAndGetAddressOf()));
+        CheckResult("creating USM coefficient texture", device_->CreateTexture2D(&td, &texData, usmCoeffTexture_.ReleaseAndGetAddressOf()));
 
         scalerCoeffView_ = CreateShaderResourceView(device_.Get(), scalerCoeffTexture_.Get());
         usmCoeffView_ = CreateShaderResourceView(device_.Get(), usmCoeffTexture_.Get());
     } catch (const std::exception& e) {
-        LogMessage(LogLevel::Error, std::string("NisUpscalerD3D11: Excepcion en inicializacion: ") + e.what());
+        LogMessage(LogLevel::Error, std::string("NisUpscalerD3D11: Initialization exception: ") + e.what());
         return false;
     }
 
@@ -479,7 +486,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
 
     const uint64_t totalPixels = static_cast<uint64_t>(dstWidth) * static_cast<uint64_t>(dstHeight);
     if (totalPixels > desc.maxOutputPixels) {
-        LogMessage(LogLevel::Warn, "NisUpscalerD3D11: Omitido por exceder maxOutputPixels.");
+        LogMessage(LogLevel::Warn, "NisUpscalerD3D11: Skipped frame exceeding maxOutputPixels.");
         return false;
     }
 
@@ -583,8 +590,10 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
                                           desc.srcArrayIndex == 0 &&
                                           desc.srcRect.x < (srcDesc.Width / 4));
 
+    // NIS_Upscale.hlsl binds Texture2D / RWTexture2D (non-array). When the swapchain has ArraySize > 1
+    // (Single-Pass Stereo, e.g. DCS World), route each slice through the 2D staging textures.
     ComPtr<ID3D11ShaderResourceView> activeSrcSrv;
-    if (srcDesc.SampleDesc.Count <= 1 && !(smaaRequested && srcDesc.ArraySize > 1)) {
+    if (srcDesc.SampleDesc.Count <= 1 && srcDesc.ArraySize <= 1) {
         activeSrcSrv = GetOrCreateSrv(src, desc.srcArrayIndex);
     }
 
@@ -607,7 +616,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
 
             if (FAILED(device_->CreateTexture2D(&td, nullptr, g_fallback.srcTex.GetAddressOf())) ||
                 FAILED(device_->CreateShaderResourceView(g_fallback.srcTex.Get(), nullptr, g_fallback.srcSrv.GetAddressOf()))) {
-                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error en fallback staging SRV.");
+                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Failed to allocate fallback staging SRV.");
                 return false;
             }
             g_fallback.srcW = srcDesc.Width;
@@ -627,7 +636,9 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
         activeSrcSrv = g_fallback.srcSrv;
     }
 
-    ComPtr<ID3D11UnorderedAccessView> activeDstUav = GetOrCreateUav(dst, desc.dstArrayIndex);
+    ComPtr<ID3D11UnorderedAccessView> activeDstUav = (dstDesc.ArraySize <= 1)
+        ? GetOrCreateUav(dst, desc.dstArrayIndex)
+        : nullptr;
     const bool directWriteOk = (activeDstUav != nullptr);
 
     if (!directWriteOk) {
@@ -649,7 +660,7 @@ bool NisUpscalerD3D11::Upscale(ID3D11DeviceContext* ctx,
 
             if (FAILED(device_->CreateTexture2D(&td, nullptr, g_fallback.dstTex.GetAddressOf())) ||
                 FAILED(device_->CreateUnorderedAccessView(g_fallback.dstTex.Get(), nullptr, g_fallback.dstUav.GetAddressOf()))) {
-                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Error en fallback staging UAV.");
+                LogMessage(LogLevel::Error, "NisUpscalerD3D11: Failed to allocate fallback staging UAV.");
                 return false;
             }
             g_fallback.dstW = dstDesc.Width;

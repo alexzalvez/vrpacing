@@ -25,13 +25,13 @@ enum class BackendStatus {
     TerminalFailure
 };
 
-// Politica de ciclo de vida:
-// 1. La descarga dinamica (FreeLibrary) NO esta soportada. Antes de instalar cualquier hook,
-//    el modulo se fija en el espacio de direcciones del proceso mediante GET_MODULE_HANDLE_EX_FLAG_PIN.
-//    Si el pin falla, se aborta la instalacion de todos los hooks y se senala Failed.
-// 2. DllMain nunca adquiere g_lifecycleMutex, nunca cierra handles compartidos con el worker y
-//    nunca invoca funciones de logging bajo el Windows Loader Lock.
-// 3. HookWatcherThread y VRPacingHook_RefreshHooks comparten un unico estado serializado (g_state).
+// Hook lifecycle policy:
+// 1. Dynamic unloading (FreeLibrary) is not supported. Before installing any hook,
+//    the module is pinned in the process address space via GET_MODULE_HANDLE_EX_FLAG_PIN.
+//    If pinning fails, all hook installations are aborted and the Failed event is signaled.
+// 2. DllMain never acquires g_lifecycleMutex, never closes shared handles, and
+//    never invokes logging routines under the Windows Loader Lock.
+// 3. HookWatcherThread and VRPacingHook_RefreshHooks share a single serialized state (g_state).
 struct LifecycleState {
     bool loggingInitialized = false;
     bool modulePinned = false;
