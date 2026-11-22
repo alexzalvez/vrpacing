@@ -32,7 +32,29 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/oculus)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi)
 
-set(NVAPI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64/nvapi64.lib")
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(VRPACING_IS_X86 TRUE)
+  set(NVAPI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/x86/nvapi.lib")
+  set(NVAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/x86")
+  set(NVAPI_LIB_NAME "nvapi")
+  set(MINHOOK_HDE_SRC "third_party/minhook/src/hde/hde32.c")
+  set(VRPACING_LAYER_TARGET_NAME "VRPacingLayer32")
+  set(VRPACING_HOOK_TARGET_NAME "VRPacingHook32")
+  set(VRPACING_LAYER_NAME "XR_APILAYER_ALEXZALVEZ_vrpacing_x86")
+  set(VRPACING_LAYER_DLL_NAME "./VRPacingLayer32.dll")
+  set(VRPACING_LAYER_JSON_NAME "VRPacingLayer32.json")
+else()
+  set(VRPACING_IS_X86 FALSE)
+  set(NVAPI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64/nvapi64.lib")
+  set(NVAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64")
+  set(NVAPI_LIB_NAME "nvapi64")
+  set(MINHOOK_HDE_SRC "third_party/minhook/src/hde/hde64.c")
+  set(VRPACING_LAYER_TARGET_NAME "VRPacingLayer")
+  set(VRPACING_HOOK_TARGET_NAME "VRPacingHook")
+  set(VRPACING_LAYER_NAME "XR_APILAYER_ALEXZALVEZ_vrpacing")
+  set(VRPACING_LAYER_DLL_NAME "./VRPacingLayer.dll")
+  set(VRPACING_LAYER_JSON_NAME "VRPacingLayer.json")
+endif()
 
 add_library(vrpacing_core STATIC
   src/core/mask_geometry.cpp
@@ -47,7 +69,7 @@ if(WIN32)
     third_party/minhook/src/buffer.c
     third_party/minhook/src/hook.c
     third_party/minhook/src/trampoline.c
-    third_party/minhook/src/hde/hde64.c
+    ${MINHOOK_HDE_SRC}
   )
   target_include_directories(minhook PUBLIC third_party/minhook/include third_party/minhook/src)
 
@@ -68,12 +90,12 @@ if(WIN32)
     src/gfx/vrs_foveated_d3d12.cpp
   )
   target_link_directories(VRPacingLayer PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi/amd64"
+    "${NVAPI_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvapi"
   )
-  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3d12 d3dcompiler dxgi minhook nvapi64 windowscodecs ole32)
+  target_link_libraries(VRPacingLayer PRIVATE vrpacing_core vrpacing_win_common d3d11 d3d12 d3dcompiler dxgi minhook ${NVAPI_LIB_NAME} windowscodecs ole32)
   target_compile_definitions(VRPacingLayer PRIVATE XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12)
-  set_target_properties(VRPacingLayer PROPERTIES OUTPUT_NAME "VRPacingLayer")
+  set_target_properties(VRPacingLayer PROPERTIES OUTPUT_NAME "${VRPACING_LAYER_TARGET_NAME}")
 
   add_library(VRPacingHook SHARED
     src/hook_dllmain.cpp
@@ -85,24 +107,32 @@ if(WIN32)
     src/gfx/vrs_foveated_d3d11.cpp
   )
   target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid windowscodecs ole32)
-  set_target_properties(VRPacingHook PROPERTIES OUTPUT_NAME "VRPacingHook")
+  set_target_properties(VRPacingHook PROPERTIES OUTPUT_NAME "${VRPACING_HOOK_TARGET_NAME}")
 
-  add_executable(VRPacingTray WIN32
-    src/tray/main.cpp
-    src/injector/process_scanner.cpp
-    src/common/config_json.cpp
-    src/common/logging_win.cpp
-  )
-  target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32 comctl32)
-  set_target_properties(VRPacingTray PROPERTIES OUTPUT_NAME "VRPacingTray")
+  if(VRPACING_IS_X86)
+    add_executable(VRPacingInjector32 WIN32
+      src/injector/injector32_main.cpp
+    )
+    target_link_libraries(VRPacingInjector32 PRIVATE kernel32 user32 shell32)
+    set_target_properties(VRPacingInjector32 PROPERTIES OUTPUT_NAME "VRPacingInjector32")
+  else()
+    add_executable(VRPacingTray WIN32
+      src/tray/main.cpp
+      src/injector/process_scanner.cpp
+      src/common/config_json.cpp
+      src/common/logging_win.cpp
+    )
+    target_link_libraries(VRPacingTray PRIVATE vrpacing_core user32 shell32 gdi32 advapi32 comctl32)
+    set_target_properties(VRPacingTray PROPERTIES OUTPUT_NAME "VRPacingTray")
 
-  if(MSVC)
-    set_target_properties(VRPacingTray PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
+    if(MSVC)
+      set_target_properties(VRPacingTray PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
+    endif()
   endif()
 
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/openxr/VRPacingLayer.json.in
-    ${CMAKE_CURRENT_BINARY_DIR}/VRPacingLayer.json
+    ${CMAKE_CURRENT_BINARY_DIR}/${VRPACING_LAYER_JSON_NAME}
     @ONLY
   )
 endif()

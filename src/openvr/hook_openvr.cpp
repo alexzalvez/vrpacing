@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -44,9 +44,10 @@ std::atomic<bool> g_openVrHandlingFrames{ false };
 
 namespace {
 
-using VRGetGenericInterfaceFn = void* (*)(const char*, int*);
+using VRGetGenericInterfaceFn = void* (__cdecl*)(const char*, int*);
 VRGetGenericInterfaceFn g_origGetGenericInterface = nullptr;
 
+#ifdef _WIN64
 using SubmitFn = vr::EVRCompositorError (*)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 using WaitGetPosesFn = vr::EVRCompositorError (*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
 
@@ -58,6 +59,19 @@ using FnTableGetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t* (__fastcall*)(vr:
 
 using GetProjectionRawFn = void (__fastcall*)(void*, vr::EVREye, float*, float*, float*, float*);
 using FnTableGetProjectionRawFn = void (__fastcall*)(vr::EVREye, float*, float*, float*, float*);
+#else
+using SubmitFn = vr::EVRCompositorError (__fastcall*)(void*, void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
+using WaitGetPosesFn = vr::EVRCompositorError (__fastcall*)(void*, void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
+
+using GetHiddenAreaMeshFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, void*, vr::HiddenAreaMesh_t*, vr::EVREye, vr::EHiddenAreaMeshType);
+using GetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t* (__fastcall*)(void*, void*, vr::HiddenAreaMesh_t*, vr::EVREye);
+
+using FnTableGetHiddenAreaMeshFn = vr::HiddenAreaMesh_t (__stdcall*)(vr::EVREye, vr::EHiddenAreaMeshType);
+using FnTableGetHiddenAreaMeshNoTypeFn = vr::HiddenAreaMesh_t (__stdcall*)(vr::EVREye);
+
+using GetProjectionRawFn = void (__fastcall*)(void*, void*, vr::EVREye, float*, float*, float*, float*);
+using FnTableGetProjectionRawFn = void (__stdcall*)(vr::EVREye, float*, float*, float*, float*);
+#endif
 
 struct VtableSlotRecord {
     uint32_t slot = 0;
@@ -130,6 +144,7 @@ struct OpenVROutputTexture {
 struct OpenVRContext {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
+    bool usingAuxDevice = false;
     OpenVROutputTexture sharedOutput;
 };
 
@@ -164,10 +179,18 @@ bool SehCallVtableGHAM(void* tramp, void* self, vr::HiddenAreaMesh_t* outMesh,
     __try {
         if (hasType) {
             auto fn = reinterpret_cast<GetHiddenAreaMeshFn>(tramp);
+#ifdef _WIN64
             *outRet = fn(self, outMesh, eye, type);
+#else
+            *outRet = fn(self, nullptr, outMesh, eye, type);
+#endif
         } else {
             auto fnNoType = reinterpret_cast<GetHiddenAreaMeshNoTypeFn>(tramp);
+#ifdef _WIN64
             *outRet = fnNoType(self, outMesh, eye);
+#else
+            *outRet = fnNoType(self, nullptr, outMesh, eye);
+#endif
         }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -180,6 +203,7 @@ bool SehCallFnTableGHAM(void* tramp, vr::HiddenAreaMesh_t* outMesh,
                         vr::EVREye eye, vr::EHiddenAreaMeshType type, bool hasType,
                         vr::HiddenAreaMesh_t** outRet, DWORD* outCode) noexcept {
     __try {
+#ifdef _WIN64
         if (hasType) {
             auto fn = reinterpret_cast<FnTableGetHiddenAreaMeshFn>(tramp);
             *outRet = fn(outMesh, eye, type);
@@ -187,6 +211,16 @@ bool SehCallFnTableGHAM(void* tramp, vr::HiddenAreaMesh_t* outMesh,
             auto fnNoType = reinterpret_cast<FnTableGetHiddenAreaMeshNoTypeFn>(tramp);
             *outRet = fnNoType(outMesh, eye);
         }
+#else
+        if (hasType) {
+            auto fn = reinterpret_cast<FnTableGetHiddenAreaMeshFn>(tramp);
+            *outMesh = fn(eye, type);
+        } else {
+            auto fnNoType = reinterpret_cast<FnTableGetHiddenAreaMeshNoTypeFn>(tramp);
+            *outMesh = fnNoType(eye);
+        }
+        *outRet = outMesh;
+#endif
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (outCode) *outCode = GetExceptionCode();
@@ -202,7 +236,11 @@ bool SehCallGetProjectionRaw(void* cppSelf, int32_t projRawSlot, void* fnTablePr
             void** vtbl = *reinterpret_cast<void***>(cppSelf);
             if (vtbl && vtbl[projRawSlot]) {
                 auto fn = reinterpret_cast<GetProjectionRawFn>(vtbl[projRawSlot]);
+#ifdef _WIN64
                 fn(cppSelf, eye, l, r, t, b);
+#else
+                fn(cppSelf, nullptr, eye, l, r, t, b);
+#endif
                 return true;
             }
         }
@@ -255,8 +293,14 @@ bool IsOriginalMeshEmpty(const vr::HiddenAreaMesh_t* mesh, vr::EHiddenAreaMeshTy
     return true;
 }
 
+#ifdef _WIN64
+constexpr const wchar_t* kVrpLayerDllName = L"VRPacingLayer.dll";
+#else
+constexpr const wchar_t* kVrpLayerDllName = L"VRPacingLayer32.dll";
+#endif
+
 bool IsOpenXrLayerHandlingD3D11() {
-    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    HMODULE hLayer = GetModuleHandleW(kVrpLayerDllName);
     if (hLayer) {
         using IsActiveFn = bool(__cdecl*)();
         auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
@@ -268,7 +312,7 @@ bool IsOpenXrLayerHandlingD3D11() {
 }
 
 bool IsOpenXrSessionActiveAnyApi() {
-    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    HMODULE hLayer = GetModuleHandleW(kVrpLayerDllName);
     if (hLayer) {
         using IsActiveFn = bool(__cdecl*)();
         auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveSession"));
@@ -641,10 +685,18 @@ vr::HiddenAreaMesh_t* HandleHiddenAreaMeshShared(
     return ret;
 }
 
+#ifdef _WIN64
 vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
                                                           vr::HiddenAreaMesh_t* ret,
                                                           vr::EVREye eye,
                                                           vr::EHiddenAreaMeshType type) {
+#else
+vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
+                                                          void* /*edx*/,
+                                                          vr::HiddenAreaMesh_t* ret,
+                                                          vr::EVREye eye,
+                                                          vr::EHiddenAreaMeshType type) {
+#endif
     VtableSlotRecord rec{};
     auto origFn = ResolveSlotTrampoline<GetHiddenAreaMeshFn>(g_hamReg, self, &rec);
     if (!origFn) {
@@ -676,6 +728,7 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_GetHiddenAreaMesh(void* self,
     return res;
 }
 
+#ifdef _WIN64
 vr::HiddenAreaMesh_t* __fastcall Hooked_FnTable_GetHiddenAreaMesh(vr::HiddenAreaMesh_t* ret,
                                                                   vr::EVREye eye,
                                                                   vr::EHiddenAreaMeshType type) {
@@ -709,12 +762,54 @@ vr::HiddenAreaMesh_t* __fastcall Hooked_FnTable_GetHiddenAreaMesh(vr::HiddenArea
     --g_hamReentrancyDepth;
     return res;
 }
+#else
+vr::HiddenAreaMesh_t __stdcall Hooked_FnTable_GetHiddenAreaMesh(vr::EVREye eye,
+                                                                vr::EHiddenAreaMeshType type) {
+    vr::HiddenAreaMesh_t localMesh{};
+    void* tramp = g_fnTableHamTrampoline;
+    if (!tramp) {
+        return localMesh;
+    }
 
+    const vr::EHiddenAreaMeshType effectiveType = g_fnTableHamHasType ? type : vr::k_eHiddenAreaMesh_Standard;
+
+    if (g_hamReentrancyDepth > 0) {
+        vr::HiddenAreaMesh_t* directRet = &localMesh;
+        DWORD dummyCode = 0;
+        SehCallFnTableGHAM(tramp, &localMesh, eye, effectiveType, g_fnTableHamHasType, &directRet, &dummyCode);
+        return directRet ? *directRet : localMesh;
+    }
+
+    ++g_hamReentrancyDepth;
+    auto callOrigSeh = [&](vr::HiddenAreaMesh_t* outPtr, vr::EHiddenAreaMeshType t,
+                           vr::HiddenAreaMesh_t** outRet, DWORD* outCode) -> bool {
+        return SehCallFnTableGHAM(tramp, outPtr, eye, t, g_fnTableHamHasType, outRet, outCode);
+    };
+
+    vr::HiddenAreaMesh_t* res = HandleHiddenAreaMeshShared(
+        g_fnTableAssociatedCppIface, g_fnTableProjRawSlot, g_fnTableProjRawFn,
+        &localMesh, eye, effectiveType, g_fnTableHamHasType, g_fnTableVersionStr, callOrigSeh);
+    --g_hamReentrancyDepth;
+    return res ? *res : localMesh;
+}
+#endif
+
+#ifdef _WIN64
 vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                          vr::TrackedDevicePose_t* pRenderPoseArray,
                                          uint32_t unRenderPoseArrayCount,
                                          vr::TrackedDevicePose_t* pGamePoseArray,
                                          uint32_t unGamePoseArrayCount) {
+#define CALL_ORIG_WAIT(fn, s, rp, rc, gp, gc) fn(s, rp, rc, gp, gc)
+#else
+vr::EVRCompositorError __fastcall HookedWaitGetPoses(void* self,
+                                                    void* /*edx*/,
+                                                    vr::TrackedDevicePose_t* pRenderPoseArray,
+                                                    uint32_t unRenderPoseArrayCount,
+                                                    vr::TrackedDevicePose_t* pGamePoseArray,
+                                                    uint32_t unGamePoseArrayCount) {
+#define CALL_ORIG_WAIT(fn, s, rp, rc, gp, gc) fn(s, nullptr, rp, rc, gp, gc)
+#endif
     WaitGetPosesFn origFn = ResolveSlotTrampoline<WaitGetPosesFn>(g_waitGetPosesReg, self);
     if (!origFn) {
         static std::atomic<bool> s_loggedMiss{ false };
@@ -726,12 +821,12 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     }
 
     if (IsOpenXrSessionActiveAnyApi()) {
-        return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+        return CALL_ORIG_WAIT(origFn, self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
 
     thread_local bool inWait = false;
     if (inWait) {
-        return origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+        return CALL_ORIG_WAIT(origFn, self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
     }
     inWait = true;
 
@@ -821,7 +916,8 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
                                  g_lastInW, g_lastInH, g_lastOutW, g_lastOutH,
                                  g_lastFormat, g_upscaleStatus, g_lastHResult);
 
-    vr::EVRCompositorError res = origFn(self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+    vr::EVRCompositorError res = CALL_ORIG_WAIT(origFn, self, pRenderPoseArray, unRenderPoseArrayCount, pGamePoseArray, unGamePoseArrayCount);
+#undef CALL_ORIG_WAIT
 
     LARGE_INTEGER afterWaitQpc{};
     QueryPerformanceCounter(&afterWaitQpc);
@@ -872,11 +968,87 @@ vr::EVRCompositorError HookedWaitGetPoses(void* self,
     return res;
 }
 
+bool EnsureAuxD3D11DeviceLocked() {
+    if (g_ovrCtx.device && g_ovrCtx.context) {
+        return true;
+    }
+    const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        levels, 2, D3D11_SDK_VERSION,
+        g_ovrCtx.device.GetAddressOf(), nullptr, g_ovrCtx.context.GetAddressOf());
+    if (FAILED(hr) || !g_ovrCtx.device || !g_ovrCtx.context) {
+        return false;
+    }
+    g_ovrCtx.usingAuxDevice = true;
+    if (!g_upscaler.IsInitialized()) {
+        if (!g_upscaler.Initialize(g_ovrCtx.device.Get())) {
+            g_upscaleStatus = -2;
+        }
+    }
+    LogMessage(LogLevel::Info, "OpenVR Hook: Initialized auxiliary D3D11 device for shared-handle/DX10 upscaling.");
+    return true;
+}
+
+bool TryResolveInputTextureD3D11(const vr::Texture_t* pTexture, ComPtr<ID3D11Texture2D>& outTex, bool& outForeignShared) {
+    outForeignShared = false;
+    if (!pTexture || !pTexture->handle) return false;
+
+    if (pTexture->eType == vr::TextureType_DirectX) {
+        __try {
+            auto* unk = reinterpret_cast<IUnknown*>(pTexture->handle);
+            if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(outTex.GetAddressOf()))) && outTex) {
+                return true;
+            }
+            ComPtr<IDXGIResource> dxgiRes;
+            if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(dxgiRes.GetAddressOf()))) && dxgiRes) {
+                HANDLE sharedHandle = nullptr;
+                if (SUCCEEDED(dxgiRes->GetSharedHandle(&sharedHandle)) && sharedHandle) {
+                    std::lock_guard<std::mutex> lock(g_gfxMutex);
+                    if (EnsureAuxD3D11DeviceLocked() &&
+                        SUCCEEDED(g_ovrCtx.device->OpenSharedResource(sharedHandle, IID_PPV_ARGS(outTex.GetAddressOf()))) &&
+                        outTex) {
+                        outForeignShared = true;
+                        return true;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            outTex.Reset();
+        }
+        return false;
+    }
+
+    if (pTexture->eType == vr::TextureType_DXGISharedHandle) {
+        std::lock_guard<std::mutex> lock(g_gfxMutex);
+        if (EnsureAuxD3D11DeviceLocked() &&
+            SUCCEEDED(g_ovrCtx.device->OpenSharedResource(static_cast<HANDLE>(pTexture->handle), IID_PPV_ARGS(outTex.GetAddressOf()))) &&
+            outTex) {
+            outForeignShared = true;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+#ifdef _WIN64
 vr::EVRCompositorError HookedSubmit(void* self,
                                     vr::EVREye eEye,
                                     const vr::Texture_t* pTexture,
                                     const vr::VRTextureBounds_t* pBounds,
                                     vr::EVRSubmitFlags nSubmitFlags) {
+#define CALL_ORIG_SUBMIT(fn, s, e, t, b, f) fn(s, e, t, b, f)
+#else
+vr::EVRCompositorError __fastcall HookedSubmit(void* self,
+                                               void* /*edx*/,
+                                               vr::EVREye eEye,
+                                               const vr::Texture_t* pTexture,
+                                               const vr::VRTextureBounds_t* pBounds,
+                                               vr::EVRSubmitFlags nSubmitFlags) {
+#define CALL_ORIG_SUBMIT(fn, s, e, t, b, f) fn(s, nullptr, e, t, b, f)
+#endif
     SubmitFn origFn = ResolveSlotTrampoline<SubmitFn>(g_submitReg, self);
     if (!origFn) {
         static std::atomic<bool> s_loggedMiss{ false };
@@ -888,19 +1060,26 @@ vr::EVRCompositorError HookedSubmit(void* self,
     }
 
     if (IsOpenXrSessionActiveAnyApi()) {
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     thread_local bool inSubmit = false;
-    if (inSubmit || !pTexture || !pTexture->handle || pTexture->eType != vr::TextureType_DirectX) {
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+    if (inSubmit || !pTexture || !pTexture->handle ||
+        (pTexture->eType != vr::TextureType_DirectX && pTexture->eType != vr::TextureType_DXGISharedHandle)) {
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
 
     inSubmit = true;
-    auto* inTex = reinterpret_cast<ID3D11Texture2D*>(pTexture->handle);
+    ComPtr<ID3D11Texture2D> inTexHolder;
+    bool isForeignShared = false;
+    if (!TryResolveInputTextureD3D11(pTexture, inTexHolder, isForeignShared) || !inTexHolder) {
+        inSubmit = false;
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+    }
+    ID3D11Texture2D* inTex = inTexHolder.Get();
 
     {
         std::lock_guard<std::mutex> lock(g_gfxMutex);
@@ -919,7 +1098,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (!g_ovrCtx.device || !g_ovrCtx.context) {
         inSubmit = false;
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     D3D11_TEXTURE2D_DESC inDesc{};
@@ -946,7 +1125,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     if (fullEyeW < 1000 || fullEyeH < 1000 || cropW < 600 || cropH < 600) {
         inSubmit = false;
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     static uint32_t s_prevFullEyeW = 0;
@@ -964,17 +1143,19 @@ vr::EVRCompositorError HookedSubmit(void* self,
     g_lastInH = cropH;
 
     CalculateOpenVRProjectionCenters();
-    VrsFoveatedD3D11::Instance().UpdateTarget(
-        g_ovrCtx.device.Get(),
-        g_ovrCtx.context.Get(),
-        g_cfg.ffr.enabled,
-        fullEyeW,
-        fullEyeH,
-        g_cfg.ffr.debugMode);
+    if (!g_ovrCtx.usingAuxDevice && !isForeignShared) {
+        VrsFoveatedD3D11::Instance().UpdateTarget(
+            g_ovrCtx.device.Get(),
+            g_ovrCtx.context.Get(),
+            g_cfg.ffr.enabled,
+            fullEyeW,
+            fullEyeH,
+            g_cfg.ffr.debugMode);
+    }
 
     if (!g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
         inSubmit = false;
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     const double s = g_cfg.upscaling.scale;
@@ -1032,7 +1213,7 @@ vr::EVRCompositorError HookedSubmit(void* self,
                 g_lastHResult = hr;
                 LogMessage(LogLevel::Error, "OpenVR Hook: Failed to allocate shared output texture. HR=" + std::to_string(hr));
                 inSubmit = false;
-                return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+                return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
             }
             sharedOut.width = maxOutW;
             sharedOut.height = maxOutH;
@@ -1060,7 +1241,11 @@ vr::EVRCompositorError HookedSubmit(void* self,
     if (!g_upscaler.Upscale(g_ovrCtx.context.Get(), inTex, sharedOut.texture.Get(), dispatch)) {
         g_upscaleStatus = -3;
         inSubmit = false;
-        return origFn(self, eEye, pTexture, pBounds, nSubmitFlags);
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+    }
+
+    if (g_ovrCtx.usingAuxDevice || isForeignShared) {
+        g_ovrCtx.context->Flush();
     }
 
     g_upscaleStatus = 1;
@@ -1076,13 +1261,17 @@ vr::EVRCompositorError HookedSubmit(void* self,
 
     auto* mutableTex = const_cast<vr::Texture_t*>(pTexture);
     void* origHandle = mutableTex->handle;
+    vr::ETextureType origType = mutableTex->eType;
     mutableTex->handle = sharedOut.texture.Get();
+    mutableTex->eType = vr::TextureType_DirectX;
     const uint32_t clearFlags = static_cast<uint32_t>(nSubmitFlags) & ~static_cast<uint32_t>(vr::Submit_GlRenderBuffer);
-    vr::EVRCompositorError res = origFn(self, eEye, mutableTex, &outBounds, static_cast<vr::EVRSubmitFlags>(clearFlags));
+    vr::EVRCompositorError res = CALL_ORIG_SUBMIT(origFn, self, eEye, mutableTex, &outBounds, static_cast<vr::EVRSubmitFlags>(clearFlags));
     mutableTex->handle = origHandle;
+    mutableTex->eType = origType;
 
     inSubmit = false;
     return res;
+#undef CALL_ORIG_SUBMIT
 }
 
 void LogUnsupportedOnce(const char* cleanName) {

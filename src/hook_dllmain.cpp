@@ -129,9 +129,15 @@ void AdvanceHookLifecycleLocked() {
     }
 
     const bool hasOpenVrMod = (GetModuleHandleW(L"openvr_api.dll") != nullptr);
+#ifdef _WIN64
     const bool hasOculusMod = (GetModuleHandleW(L"LibOVRRT64_1.dll") != nullptr ||
                                GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") != nullptr ||
                                GetModuleHandleW(L"LibPVRRT64_1_X.dll") != nullptr);
+#else
+    const bool hasOculusMod = (GetModuleHandleW(L"LibOVRRT32_1.dll") != nullptr ||
+                               GetModuleHandleW(L"VirtualDesktop.LibOVRRT32_1.dll") != nullptr ||
+                               GetModuleHandleW(L"LibPVRRT32_1_X.dll") != nullptr);
+#endif
 
     if (!hasOpenVrMod && !hasOculusMod) {
         return;

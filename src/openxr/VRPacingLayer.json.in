@@ -1,8 +1,8 @@
 {
   "file_format_version": "1.0.0",
   "api_layer": {
-    "name": "XR_APILAYER_ALEXZALVEZ_vrpacing",
-    "library_path": "./VRPacingLayer.dll",
+    "name": "@VRPACING_LAYER_NAME@",
+    "library_path": "@VRPACING_LAYER_DLL_NAME@",
     "api_version": "1.0",
     "implementation_version": "1",
     "description": "VRPacing OpenXR implicit layer (pacing + NIS + visibility mask)",

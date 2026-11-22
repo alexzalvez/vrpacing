@@ -4,9 +4,11 @@
 #include <iostream>
 #include <string>
 
+#include <cstddef>
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
 #include "vrpacing/mask_geometry.h"
+#include "vrpacing/shared_state.h"
 
 namespace {
 
@@ -86,6 +88,11 @@ void TestHzTracker() {
     Check(target > 88.0 && target < 91.0, "hz_tracker: target derivado");
 }
 
+void TestSharedStateAbi() {
+    Check(sizeof(vrpacing::SharedState) == 1944, "shared_state: tamano fijo 1944 bytes en x86/x64");
+    Check(offsetof(vrpacing::SharedState, avgFps) == 336, "shared_state: offset exacto de avgFps");
+}
+
 } // namespace
 
 int main() {
@@ -93,6 +100,7 @@ int main() {
         TestMaskGeometry();
         TestLimiterMath();
         TestHzTracker();
+        TestSharedStateAbi();
     } catch (const std::exception& e) {
         std::cout << "[EXCEPTION] " << e.what() << "\n";
         return 1;

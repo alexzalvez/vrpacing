@@ -176,11 +176,17 @@ bool IsCurrentProcessVrsAutoExcluded() {
     return false;
 }
 
+#ifdef _WIN64
+constexpr const wchar_t* kVrpHookDllName = L"VRPacingHook.dll";
+#else
+constexpr const wchar_t* kVrpHookDllName = L"VRPacingHook32.dll";
+#endif
+
 bool IsOpenCompositeActive() {
     if (GetModuleHandleW(L"openvr_api.dll") == nullptr) {
         return false;
     }
-    HMODULE hHook = GetModuleHandleW(L"VRPacingHook.dll");
+    HMODULE hHook = GetModuleHandleW(kVrpHookDllName);
     if (!hHook) {
         return false;
     }
@@ -207,7 +213,7 @@ void EnsureHookDllLoadedForVdxrBridge() {
         dir.resize(pos);
     }
 
-    const std::wstring hookPath = dir + L"\\VRPacingHook.dll";
+    const std::wstring hookPath = dir + L"\\" + kVrpHookDllName;
     HMODULE hHook = LoadLibraryW(hookPath.c_str());
     if (hHook) {
         using RefreshFn = void(__cdecl*)();
@@ -634,7 +640,15 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
                                         (createInfo->width <= (g_nativeViewW * 6 / 5));
         const bool widthMatchesSbs = (createInfo->width >= (g_nativeViewW * 8 / 5)) &&
                                      (createInfo->width <= (g_nativeViewW * 12 / 5));
-        isEyeResolution = heightMatches && (widthMatchesSingle || widthMatchesSbs);
+        const float nativeAspect = static_cast<float>(g_nativeViewW) / static_cast<float>(g_nativeViewH);
+        const float swapAspect = (createInfo->height > 0)
+            ? (static_cast<float>(createInfo->width) / static_cast<float>(createInfo->height))
+            : 0.0f;
+        const bool aspectMatchesSingle = (std::abs(swapAspect - nativeAspect) <= 0.04f);
+        const bool aspectMatchesSbs = (std::abs(swapAspect - (nativeAspect * 2.0f)) <= 0.08f);
+        isEyeResolution = heightMatches &&
+                          ((widthMatchesSingle && aspectMatchesSingle) ||
+                           (widthMatchesSbs && aspectMatchesSbs));
     } else {
         isEyeResolution = (createInfo->width >= 1400 && createInfo->height >= 1400);
     }
@@ -1109,9 +1123,15 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
         if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
             const uint32_t frames = g_vdxrWarmupFrames.fetch_add(1, std::memory_order_relaxed) + 1;
             if (frames >= 60) {
+#ifdef _WIN64
                 if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") ||
                     GetModuleHandleW(L"LibOVRRT64_1.dll") ||
                     GetModuleHandleW(L"LibPVRRT64_1_X.dll")) {
+#else
+                if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT32_1.dll") ||
+                    GetModuleHandleW(L"LibOVRRT32_1.dll") ||
+                    GetModuleHandleW(L"LibPVRRT32_1_X.dll")) {
+#endif
                     g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
                     g_openXrSessionActive.store(true, std::memory_order_relaxed);
                     g_vdxrBridgeActive.store(true, std::memory_order_relaxed);

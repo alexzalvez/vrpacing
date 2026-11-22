@@ -188,8 +188,7 @@ void OpenScreenshotsFolder() {
     ShellExecuteW(nullptr, L"open", g_screenshotsDir.c_str(), nullptr, nullptr, SW_SHOW);
 }
 
-void RegisterOpenXrImplicitLayer() {
-    const std::wstring jsonPath = ExeDir() + L"\\VRPacingLayer.json";
+void RegisterImplicitLayerView(const std::wstring& jsonPath, REGSAM wowFlag, const char* label) {
     if (!std::filesystem::exists(jsonPath)) {
         return;
     }
@@ -198,44 +197,53 @@ void RegisterOpenXrImplicitLayer() {
     DWORD val = 0;
 
     HKEY hKeyLm = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyLm, nullptr) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, nullptr, 0, KEY_SET_VALUE | wowFlag, nullptr, &hKeyLm, nullptr) == ERROR_SUCCESS) {
         RegSetValueExW(hKeyLm, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKeyLm);
 
         HKEY hKeyCu = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hKeyCu) == ERROR_SUCCESS) {
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE | wowFlag, &hKeyCu) == ERROR_SUCCESS) {
             RegDeleteValueW(hKeyCu, jsonPath.c_str());
             RegCloseKey(hKeyCu);
         }
-        vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registered in HKLM (single-instance mode).");
+        vrpacing::LogMessage(vrpacing::LogLevel::Info, std::string("OpenXR implicit layer registered in HKLM (") + label + ").");
         return;
     }
 
     HKEY hKeyCu = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKeyCu, nullptr) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr, 0, KEY_SET_VALUE | wowFlag, nullptr, &hKeyCu, nullptr) == ERROR_SUCCESS) {
         RegSetValueExW(hKeyCu, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKeyCu);
-        vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer registered in HKCU.");
+        vrpacing::LogMessage(vrpacing::LogLevel::Info, std::string("OpenXR implicit layer registered in HKCU (") + label + ").");
     }
 }
 
-void UnregisterOpenXrImplicitLayer() {
-    const std::wstring jsonPath = ExeDir() + L"\\VRPacingLayer.json";
+void UnregisterImplicitLayerView(const std::wstring& jsonPath, REGSAM wowFlag, const char* label) {
     const wchar_t* subKey = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
     DWORD val = 1;
 
     HKEY hKeyCu = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hKeyCu) == ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE | wowFlag, &hKeyCu) == ERROR_SUCCESS) {
         RegDeleteValueW(hKeyCu, jsonPath.c_str());
         RegCloseKey(hKeyCu);
     }
 
     HKEY hKeyLm = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, KEY_SET_VALUE, &hKeyLm) == ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, KEY_SET_VALUE | wowFlag, &hKeyLm) == ERROR_SUCCESS) {
         RegSetValueExW(hKeyLm, jsonPath.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
         RegCloseKey(hKeyLm);
-        vrpacing::LogMessage(vrpacing::LogLevel::Info, "OpenXR implicit layer disabled in HKLM (application closed).");
+        vrpacing::LogMessage(vrpacing::LogLevel::Info, std::string("OpenXR implicit layer disabled in HKLM (") + label + ").");
     }
+}
+
+void RegisterOpenXrImplicitLayer() {
+    RegisterImplicitLayerView(ExeDir() + L"\\VRPacingLayer.json", KEY_WOW64_64KEY, "single-instance mode");
+    RegisterImplicitLayerView(ExeDir() + L"\\VRPacingLayer32.json", KEY_WOW64_32KEY, "32-bit WoW64");
+}
+
+void UnregisterOpenXrImplicitLayer() {
+    UnregisterImplicitLayerView(ExeDir() + L"\\VRPacingLayer.json", KEY_WOW64_64KEY, "application closed");
+    UnregisterImplicitLayerView(ExeDir() + L"\\VRPacingLayer32.json", KEY_WOW64_32KEY, "32-bit WoW64 closed");
 }
 
 void UpdateSharedStateFlags() {

@@ -1,4 +1,4 @@
-﻿name: build
+name: build
 
 on:
   push:
@@ -7,14 +7,14 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build:
+  build-x64:
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSVC developer prompt
+      - name: Setup MSVC developer prompt (x64)
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Compile NIS and SMAA Compute Shaders
@@ -24,35 +24,97 @@ jobs:
           fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_edge.h /Vn g_SmaaEdgeShader src/smaa/smaa_edge_detection.hlsl
           fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_blend.h /Vn g_SmaaBlendShader src/smaa/smaa_blend_weight.hlsl
           fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_neighbor.h /Vn g_SmaaNeighborShader src/smaa/smaa_neighborhood_blend.hlsl
-          Write-Host "Compute Shaders NIS y SMAA compilados exitosamente"
 
-      - name: Configure
+      - name: Configure (x64)
         run: cmake --preset windows-release -DVRPACING_BUILD_TESTS=ON
 
-      - name: Build
+      - name: Build (x64)
         run: cmake --build --preset windows-release --config Release
 
-      - name: Test
+      - name: Test (x64)
         run: ctest --preset windows-release --output-on-failure -C Release
 
-      - name: Stage artifact
+      - name: Stage x64 binaries
         shell: pwsh
         run: |
-          $out = "dist/VRPacing"
+          $out = "dist/x64"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          $required = @("VRPacingLayer.dll", "VRPacingHook.dll", "VRPacingTray.exe")
-          foreach ($file in $required) {
+          foreach ($file in @("VRPacingLayer.dll", "VRPacingHook.dll", "VRPacingTray.exe", "VRPacingLayer.json")) {
               $found = Get-ChildItem -Path "build/windows-release" -Filter $file -Recurse | Select-Object -First 1
-              if (-not $found) {
-                  throw "Error critico: no se encontro el binario compilado $file en build/windows-release"
-              }
+              if (-not $found) { throw "No se encontro $file en build/windows-release" }
               Copy-Item $found.FullName -Destination $out
           }
 
-          $json = Get-ChildItem -Path "build/windows-release" -Filter "VRPacingLayer.json" -Recurse | Select-Object -First 1
-          if ($json) { Copy-Item $json.FullName -Destination $out }
+      - name: Upload x64 partial artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VRPacing-part-x64
+          path: dist/x64/
 
-      - name: Upload artifact
+  build-x86:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC developer prompt (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile NIS and SMAA Compute Shaders
+        shell: pwsh
+        run: |
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I third_party/nis /Fh src/gfx/shader_nis_upscale.h /Vn g_NISUpscaleShader third_party/nis/NIS_Upscale.hlsl
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_edge.h /Vn g_SmaaEdgeShader src/smaa/smaa_edge_detection.hlsl
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_blend.h /Vn g_SmaaBlendShader src/smaa/smaa_blend_weight.hlsl
+          fxc.exe /nologo /T cs_5_0 /E main /O3 /I src/smaa /Fh src/gfx/shader_smaa_neighbor.h /Vn g_SmaaNeighborShader src/smaa/smaa_neighborhood_blend.hlsl
+
+      - name: Configure (x86)
+        run: cmake -B build/windows-release-x86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DVRPACING_BUILD_TESTS=ON
+
+      - name: Build (x86)
+        run: cmake --build build/windows-release-x86 --config Release
+
+      - name: Test (x86)
+        run: ctest --test-dir build/windows-release-x86 --output-on-failure -C Release
+
+      - name: Stage x86 binaries
+        shell: pwsh
+        run: |
+          $out = "dist/x86"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($file in @("VRPacingLayer32.dll", "VRPacingHook32.dll", "VRPacingInjector32.exe", "VRPacingLayer32.json")) {
+              $found = Get-ChildItem -Path "build/windows-release-x86" -Filter $file -Recurse | Select-Object -First 1
+              if (-not $found) { throw "No se encontro $file en build/windows-release-x86" }
+              Copy-Item $found.FullName -Destination $out
+          }
+
+      - name: Upload x86 partial artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VRPacing-part-x86
+          path: dist/x86/
+
+  package:
+    needs: [build-x64, build-x86]
+    runs-on: windows-latest
+
+    steps:
+      - name: Download x64 binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: VRPacing-part-x64
+          path: dist/VRPacing
+
+      - name: Download x86 binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: VRPacing-part-x86
+          path: dist/VRPacing
+
+      - name: Upload combined artifact
         uses: actions/upload-artifact@v4
         with:
           name: VRPacing-windows-x64

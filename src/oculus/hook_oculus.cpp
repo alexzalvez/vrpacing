@@ -129,8 +129,14 @@ struct OculusSessionContext {
 
 std::unique_ptr<OculusSessionContext> g_oculusCtx;
 
+#ifdef _WIN64
+constexpr const wchar_t* kVrpLayerDllName = L"VRPacingLayer.dll";
+#else
+constexpr const wchar_t* kVrpLayerDllName = L"VRPacingLayer32.dll";
+#endif
+
 bool IsOpenXrLayerHandlingD3D11() {
-    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    HMODULE hLayer = GetModuleHandleW(kVrpLayerDllName);
     if (hLayer) {
         using IsActiveFn = bool(__cdecl*)();
         auto fn = reinterpret_cast<IsActiveFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveD3D11"));
@@ -142,7 +148,7 @@ bool IsOpenXrLayerHandlingD3D11() {
 }
 
 bool IsOpenXrLayerSessionActive() {
-    HMODULE hLayer = GetModuleHandleW(L"VRPacingLayer.dll");
+    HMODULE hLayer = GetModuleHandleW(kVrpLayerDllName);
     if (hLayer) {
         using IsSessionFn = bool(__cdecl*)();
         auto fn = reinterpret_cast<IsSessionFn>(GetProcAddress(hLayer, "VRPacingLayer_IsActiveSession"));
@@ -854,9 +860,15 @@ ovrResult __cdecl Hooked_ovrEndFrame(ovrSession session,
 bool InstallOculusHooks() {
     HMODULE mod = nullptr;
     const wchar_t* dllNames[] = {
+#ifdef _WIN64
         L"LibOVRRT64_1.dll",
         L"VirtualDesktop.LibOVRRT64_1.dll",
         L"LibPVRRT64_1_X.dll"
+#else
+        L"LibOVRRT32_1.dll",
+        L"VirtualDesktop.LibOVRRT32_1.dll",
+        L"LibPVRRT32_1_X.dll"
+#endif
     };
 
     for (const auto* name : dllNames) {

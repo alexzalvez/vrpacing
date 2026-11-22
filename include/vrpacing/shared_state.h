@@ -17,7 +17,7 @@ constexpr uint32_t kFlagMaskEnabled = 1 << 5;
 constexpr uint32_t kFlagFfrOpenXrEnabled = 1 << 6;
 constexpr uint32_t kFlagSmaaEnabled = 1 << 7;
 
-constexpr uint32_t kSharedStateVersion = 9;
+constexpr uint32_t kSharedStateVersion = 10;
 
 struct SharedState {
     uint32_t version;
@@ -41,6 +41,7 @@ struct SharedState {
 
     int32_t upscaleStatus;
     int32_t lastHResult;
+    uint32_t reservedPad;
 
     double avgFps;
     double onePercentLowFps;
@@ -59,6 +60,9 @@ struct SharedState {
     uint32_t screenshotSavedCount;
     int32_t smaaStatus;
     wchar_t screenshotDir[260];
+    uint32_t reservedTailPad;
 };
+
+static_assert(sizeof(SharedState) == 1944, "SharedState size must match across x86 and x64");
 
 } // namespace vrpacing

@@ -280,11 +280,27 @@ bool IsSystemWindowsProcess(HANDLE hProc) {
             lower.find(L"\\windows defender\\") != std::wstring::npos);
 }
 
+bool IsProcess32BitWow64(HANDLE hProc) {
+    BOOL isWow64 = FALSE;
+    if (IsWow64Process(hProc, &isWow64) && isWow64) {
+        return true;
+    }
+    return false;
+}
+
+std::wstring ResolveSiblingFile(const std::wstring& refPath, const wchar_t* fileName) {
+    const auto pos = refPath.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        return std::wstring(fileName);
+    }
+    return refPath.substr(0, pos + 1) + fileName;
+}
+
 bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
     alreadyHooked = false;
     HMODULE hMods[1024];
     DWORD cbNeeded = 0;
-    if (!EnumProcessModulesEx(hProc, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_64BIT)) {
+    if (!EnumProcessModulesEx(hProc, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL)) {
         if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
             return false;
         }
@@ -297,14 +313,19 @@ bool HasVrRuntimeModuleLoaded(HANDLE hProc, bool& alreadyHooked) {
     for (DWORD i = 0; i < count; ++i) {
         if (GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH)) {
             if (_wcsicmp(modName, L"VRPacingHook.dll") == 0 ||
-                _wcsicmp(modName, L"VRPacingLayer.dll") == 0) {
+                _wcsicmp(modName, L"VRPacingLayer.dll") == 0 ||
+                _wcsicmp(modName, L"VRPacingHook32.dll") == 0 ||
+                _wcsicmp(modName, L"VRPacingLayer32.dll") == 0) {
                 alreadyHooked = true;
                 return false;
             }
             if (_wcsicmp(modName, L"openvr_api.dll") == 0 ||
                 _wcsicmp(modName, L"LibOVRRT64_1.dll") == 0 ||
                 _wcsicmp(modName, L"VirtualDesktop.LibOVRRT64_1.dll") == 0 ||
-                _wcsicmp(modName, L"LibPVRRT64_1_X.dll") == 0) {
+                _wcsicmp(modName, L"LibPVRRT64_1_X.dll") == 0 ||
+                _wcsicmp(modName, L"LibOVRRT32_1.dll") == 0 ||
+                _wcsicmp(modName, L"VirtualDesktop.LibOVRRT32_1.dll") == 0 ||
+                _wcsicmp(modName, L"LibPVRRT32_1_X.dll") == 0) {
                 foundVrMod = true;
             }
         }
@@ -426,11 +447,6 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
         return false;
     }
 
-    if (!std::filesystem::exists(dllPath)) {
-        LogMessage(LogLevel::Error, "ProcessScanner: Hook DLL not found on disk.");
-        return false;
-    }
-
     const std::string exeName = WideToNarrow(exeNameW);
 
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
@@ -446,30 +462,65 @@ bool StartOrCompleteInjectionByPid(DWORD pid, const wchar_t* exeNameW, const std
         return false;
     }
 
-    const size_t pathBytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    void* remoteMem = VirtualAllocEx(hProc, nullptr, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteMem) {
+    const bool is32Bit = IsProcess32BitWow64(hProc);
+    const std::wstring targetDllPath = is32Bit ? ResolveSiblingFile(dllPath, L"VRPacingHook32.dll") : dllPath;
+    if (!std::filesystem::exists(targetDllPath)) {
+        LogMessage(LogLevel::Error, "ProcessScanner: Hook DLL not found on disk for " +
+                   exeName + (is32Bit ? " (expected VRPacingHook32.dll)." : " (expected VRPacingHook.dll)."));
         CloseHandle(hProc);
         return false;
     }
 
-    if (!WriteProcessMemory(hProc, remoteMem, dllPath.c_str(), pathBytes, nullptr)) {
-        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        return false;
-    }
+    HANDLE hThread = nullptr;
+    void* remoteMem = nullptr;
 
-    LPTHREAD_START_ROUTINE loadLibAddr = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
+    if (is32Bit) {
+        const std::wstring inj32Path = ResolveSiblingFile(dllPath, L"VRPacingInjector32.exe");
+        if (!std::filesystem::exists(inj32Path)) {
+            LogMessage(LogLevel::Error, "ProcessScanner: VRPacingInjector32.exe not found on disk for 32-bit target " + exeName + ".");
+            CloseHandle(hProc);
+            return false;
+        }
+        std::wstring cmdLine = L"\"" + inj32Path + L"\" " + std::to_wstring(pid) + L" \"" + targetDllPath + L"\"";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(inj32Path.c_str(), cmdLine.data(), nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            const DWORD err = GetLastError();
+            LogMessage(LogLevel::Error, "ProcessScanner: Failed to launch VRPacingInjector32.exe for " +
+                       exeName + " [PID " + std::to_string(pid) + "] (GLE=" + std::to_string(err) + ").");
+            CloseHandle(hProc);
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        hThread = pi.hProcess;
+    } else {
+        const size_t pathBytes = (targetDllPath.size() + 1) * sizeof(wchar_t);
+        remoteMem = VirtualAllocEx(hProc, nullptr, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!remoteMem) {
+            CloseHandle(hProc);
+            return false;
+        }
 
-    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, loadLibAddr, remoteMem, 0, nullptr);
-    if (!hThread) {
-        const DWORD err = GetLastError();
-        LogMessage(LogLevel::Error, "ProcessScanner: CreateRemoteThread failed for " +
-                   exeName + " [PID " + std::to_string(pid) + "] (GLE=" + std::to_string(err) + ").");
-        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        return false;
+        if (!WriteProcessMemory(hProc, remoteMem, targetDllPath.c_str(), pathBytes, nullptr)) {
+            VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+            CloseHandle(hProc);
+            return false;
+        }
+
+        LPTHREAD_START_ROUTINE loadLibAddr = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
+
+        hThread = CreateRemoteThread(hProc, nullptr, 0, loadLibAddr, remoteMem, 0, nullptr);
+        if (!hThread) {
+            const DWORD err = GetLastError();
+            LogMessage(LogLevel::Error, "ProcessScanner: CreateRemoteThread failed for " +
+                       exeName + " [PID " + std::to_string(pid) + "] (GLE=" + std::to_string(err) + ").");
+            VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+            CloseHandle(hProc);
+            return false;
+        }
     }
 
     PendingInjection entry{};
