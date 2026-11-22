@@ -990,31 +990,54 @@ bool EnsureAuxD3D11DeviceLocked() {
     return true;
 }
 
+bool SehQueryId3d11Texture(void* handle, ID3D11Texture2D** outRawTex) noexcept {
+    *outRawTex = nullptr;
+    __try {
+        auto* unk = reinterpret_cast<IUnknown*>(handle);
+        return SUCCEEDED(unk->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(outRawTex))) &&
+               (*outRawTex != nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outRawTex = nullptr;
+        return false;
+    }
+}
+
+bool SehQueryDxgiSharedHandle(void* handle, HANDLE* outSharedHandle) noexcept {
+    *outSharedHandle = nullptr;
+    IDXGIResource* dxgiRes = nullptr;
+    __try {
+        auto* unk = reinterpret_cast<IUnknown*>(handle);
+        if (FAILED(unk->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void**>(&dxgiRes))) || !dxgiRes) {
+            return false;
+        }
+        const HRESULT hr = dxgiRes->GetSharedHandle(outSharedHandle);
+        dxgiRes->Release();
+        return SUCCEEDED(hr) && (*outSharedHandle != nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outSharedHandle = nullptr;
+        return false;
+    }
+}
+
 bool TryResolveInputTextureD3D11(const vr::Texture_t* pTexture, ComPtr<ID3D11Texture2D>& outTex, bool& outForeignShared) {
     outForeignShared = false;
     if (!pTexture || !pTexture->handle) return false;
 
     if (pTexture->eType == vr::TextureType_DirectX) {
-        __try {
-            auto* unk = reinterpret_cast<IUnknown*>(pTexture->handle);
-            if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(outTex.GetAddressOf()))) && outTex) {
+        ID3D11Texture2D* rawTex = nullptr;
+        if (SehQueryId3d11Texture(pTexture->handle, &rawTex) && rawTex) {
+            outTex.Attach(rawTex);
+            return true;
+        }
+        HANDLE sharedHandle = nullptr;
+        if (SehQueryDxgiSharedHandle(pTexture->handle, &sharedHandle) && sharedHandle) {
+            std::lock_guard<std::mutex> lock(g_gfxMutex);
+            if (EnsureAuxD3D11DeviceLocked() &&
+                SUCCEEDED(g_ovrCtx.device->OpenSharedResource(sharedHandle, IID_PPV_ARGS(outTex.GetAddressOf()))) &&
+                outTex) {
+                outForeignShared = true;
                 return true;
             }
-            ComPtr<IDXGIResource> dxgiRes;
-            if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(dxgiRes.GetAddressOf()))) && dxgiRes) {
-                HANDLE sharedHandle = nullptr;
-                if (SUCCEEDED(dxgiRes->GetSharedHandle(&sharedHandle)) && sharedHandle) {
-                    std::lock_guard<std::mutex> lock(g_gfxMutex);
-                    if (EnsureAuxD3D11DeviceLocked() &&
-                        SUCCEEDED(g_ovrCtx.device->OpenSharedResource(sharedHandle, IID_PPV_ARGS(outTex.GetAddressOf()))) &&
-                        outTex) {
-                        outForeignShared = true;
-                        return true;
-                    }
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            outTex.Reset();
         }
         return false;
     }
