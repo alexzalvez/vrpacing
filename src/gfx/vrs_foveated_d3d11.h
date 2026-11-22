@@ -103,13 +103,13 @@ private:
 
     struct RtHistogramKeyHash {
         size_t operator()(const RtHistogramKey& k) const {
-            size_t h = 14695981039346656037ULL;
+            uint64_t h = 14695981039346656037ULL;
             auto mix = [&h](uint32_t v) {
                 h ^= v;
                 h *= 1099511628211ULL;
             };
             mix(k.w); mix(k.h); mix(k.fmt); mix(k.ms); mix(k.arr);
-            return h;
+            return static_cast<size_t>(h ^ (h >> 32));
         }
     };
 

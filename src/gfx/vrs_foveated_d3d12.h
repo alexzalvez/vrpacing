@@ -101,10 +101,10 @@ private:
 
     struct HistKey12Hash {
         size_t operator()(const HistKey12& k) const {
-            size_t h = 14695981039346656037ULL;
+            uint64_t h = 14695981039346656037ULL;
             auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
             mix(k.w); mix(k.h); mix(k.fRt); mix(k.fView); mix(k.ms); mix(k.dsv); mix(k.sc);
-            return h;
+            return static_cast<size_t>(h ^ (h >> 32));
         }
     };
 
