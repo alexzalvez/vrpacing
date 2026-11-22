@@ -1364,6 +1364,10 @@ extern "C" __declspec(dllexport) bool __cdecl VRPacingLayer_IsActiveSession() {
     return vrpacing::g_openXrSessionActive.load(std::memory_order_relaxed);
 }
 
+#if defined(_MSC_VER) && !defined(_WIN64)
+#pragma comment(linker, "/EXPORT:xrNegotiateLoaderApiLayerInterface=_xrNegotiateLoaderApiLayerInterface@12")
+#endif
+
 extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(
     const XrNegotiateLoaderInfo* loaderInfo,
     const char* layerName,
