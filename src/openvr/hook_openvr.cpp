@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <wrl/client.h>
 
 #include <openvr.h>
@@ -30,6 +31,7 @@
 #include "common/shared_memory_win.h"
 #include "common/visibility_mask.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/d3d12_upscaler_bridge.h"
 #include "gfx/vrs_foveated_d3d11.h"
 #include "vrpacing/frame_limiter_math.h"
 #include "vrpacing/hz_tracker.h"
@@ -148,7 +150,18 @@ struct OpenVRContext {
     OpenVROutputTexture sharedOutput;
 };
 
+struct OpenVRD3D12Context {
+    D3D12UpscalerBridge bridge;
+    std::unordered_map<ID3D12Resource*, ComPtr<ID3D11Texture2D>> wrappedInputs;
+    ComPtr<ID3D12Resource> sharedOut12;
+    ComPtr<ID3D11Texture2D> sharedOutWrapped;
+    uint32_t outW = 0;
+    uint32_t outH = 0;
+    DXGI_FORMAT outFmt = DXGI_FORMAT_UNKNOWN;
+};
+
 OpenVRContext g_ovrCtx;
+OpenVRD3D12Context g_ovrD3D12Ctx;
 
 struct StaticHamCache {
     bool built[2][3]{};
@@ -1094,6 +1107,176 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
 
     g_openVrApiUsed.store(true, std::memory_order_relaxed);
 
+    if (pTexture->eType == vr::TextureType_DirectX12) {
+        EnsureInit();
+        g_shm.SyncConfig(g_cfg);
+        g_submitFrameCounter.fetch_add(1, std::memory_order_relaxed);
+        g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
+
+        const auto* d12Data = reinterpret_cast<const vr::D3D12TextureData_t*>(pTexture->handle);
+        if (!d12Data || !d12Data->m_pResource || !d12Data->m_pCommandQueue ||
+            !g_cfg.upscaling.enabled || (g_cfg.upscaling.scale <= 1.0f)) {
+            return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+        }
+
+        inSubmit = true;
+        ComPtr<ID3D12Device> dev12;
+        if (FAILED(d12Data->m_pResource->GetDevice(IID_PPV_ARGS(dev12.GetAddressOf()))) || !dev12) {
+            inSubmit = false;
+            return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+        }
+
+        D3D12_RESOURCE_DESC inDesc12 = d12Data->m_pResource->GetDesc();
+        const uint32_t texW = static_cast<uint32_t>(inDesc12.Width);
+        const uint32_t texH = inDesc12.Height;
+
+        static const vr::VRTextureBounds_t defaultBounds12{ 0.0f, 0.0f, 1.0f, 1.0f };
+        const vr::VRTextureBounds_t* b = pBounds ? pBounds : &defaultBounds12;
+        const bool isFlippedX = (b->uMin > b->uMax);
+        const bool isFlippedY = (b->vMin > b->vMax);
+        const float uMin = (std::min)(b->uMin, b->uMax);
+        const float uMax = (std::max)(b->uMin, b->uMax);
+        const float vMin = (std::min)(b->vMin, b->vMax);
+        const float vMax = (std::max)(b->vMin, b->vMax);
+
+        const uint32_t cropX = static_cast<uint32_t>(std::lround(uMin * texW));
+        const uint32_t cropY = static_cast<uint32_t>(std::lround(vMin * texH));
+        const uint32_t cropW = static_cast<uint32_t>(std::lround((uMax - uMin) * texW));
+        const uint32_t cropH = static_cast<uint32_t>(std::lround((vMax - vMin) * texH));
+        const bool isSideBySide = (inDesc12.DepthOrArraySize == 1) && ((uMax - uMin) <= 0.60f) && (texW >= (texH * 4 / 3));
+        const uint32_t fullEyeW = isSideBySide ? (texW / 2) : texW;
+        const uint32_t fullEyeH = texH;
+
+        if (fullEyeW < 1000 || fullEyeH < 1000 || cropW < 600 || cropH < 600) {
+            inSubmit = false;
+            return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+        }
+
+        g_lastFormat = static_cast<uint32_t>(inDesc12.Format);
+        g_lastInW = cropW;
+        g_lastInH = cropH;
+        CalculateOpenVRProjectionCenters();
+
+        const double s = g_cfg.upscaling.scale;
+        uint32_t maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(fullEyeW * s)));
+        uint32_t maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(fullEyeH * s)));
+        const uint64_t maxPx = static_cast<uint64_t>(maxOutW) * static_cast<uint64_t>(maxOutH);
+        if (maxPx > g_cfg.upscaling.maxOutputPixels) {
+            const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(maxPx));
+            maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutW * factor)));
+            maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutH * factor)));
+        }
+
+        const uint32_t outW = (std::min)(maxOutW, static_cast<uint32_t>((std::max)(1L, std::lround(cropW * (static_cast<double>(maxOutW) / fullEyeW)))));
+        const uint32_t outH = (std::min)(maxOutH, static_cast<uint32_t>((std::max)(1L, std::lround(cropH * (static_cast<double>(maxOutH) / fullEyeH)))));
+        g_lastOutW = outW;
+        g_lastOutH = outH;
+
+        ComPtr<ID3D11Texture2D> wrappedIn;
+        ComPtr<ID3D11Texture2D> wrappedOut;
+        ComPtr<ID3D12Resource> outRes12;
+
+        {
+            std::lock_guard<std::mutex> lock(g_gfxMutex);
+            if (!g_ovrD3D12Ctx.bridge.Initialize(dev12.Get(), d12Data->m_pCommandQueue)) {
+                inSubmit = false;
+                return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+            }
+
+            if (g_ovrD3D12Ctx.wrappedInputs.size() > 32) {
+                g_ovrD3D12Ctx.wrappedInputs.clear();
+            }
+            auto itW = g_ovrD3D12Ctx.wrappedInputs.find(d12Data->m_pResource);
+            if (itW != g_ovrD3D12Ctx.wrappedInputs.end()) {
+                wrappedIn = itW->second;
+            } else if (g_ovrD3D12Ctx.bridge.WrapResource(
+                           d12Data->m_pResource,
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                           wrappedIn)) {
+                g_ovrD3D12Ctx.wrappedInputs[d12Data->m_pResource] = wrappedIn;
+            }
+
+            if (!g_ovrD3D12Ctx.sharedOut12 || g_ovrD3D12Ctx.outW != maxOutW ||
+                g_ovrD3D12Ctx.outH != maxOutH || g_ovrD3D12Ctx.outFmt != inDesc12.Format) {
+                g_ovrD3D12Ctx.sharedOutWrapped.Reset();
+                g_ovrD3D12Ctx.sharedOut12.Reset();
+
+                D3D12_RESOURCE_DESC outDesc12 = inDesc12;
+                outDesc12.Width = maxOutW;
+                outDesc12.Height = maxOutH;
+                outDesc12.DepthOrArraySize = 1;
+                outDesc12.MipLevels = 1;
+                outDesc12.SampleDesc.Count = 1;
+                outDesc12.SampleDesc.Quality = 0;
+                outDesc12.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                if (SUCCEEDED(g_ovrD3D12Ctx.bridge.GetRealD3D12Device()->CreateCommittedResource(
+                        &hp, D3D12_HEAP_FLAG_NONE, &outDesc12,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                        IID_PPV_ARGS(g_ovrD3D12Ctx.sharedOut12.GetAddressOf()))) &&
+                    g_ovrD3D12Ctx.bridge.WrapResource(
+                        g_ovrD3D12Ctx.sharedOut12.Get(),
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        g_ovrD3D12Ctx.sharedOutWrapped)) {
+                    g_ovrD3D12Ctx.outW = maxOutW;
+                    g_ovrD3D12Ctx.outH = maxOutH;
+                    g_ovrD3D12Ctx.outFmt = inDesc12.Format;
+                    LogMessage(LogLevel::Info, "OpenVR D3D12: Shared output texture allocated (D3D11On12): " +
+                               std::to_string(maxOutW) + "x" + std::to_string(maxOutH));
+                }
+            }
+            wrappedOut = g_ovrD3D12Ctx.sharedOutWrapped;
+            outRes12 = g_ovrD3D12Ctx.sharedOut12;
+        }
+
+        if (!wrappedIn || !wrappedOut || !outRes12) {
+            inSubmit = false;
+            return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+        }
+
+        const int eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
+        UpscaleDispatchDesc dispatch{};
+        dispatch.srcRect = { cropX, cropY, cropW, cropH };
+        dispatch.dstRect = { 0, 0, outW, outH };
+        dispatch.srcArrayIndex = (inDesc12.DepthOrArraySize > 1) ? eyeIdx : 0;
+        dispatch.dstArrayIndex = 0;
+        dispatch.projCenterX = g_projCenters[eyeIdx][0];
+        dispatch.projCenterY = g_projCenters[eyeIdx][1];
+        dispatch.radius = g_cfg.upscaling.radius;
+        dispatch.sharpness = g_cfg.upscaling.sharpness;
+        dispatch.maskEnabled = false;
+        dispatch.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+
+        if (!g_ovrD3D12Ctx.bridge.UpscaleWrapped(wrappedIn.Get(), wrappedOut.Get(), dispatch)) {
+            g_upscaleStatus = -3;
+            inSubmit = false;
+            return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+        }
+
+        g_upscaleStatus = 1;
+        const float uMaxOut = static_cast<float>(outW) / static_cast<float>(maxOutW);
+        const float vMaxOut = static_cast<float>(outH) / static_cast<float>(maxOutH);
+
+        vr::VRTextureBounds_t outBounds{};
+        outBounds.uMin = isFlippedX ? uMaxOut : 0.0f;
+        outBounds.uMax = isFlippedX ? 0.0f : uMaxOut;
+        outBounds.vMin = isFlippedY ? vMaxOut : 0.0f;
+        outBounds.vMax = isFlippedY ? 0.0f : vMaxOut;
+
+        vr::D3D12TextureData_t outD12 = *d12Data;
+        outD12.m_pResource = outRes12.Get();
+        vr::Texture_t outTex = *pTexture;
+        outTex.handle = &outD12;
+
+        vr::EVRCompositorError res = CALL_ORIG_SUBMIT(origFn, self, eEye, &outTex, &outBounds, nSubmitFlags);
+        inSubmit = false;
+        return res;
+    }
+
     if (pTexture->eType != vr::TextureType_DirectX && pTexture->eType != vr::TextureType_DXGISharedHandle) {
         EnsureInit();
         g_submitFrameCounter.fetch_add(1, std::memory_order_relaxed);
@@ -1104,13 +1287,12 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
             switch (pTexture->eType) {
                 case vr::TextureType_OpenGL: typeName = "OpenGL"; break;
                 case vr::TextureType_Vulkan: typeName = "Vulkan"; break;
-                case vr::TextureType_DirectX12: typeName = "DirectX12"; break;
                 default: break;
             }
-            LogMessage(LogLevel::Info, "OpenVR [Submit] Non-D3D11 texture detected: eType=" +
+            LogMessage(LogLevel::Info, "OpenVR [Submit] Non-DirectX texture detected: eType=" +
                        std::to_string(static_cast<int>(pTexture->eType)) + " (" + typeName +
                        ") Flags=" + std::to_string(static_cast<uint32_t>(nSubmitFlags)) +
-                       " (Frame Pacing active; NIS awaits API backend).");
+                       " (Frame Pacing active).");
         }
         return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }

@@ -199,6 +199,7 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"vrdashboard.exe",
         L"vrwebhelper.exe",
         L"vrstartup.exe",
+        L"vrpathreg.exe",
         L"steamtours.exe",
         L"steam.exe",
         L"steamwebhelper.exe",

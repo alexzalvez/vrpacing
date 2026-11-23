@@ -38,6 +38,7 @@
 #include "common/visibility_mask.h"
 #include "common/vrs_filter.h"
 #include "gfx/nis_upscaler_d3d11.h"
+#include "gfx/d3d12_upscaler_bridge.h"
 #include "gfx/vrs_foveated_d3d11.h"
 #include "gfx/vrs_foveated_d3d12.h"
 #include "vrpacing/frame_limiter_math.h"
@@ -73,8 +74,11 @@ PFN_xrDestroySpace g_nextDestroySpace = nullptr;
 
 struct ProxySwapchain {
     XrSwapchain realSwapchain = XR_NULL_HANDLE;
+    bool isD3D12 = false;
     std::vector<ComPtr<ID3D11Texture2D>> appTextures;
     std::vector<ComPtr<ID3D11Texture2D>> realTextures;
+    std::vector<ComPtr<ID3D12Resource>> appTextures12;
+    std::vector<ComPtr<ID3D12Resource>> realTextures12;
     std::queue<uint32_t> acquiredIndices;
     uint32_t appWidth = 0;
     uint32_t appHeight = 0;
@@ -117,6 +121,9 @@ SharedMemoryClient g_shm;
 ComPtr<ID3D11Device> g_d3d11Device;
 ComPtr<ID3D11DeviceContext> g_d3d11Context;
 ComPtr<ID3D12Device> g_d3d12Device;
+ComPtr<ID3D12CommandQueue> g_d3d12Queue;
+D3D12UpscalerBridge g_d3d12Bridge;
+bool g_d3d12Use11On12 = false;
 
 uint32_t g_lastInW = 0;
 uint32_t g_lastInH = 0;
@@ -483,6 +490,9 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
     g_cfg = LoadConfig();
     g_d3d11Device.Reset();
     g_d3d11Context.Reset();
+    g_d3d12Bridge.Reset();
+    g_d3d12Use11On12 = false;
+    g_d3d12Queue.Reset();
     g_d3d12Device.Reset();
     g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
     g_vdxrBridgeActive.store(false, std::memory_order_relaxed);
@@ -508,6 +518,7 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
             const auto* d3d12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(next);
             if (d3d12->device) {
                 g_d3d12Device = d3d12->device;
+                g_d3d12Queue = d3d12->queue;
                 LogMessage(LogLevel::Info, "OpenXR Layer: Captured ID3D12Device in xrCreateSession.");
                 if (!IsCurrentProcessBlacklisted() && !IsOpenCompositeActive()) {
                     VrsFoveatedD3D12::Instance().OnSessionCreated(g_d3d12Device.Get(), g_cfg.vrs12.extraFormats);
@@ -520,7 +531,6 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
 
     if (!g_d3d11Device) {
         g_openXrD3D11Active.store(false, std::memory_order_relaxed);
-        LogMessage(LogLevel::Info, "OpenXR Layer: Non-D3D11 session (DX12/Vulkan) detected. Pure VDXR Bridge standby active.");
     }
 
     XrResult res = g_nextCreateSession(instance, createInfo, session);
@@ -536,11 +546,24 @@ XrResult XRAPI_CALL Impl_xrCreateSession(XrInstance instance, const XrSessionCre
         g_vrsTargetEyeH = 0;
         g_vrsLastEnabled = false;
         g_vrsLastDebugMode = -1;
+
         if (g_d3d11Device && !IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
         } else if (!IsCurrentProcessBlacklisted()) {
             g_openXrSessionActive.store(true, std::memory_order_relaxed);
-            g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
+#ifdef _WIN64
+            const bool isVdxrPresent = (GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") != nullptr);
+#else
+            const bool isVdxrPresent = (GetModuleHandleW(L"VirtualDesktop.LibOVRRT32_1.dll") != nullptr);
+#endif
+            if (g_d3d12Device && g_d3d12Queue && !isVdxrPresent &&
+                g_d3d12Bridge.Initialize(g_d3d12Device.Get(), g_d3d12Queue.Get())) {
+                g_d3d12Use11On12 = true;
+                LogMessage(LogLevel::Info, "OpenXR Layer: Non-VDXR D3D12 runtime detected. Native D3D11On12 NIS/SMAA bridge enabled.");
+            } else {
+                g_vdxrBridgeStandby.store(true, std::memory_order_relaxed);
+                LogMessage(LogLevel::Info, "OpenXR Layer: Non-D3D11 session (DX12/Vulkan) detected. Pure VDXR Bridge standby active.");
+            }
         }
     }
     return res;
@@ -559,6 +582,9 @@ XrResult XRAPI_CALL Impl_xrDestroySession(XrSession session) {
         VrsFoveatedD3D12::Instance().Shutdown("DestroySession");
         VrsFoveatedD3D12::Instance().ClearSwapchainTextures();
     }
+    g_d3d12Bridge.Reset();
+    g_d3d12Use11On12 = false;
+    g_d3d12Queue.Reset();
     g_vrsTargetEyeW = 0;
     g_vrsTargetEyeH = 0;
     g_vrsLastEnabled = false;
@@ -628,7 +654,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     EnsureInit();
     if (!createInfo || !swapchain || !g_nextCreateSwapchain) return XR_ERROR_VALIDATION_FAILURE;
 
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+    if ((!g_d3d11Device && !g_d3d12Use11On12) || IsCurrentProcessBlacklisted()) {
         return g_nextCreateSwapchain(session, createInfo, swapchain);
     }
 
@@ -686,6 +712,94 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     g_lastOutW = realW;
     g_lastOutH = realH;
     g_lastFormat = static_cast<uint32_t>(createInfo->format);
+
+    if (g_d3d12Use11On12 && !g_d3d11Device) {
+        XrSwapchainCreateInfo realDesc = *createInfo;
+        realDesc.width = realW;
+        realDesc.height = realH;
+
+        XrSwapchain real = XR_NULL_HANDLE;
+        XrResult r = g_nextCreateSwapchain(session, &realDesc, &real);
+        if (XR_FAILED(r)) {
+            g_upscaleStatus = -1;
+            g_lastHResult = r;
+            LogMessage(LogLevel::Error, "OpenXR Layer (D3D12): Failed to create native upscaled swapchain.");
+            return r;
+        }
+
+        uint32_t imgCount = 0;
+        g_nextEnumerateSwapchainImages(real, 0, &imgCount, nullptr);
+        std::vector<XrSwapchainImageD3D12KHR> realImgs12(imgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
+        g_nextEnumerateSwapchainImages(real, imgCount, &imgCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(realImgs12.data()));
+
+        ID3D12Device* dev12 = g_d3d12Bridge.GetRealD3D12Device();
+        if (!dev12 || imgCount == 0 || !realImgs12[0].texture) {
+            g_nextDestroySwapchain(real);
+            return g_nextCreateSwapchain(session, createInfo, swapchain);
+        }
+
+        D3D12_RESOURCE_DESC appDesc12 = realImgs12[0].texture->GetDesc();
+        appDesc12.Width = appW;
+        appDesc12.Height = appH;
+        appDesc12.DepthOrArraySize = static_cast<UINT16>(arrSize);
+        appDesc12.MipLevels = 1;
+        appDesc12.SampleDesc.Count = createInfo->sampleCount ? createInfo->sampleCount : 1;
+        appDesc12.SampleDesc.Quality = 0;
+        appDesc12.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        ProxySwapchain proxy{};
+        proxy.realSwapchain = real;
+        proxy.isD3D12 = true;
+        proxy.appWidth = appW;
+        proxy.appHeight = appH;
+        proxy.realWidth = realW;
+        proxy.realHeight = realH;
+        proxy.arraySize = arrSize;
+        proxy.format = createInfo->format;
+        proxy.sampleCount = appDesc12.SampleDesc.Count;
+
+        for (uint32_t i = 0; i < imgCount; ++i) {
+            ComPtr<ID3D12Resource> appRes12;
+            HRESULT hr = dev12->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &appDesc12,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                nullptr,
+                IID_PPV_ARGS(appRes12.GetAddressOf()));
+
+            ComPtr<ID3D11Texture2D> wrappedApp;
+            ComPtr<ID3D11Texture2D> wrappedReal;
+            if (FAILED(hr) || !appRes12 ||
+                !g_d3d12Bridge.WrapResource(appRes12.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, wrappedApp) ||
+                !g_d3d12Bridge.WrapResource(realImgs12[i].texture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, wrappedReal)) {
+                LogMessage(LogLevel::Error, "OpenXR Layer (D3D12): Failed to create/wrap intermediate D3D11On12 textures. Falling back to native swapchain.");
+                g_nextDestroySwapchain(real);
+                return g_nextCreateSwapchain(session, createInfo, swapchain);
+            }
+
+            VrsFoveatedD3D12::Instance().RegisterSwapchainTexture(appRes12.Get());
+            VrsFoveatedD3D12::Instance().RegisterSwapchainTexture(realImgs12[i].texture);
+
+            proxy.appTextures12.push_back(appRes12);
+            proxy.realTextures12.push_back(realImgs12[i].texture);
+            proxy.appTextures.push_back(wrappedApp);
+            proxy.realTextures.push_back(wrappedReal);
+        }
+
+        std::lock_guard<std::mutex> lock(g_layerMutex);
+        g_swapchains[real] = std::move(proxy);
+        *swapchain = real;
+
+        LogMessage(LogLevel::Info, "OpenXR D3D12 Proxy Swapchain created (D3D11On12): " +
+                   std::to_string(appW) + "x" + std::to_string(appH) +
+                   " (ArraySize=" + std::to_string(arrSize) + ") -> " +
+                   std::to_string(realW) + "x" + std::to_string(realH));
+        return XR_SUCCESS;
+    }
 
     XrSwapchainCreateInfo realDesc = *createInfo;
     realDesc.width = realW;
@@ -814,6 +928,19 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
     }
 
     const auto& proxy = it->second;
+    if (proxy.isD3D12) {
+        const uint32_t count = static_cast<uint32_t>(proxy.appTextures12.size());
+        if (imageCountOutput) *imageCountOutput = count;
+        if (imageCapacityInput == 0 || !images) return XR_SUCCESS;
+
+        auto* d3d12Imgs = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+        for (uint32_t i = 0; i < (std::min)(imageCapacityInput, count); ++i) {
+            d3d12Imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+            d3d12Imgs[i].texture = proxy.appTextures12[i].Get();
+        }
+        return XR_SUCCESS;
+    }
+
     const uint32_t count = static_cast<uint32_t>(proxy.appTextures.size());
     if (imageCountOutput) *imageCountOutput = count;
     if (imageCapacityInput == 0 || !images) return XR_SUCCESS;
@@ -829,7 +956,7 @@ XrResult XRAPI_CALL Impl_xrEnumerateSwapchainImages(XrSwapchain swapchain, uint3
 
 XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageAcquireInfo* acquireInfo, uint32_t* index) {
     if (!g_nextAcquireSwapchainImage) return XR_ERROR_HANDLE_INVALID;
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+    if ((!g_d3d11Device && !g_d3d12Use11On12) || IsCurrentProcessBlacklisted()) {
         return g_nextAcquireSwapchainImage(swapchain, acquireInfo, index);
     }
 
@@ -850,7 +977,7 @@ XrResult XRAPI_CALL Impl_xrAcquireSwapchainImage(XrSwapchain swapchain, const Xr
 
 XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageWaitInfo* waitInfo) {
     if (!g_nextWaitSwapchainImage) return XR_ERROR_HANDLE_INVALID;
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+    if ((!g_d3d11Device && !g_d3d12Use11On12) || IsCurrentProcessBlacklisted()) {
         return g_nextWaitSwapchainImage(swapchain, waitInfo);
     }
 
@@ -864,7 +991,7 @@ XrResult XRAPI_CALL Impl_xrWaitSwapchainImage(XrSwapchain swapchain, const XrSwa
 
 XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageReleaseInfo* releaseInfo) {
     if (!g_nextReleaseSwapchainImage) return XR_ERROR_HANDLE_INVALID;
-    if (!g_d3d11Device || IsCurrentProcessBlacklisted()) {
+    if ((!g_d3d11Device && !g_d3d12Use11On12) || IsCurrentProcessBlacklisted()) {
         return g_nextReleaseSwapchainImage(swapchain, releaseInfo);
     }
 
@@ -882,7 +1009,70 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
     const uint32_t idx = proxy.acquiredIndices.front();
     proxy.acquiredIndices.pop();
 
-    if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
+    if (proxy.isD3D12 && g_d3d12Bridge.IsInitialized() && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
+        const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
+        const bool isSideBySide = (numSlices == 1) && (proxy.appWidth >= (proxy.appHeight * 3 / 2));
+
+        static std::atomic<bool> s_firstFrame12Logged{ false };
+        if (!s_firstFrame12Logged.exchange(true)) {
+            LogMessage(LogLevel::Info, "OpenXR D3D12 [Release] First frame (D3D11On12): App=" +
+                       std::to_string(proxy.appWidth) + "x" + std::to_string(proxy.appHeight) +
+                       " ArraySize=" + std::to_string(numSlices) +
+                       " FMT=" + std::to_string(proxy.format) +
+                       " -> Real=" + std::to_string(proxy.realWidth) + "x" + std::to_string(proxy.realHeight) +
+                       " Scale=" + std::to_string(g_cfg.upscaling.scale));
+        }
+
+        if (proxy.lastUsedAsQuad && proxy.sampleCount <= 1 &&
+            proxy.appWidth <= proxy.realWidth && proxy.appHeight <= proxy.realHeight) {
+            g_d3d12Bridge.CopyWrapped1to1(proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), numSlices);
+            proxy.lastReleaseWas1to1 = true;
+            return g_nextReleaseSwapchainImage(proxy.realSwapchain, releaseInfo);
+        }
+        proxy.lastReleaseWas1to1 = false;
+
+        bool allSlicesOk = true;
+        if (isSideBySide) {
+            const uint32_t halfAppW = proxy.appWidth / 2;
+            const uint32_t halfRealW = proxy.realWidth / 2;
+            for (uint32_t eye = 0; eye < 2; ++eye) {
+                UpscaleDispatchDesc desc{};
+                desc.srcRect = { eye * halfAppW, 0, halfAppW, proxy.appHeight };
+                desc.dstRect = { eye * halfRealW, 0, halfRealW, proxy.realHeight };
+                desc.srcArrayIndex = 0;
+                desc.dstArrayIndex = 0;
+                desc.projCenterX = 0.5f;
+                desc.projCenterY = 0.5f;
+                desc.radius = g_cfg.upscaling.radius;
+                desc.sharpness = g_cfg.upscaling.sharpness;
+                desc.maskEnabled = false;
+                desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+
+                if (!g_d3d12Bridge.UpscaleWrapped(proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
+                    allSlicesOk = false;
+                }
+            }
+        } else {
+            for (uint32_t slice = 0; slice < numSlices; ++slice) {
+                UpscaleDispatchDesc desc{};
+                desc.srcRect = { 0, 0, proxy.appWidth, proxy.appHeight };
+                desc.dstRect = { 0, 0, proxy.realWidth, proxy.realHeight };
+                desc.srcArrayIndex = static_cast<int>(slice);
+                desc.dstArrayIndex = static_cast<int>(slice);
+                desc.projCenterX = 0.5f;
+                desc.projCenterY = 0.5f;
+                desc.radius = g_cfg.upscaling.radius;
+                desc.sharpness = g_cfg.upscaling.sharpness;
+                desc.maskEnabled = false;
+                desc.maxOutputPixels = g_cfg.upscaling.maxOutputPixels;
+
+                if (!g_d3d12Bridge.UpscaleWrapped(proxy.appTextures[idx].Get(), proxy.realTextures[idx].Get(), desc)) {
+                    allSlicesOk = false;
+                }
+            }
+        }
+        g_upscaleStatus = allSlicesOk ? 1 : -3;
+    } else if (g_d3d11Context && idx < proxy.appTextures.size() && idx < proxy.realTextures.size()) {
         const uint32_t numSlices = (proxy.arraySize > 0) ? proxy.arraySize : 1;
         const bool isSideBySide = (numSlices == 1) && (proxy.appWidth >= (proxy.appHeight * 3 / 2));
 
@@ -1022,7 +1212,7 @@ XrResult XRAPI_CALL Impl_xrWaitFrame(XrSession session, const XrFrameWaitInfo* i
         g_limiter.WaitBeforeRuntime();
     }
 
-    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (VDXR)" : L"OpenXR (VDXR Bridge)";
+    const wchar_t* apiLabel = g_d3d11Device ? L"OpenXR (D3D11)" : (g_d3d12Use11On12 ? L"OpenXR (D3D12)" : L"OpenXR (VDXR Bridge)");
     int32_t vrsStatus = 0;
     if (IsOpenCompositeActive() || IsCurrentProcessVrsAutoExcluded()) {
         vrsStatus = -1;
@@ -1144,28 +1334,30 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
             VrsFoveatedD3D12::Instance().EndFrame();
         }
 
-        if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
-            const uint32_t frames = g_vdxrWarmupFrames.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (frames >= 60) {
+        if (!g_d3d12Use11On12) {
+            if (g_vdxrBridgeStandby.load(std::memory_order_relaxed) && !g_vdxrBridgeActive.load(std::memory_order_relaxed)) {
+                const uint32_t frames = g_vdxrWarmupFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (frames >= 60) {
 #ifdef _WIN64
-                if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") ||
-                    GetModuleHandleW(L"LibOVRRT64_1.dll") ||
-                    GetModuleHandleW(L"LibPVRRT64_1_X.dll")) {
+                    if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT64_1.dll") ||
+                        GetModuleHandleW(L"LibOVRRT64_1.dll") ||
+                        GetModuleHandleW(L"LibPVRRT64_1_X.dll")) {
 #else
-                if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT32_1.dll") ||
-                    GetModuleHandleW(L"LibOVRRT32_1.dll") ||
-                    GetModuleHandleW(L"LibPVRRT32_1_X.dll")) {
+                    if (GetModuleHandleW(L"VirtualDesktop.LibOVRRT32_1.dll") ||
+                        GetModuleHandleW(L"LibOVRRT32_1.dll") ||
+                        GetModuleHandleW(L"LibPVRRT32_1_X.dll")) {
 #endif
-                    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
-                    g_openXrSessionActive.store(true, std::memory_order_relaxed);
-                    g_vdxrBridgeActive.store(true, std::memory_order_relaxed);
-                    EnsureHookDllLoadedForVdxrBridge();
-                } else if (frames >= 300) {
-                    g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+                        g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+                        g_openXrSessionActive.store(true, std::memory_order_relaxed);
+                        g_vdxrBridgeActive.store(true, std::memory_order_relaxed);
+                        EnsureHookDllLoadedForVdxrBridge();
+                    } else if (frames >= 300) {
+                        g_vdxrBridgeStandby.store(false, std::memory_order_relaxed);
+                    }
                 }
             }
+            return g_nextEndFrame(session, frameEndInfo);
         }
-        return g_nextEndFrame(session, frameEndInfo);
     }
 
     if (IsCurrentProcessBlacklisted() || !frameEndInfo || frameEndInfo->layerCount == 0 || !frameEndInfo->layers) {

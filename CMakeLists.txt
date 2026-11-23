@@ -91,6 +91,7 @@ if(WIN32)
     src/gfx/d3d11_helper.cpp
     src/gfx/smaa_pass_d3d11.cpp
     src/gfx/nis_upscaler_d3d11.cpp
+    src/gfx/d3d12_upscaler_bridge.cpp
     src/gfx/vrs_foveated_d3d11.cpp
     src/gfx/vrs_foveated_d3d12.cpp
   )
@@ -109,6 +110,7 @@ if(WIN32)
     src/gfx/d3d11_helper.cpp
     src/gfx/smaa_pass_d3d11.cpp
     src/gfx/nis_upscaler_d3d11.cpp
+    src/gfx/d3d12_upscaler_bridge.cpp
     src/gfx/vrs_foveated_d3d11.cpp
   )
   target_link_libraries(VRPacingHook PRIVATE vrpacing_core vrpacing_win_common minhook d3d11 d3dcompiler dxgi "${NVAPI_LIB}" dxguid windowscodecs ole32)
