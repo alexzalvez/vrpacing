@@ -1,5 +1,5 @@
 #pragma once
-// [B5, C3, B8', Z1] Shared pure ring pattern generator for D3D11 and D3D12 VRS.
+// Shared pure ring pattern generator for D3D11 and D3D12 VRS.
 
 #include <algorithm>
 #include <cmath>
@@ -133,7 +133,7 @@ inline std::vector<uint8_t> CreateTopLeftAnchoredPatternD3D12(
     return data;
 }
 
-// [Z1] Second pattern texture generator for D3D12 DOUBLEWIDE targets:
+// Second pattern texture generator for D3D12 DOUBLEWIDE targets:
 // Capacity = ceil(2*eyeW*1.5) x ceil(eyeH*1.5), top-left anchored,
 // two foveal centers at (eyeW/2, eyeH/2) and (eyeW + eyeW/2, eyeH/2).
 // Tiles beyond (2*eyeW, eyeH) receive outermost ring rate.

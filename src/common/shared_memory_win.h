@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #ifdef _WIN32
 
@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cwchar>
 #include <string>
@@ -228,6 +229,7 @@ public:
                 const float ftMs = static_cast<float>(dt * 1000.0);
                 const uint32_t ftIdx = shared_->frameTimeWriteIdx % 256;
                 shared_->frameTimesMs[ftIdx] = ftMs;
+                std::atomic_thread_fence(std::memory_order_release);
                 shared_->frameTimeWriteIdx = (ftIdx + 1) % 256;
 
                 s_samples[s_sampleIdx] = dt;
@@ -274,6 +276,7 @@ public:
         if (!OpenOrCreate() || !shared_ || !IsTelemetryActive()) return;
         const uint32_t idx = shared_->frameTimeWriteIdx % 256;
         shared_->frameTimesMs[idx] = frameTimeMs;
+        std::atomic_thread_fence(std::memory_order_release);
         shared_->frameTimeWriteIdx = (idx + 1) % 256;
     }
 

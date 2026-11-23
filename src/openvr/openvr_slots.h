@@ -1,5 +1,5 @@
 #pragma once
-// [C1, F1] Script-verified OpenVR vtable slot table derived from ValveSoftware/openvr tags
+// Script-verified OpenVR vtable slot table derived from ValveSoftware/openvr tags
 // and cross-checked against ValveSoftware/Proton vrclient_x64 thunks.
 // GetProjectionRaw is verified at 0-based slot 2 in headers/openvr.h (e.g. v1.0.12 IVRSystem_019 line 1435,
 // v1.14.15 IVRSystem_022 line 1749) and headers/openvr_capi.h (struct VR_IVRSystem_FnTable, 3rd field).
@@ -13,7 +13,7 @@ struct OpenVrSlotEntry {
     const char* versionString;
     int32_t waitSlot;
     int32_t submitSlot;
-    int32_t projRawSlot; // [F1] Verified slot for IVRSystem::GetProjectionRaw (-1 for Compositor)
+    int32_t projRawSlot; // Verified slot for IVRSystem::GetProjectionRaw (-1 for Compositor)
     int32_t hamSlot;
     bool hamHasType;
 };

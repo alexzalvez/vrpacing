@@ -1282,15 +1282,11 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
     outBounds.vMin = isFlippedY ? vMaxOut : 0.0f;
     outBounds.vMax = isFlippedY ? 0.0f : vMaxOut;
 
-    auto* mutableTex = const_cast<vr::Texture_t*>(pTexture);
-    void* origHandle = mutableTex->handle;
-    vr::ETextureType origType = mutableTex->eType;
-    mutableTex->handle = sharedOut.texture.Get();
-    mutableTex->eType = vr::TextureType_DirectX;
+    vr::Texture_t outTex = *pTexture;
+    outTex.handle = sharedOut.texture.Get();
+    outTex.eType = vr::TextureType_DirectX;
     const uint32_t clearFlags = static_cast<uint32_t>(nSubmitFlags) & ~static_cast<uint32_t>(vr::Submit_GlRenderBuffer);
-    vr::EVRCompositorError res = CALL_ORIG_SUBMIT(origFn, self, eEye, mutableTex, &outBounds, static_cast<vr::EVRSubmitFlags>(clearFlags));
-    mutableTex->handle = origHandle;
-    mutableTex->eType = origType;
+    vr::EVRCompositorError res = CALL_ORIG_SUBMIT(origFn, self, eEye, &outTex, &outBounds, static_cast<vr::EVRSubmitFlags>(clearFlags));
 
     inSubmit = false;
     return res;

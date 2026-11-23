@@ -11,7 +11,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             break;
         case DLL_PROCESS_DETACH:
             vrpacing::g_vrsDetaching.store(true, std::memory_order_relaxed);
-            // [F9] Log fallback shutdown if D3D12 session was never destroyed via OpenXR API
+            // Log fallback shutdown if D3D12 session was never destroyed via OpenXR API
             vrpacing::VrsFoveatedD3D12::Instance().ShutdownOnProcessDetach();
             break;
     }

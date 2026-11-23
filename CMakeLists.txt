@@ -72,6 +72,11 @@ if(WIN32)
     ${MINHOOK_HDE_SRC}
   )
   target_include_directories(minhook PUBLIC third_party/minhook/include third_party/minhook/src)
+  if(MSVC)
+    target_compile_options(minhook PRIVATE /W0)
+  else()
+    target_compile_options(minhook PRIVATE -w)
+  endif()
 
   add_library(vrpacing_win_common STATIC
     src/common/config_json.cpp

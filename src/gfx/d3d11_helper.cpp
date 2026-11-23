@@ -45,7 +45,7 @@ ComPtr<ID3D11Buffer> CreateConstantsBuffer(ID3D11Device* device, uint32_t size) 
     bd.StructureByteStride = 0;
     bd.ByteWidth = size;
     ComPtr<ID3D11Buffer> buffer;
-    CheckResult("creando constant buffer", device->CreateBuffer(&bd, nullptr, buffer.GetAddressOf()));
+    CheckResult("creating constant buffer", device->CreateBuffer(&bd, nullptr, buffer.GetAddressOf()));
     return buffer;
 }
 
@@ -61,7 +61,7 @@ ComPtr<ID3D11SamplerState> CreateLinearSampler(ID3D11Device* device) {
     sd.MinLOD = 0.0f;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     ComPtr<ID3D11SamplerState> sampler;
-    CheckResult("creando sampler linear", device->CreateSamplerState(&sd, sampler.GetAddressOf()));
+    CheckResult("creating linear sampler", device->CreateSamplerState(&sd, sampler.GetAddressOf()));
     return sampler;
 }
 
@@ -105,7 +105,7 @@ ComPtr<ID3D11Texture2D> CreateResolveTexture(ID3D11Device* device, ID3D11Texture
     if (format != DXGI_FORMAT_UNKNOWN) td.Format = format;
 
     ComPtr<ID3D11Texture2D> resolved;
-    CheckResult("creando resolve texture", device->CreateTexture2D(&td, nullptr, resolved.GetAddressOf()));
+    CheckResult("creating resolve texture", device->CreateTexture2D(&td, nullptr, resolved.GetAddressOf()));
     return resolved;
 }
 
@@ -124,7 +124,7 @@ ComPtr<ID3D11Texture2D> CreatePostProcessTexture(ID3D11Device* device, uint32_t 
     td.MiscFlags = 0;
 
     ComPtr<ID3D11Texture2D> post;
-    CheckResult("creando post texture", device->CreateTexture2D(&td, nullptr, post.GetAddressOf()));
+    CheckResult("creating post-process texture", device->CreateTexture2D(&td, nullptr, post.GetAddressOf()));
     return post;
 }
 
@@ -179,7 +179,7 @@ ComPtr<ID3D11ShaderResourceView> CreateShaderResourceView(ID3D11Device* device, 
     HRESULT hr = device->CreateShaderResourceView(texture, &srvd, srv.GetAddressOf());
     if (FAILED(hr)) {
         hr = device->CreateShaderResourceView(texture, nullptr, srv.GetAddressOf());
-        CheckResult("creando SRV fallback", hr);
+        CheckResult("creating fallback SRV", hr);
     }
     return srv;
 }
@@ -210,7 +210,7 @@ ComPtr<ID3D11UnorderedAccessView> CreateUnorderedAccessView(ID3D11Device* device
     HRESULT hr = device->CreateUnorderedAccessView(texture, &uavd, uav.GetAddressOf());
     if (FAILED(hr)) {
         hr = device->CreateUnorderedAccessView(texture, nullptr, uav.GetAddressOf());
-        CheckResult("creando UAV fallback", hr);
+        CheckResult("creating fallback UAV", hr);
     }
     return uav;
 }

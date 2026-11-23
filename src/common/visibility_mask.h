@@ -1,5 +1,5 @@
 #pragma once
-// [C4] Shared pure circular visibility mask generator (no API types).
+// Shared pure circular visibility mask generator (no API types).
 
 #include <cstdint>
 #include <vector>

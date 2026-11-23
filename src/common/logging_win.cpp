@@ -49,8 +49,7 @@ std::wstring GetDefaultLogPath() {
 
 } // namespace
 
-void InitLogging(const std::wstring& customPath) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+void InitLoggingLocked(const std::wstring& customPath) {
     if (g_initialized) return;
 
     g_logFilePath = customPath.empty() ? GetDefaultLogPath() : customPath;
@@ -65,15 +64,23 @@ void InitLogging(const std::wstring& customPath) {
     }
     const DWORD pid = GetCurrentProcessId();
 
-    char exeA[MAX_PATH]{};
-    size_t converted = 0;
-    wcstombs_s(&converted, exeA, exeStr.c_str(), sizeof(exeA) - 1);
+    std::string exeUtf8;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, exeStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n > 1) {
+        exeUtf8.resize(static_cast<size_t>(n - 1));
+        WideCharToMultiByte(CP_UTF8, 0, exeStr.c_str(), -1, exeUtf8.data(), n, nullptr, nullptr);
+    }
 
     std::ofstream ofs(g_logFilePath, std::ios::app);
     if (ofs.is_open()) {
         ofs << "=== VRPacing " << kAppVersionAnsi << " | Process: "
-            << exeA << " [PID " << pid << "] ===" << std::endl;
+            << exeUtf8 << " [PID " << pid << "] ===" << std::endl;
     }
+}
+
+void InitLogging(const std::wstring& customPath) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    InitLoggingLocked(customPath);
 }
 
 void InitLogging() {
@@ -91,7 +98,7 @@ std::wstring GetLogFilePath() {
 void LogMessage(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (!g_initialized) {
-        InitLogging(L"");
+        InitLoggingLocked(L"");
     }
 
     const auto now = std::chrono::system_clock::now();
@@ -103,6 +110,7 @@ void LogMessage(LogLevel level, const std::string& message) {
     ss << std::put_time(&tmBuffer, "%Y-%m-%d %H:%M:%S") << " [";
 
     switch (level) {
+    case LogLevel::Debug: ss << "DEBUG"; break;
     case LogLevel::Info:  ss << "INFO";  break;
     case LogLevel::Warn:  ss << "WARN";  break;
     case LogLevel::Error: ss << "ERROR"; break;

@@ -160,7 +160,7 @@ void AdvanceHookLifecycleLocked() {
         }
     }
 
-    // 1. Ruta OpenVR (con resultado verificable sobre VR_GetGenericInterface)
+    // 1. OpenVR path (verified via VR_GetGenericInterface)
     if (hasOpenVrMod &&
         g_state.openvrStatus != BackendStatus::ReadyVerified &&
         g_state.openvrStatus != BackendStatus::TerminalFailure) {
@@ -180,8 +180,7 @@ void AdvanceHookLifecycleLocked() {
         }
     }
 
-    // Publicacion/recuperacion de eventos Ready/Failed desacoplada de la instalacion:
-    // si SetEvent fallo transitoriamente en un ciclo previo, se reintenta sin reinstalar hooks.
+    // Decoupled Ready/Failed event publication so transient SetEvent failures retry without reinstalling hooks.
     if (g_state.openvrStatus == BackendStatus::ReadyVerified &&
         !g_state.readySignaled && !g_state.failedSignaled) {
         if (SignalNamedProcessEventLocked(L"Local\\VRPacingHookReady_", g_hReadyEvent)) {
@@ -196,7 +195,7 @@ void AdvanceHookLifecycleLocked() {
         }
     }
 
-    // 2. Ruta Oculus LibOVR verificada
+    // 2. Verified Oculus LibOVR path
     if (hasOculusMod &&
         g_state.oculusStatus != BackendStatus::ReadyVerified &&
         g_state.oculusStatus != BackendStatus::TerminalFailure) {
@@ -294,8 +293,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             break;
         }
         case DLL_PROCESS_DETACH:
-            // El modulo permanece fijado (GET_MODULE_HANDLE_EX_FLAG_PIN); no se adquiere
-            // g_lifecycleMutex ni se cierran handles compartidos bajo el Loader Lock.
+            // Module stays pinned (GET_MODULE_HANDLE_EX_FLAG_PIN); avoid acquiring
+            // g_lifecycleMutex or closing shared handles under the Windows Loader Lock.
             g_stopWatcher.store(true, std::memory_order_relaxed);
             break;
         default:
