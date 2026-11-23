@@ -830,6 +830,7 @@ vr::EVRCompositorError __fastcall HookedWaitGetPoses(void* self,
     }
     inWait = true;
 
+    g_openVrApiUsed.store(true, std::memory_order_relaxed);
     EnsureInit();
     g_shm.SyncConfig(g_cfg);
     VrsFoveatedD3D11::Instance().EndFrame();
@@ -1087,8 +1088,30 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
     }
 
     thread_local bool inSubmit = false;
-    if (inSubmit || !pTexture || !pTexture->handle ||
-        (pTexture->eType != vr::TextureType_DirectX && pTexture->eType != vr::TextureType_DXGISharedHandle)) {
+    if (inSubmit || !pTexture || !pTexture->handle) {
+        return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
+    }
+
+    g_openVrApiUsed.store(true, std::memory_order_relaxed);
+
+    if (pTexture->eType != vr::TextureType_DirectX && pTexture->eType != vr::TextureType_DXGISharedHandle) {
+        EnsureInit();
+        g_submitFrameCounter.fetch_add(1, std::memory_order_relaxed);
+        g_openVrHandlingFrames.store(true, std::memory_order_relaxed);
+        static std::atomic<bool> s_nonD3d11Logged{ false };
+        if (!s_nonD3d11Logged.exchange(true)) {
+            const char* typeName = "Unknown";
+            switch (pTexture->eType) {
+                case vr::TextureType_OpenGL: typeName = "OpenGL"; break;
+                case vr::TextureType_Vulkan: typeName = "Vulkan"; break;
+                case vr::TextureType_DirectX12: typeName = "DirectX12"; break;
+                default: break;
+            }
+            LogMessage(LogLevel::Info, "OpenVR [Submit] Non-D3D11 texture detected: eType=" +
+                       std::to_string(static_cast<int>(pTexture->eType)) + " (" + typeName +
+                       ") Flags=" + std::to_string(static_cast<uint32_t>(nSubmitFlags)) +
+                       " (Frame Pacing active; NIS awaits API backend).");
+        }
         return CALL_ORIG_SUBMIT(origFn, self, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
@@ -1307,9 +1330,11 @@ void LogUnsupportedOnce(const char* cleanName) {
     }
 }
 
-void HookCompositorInstance(const char* name, void* iface) {
+void HookCompositorInstance(const char* name, void* iface, bool fromAppCall = true) {
     if (!iface || !name) return;
-    g_openVrApiUsed.store(true, std::memory_order_relaxed);
+    if (fromAppCall) {
+        g_openVrApiUsed.store(true, std::memory_order_relaxed);
+    }
     const char* cleanName = StripFnTablePrefix(name);
     const OpenVrSlotEntry* entry = LookupOpenVrSlots(cleanName);
     if (!entry || entry->waitSlot < 0 || entry->submitSlot < 0) {
@@ -1454,59 +1479,96 @@ void* HookedVRGetGenericInterface(const char* name, int* error) {
     return iface;
 }
 
+void* SehGetGenericInterface(VRGetGenericInterfaceFn fn, const char* name, int* err) noexcept {
+    __try {
+        return fn(name, err);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (err) *err = -1;
+        return nullptr;
+    }
+}
+
+void ProbeExistingOpenVrCompositors() {
+    if (!g_origGetGenericInterface || IsOpenXrSessionActiveAnyApi()) {
+        return;
+    }
+    if (!GetModuleHandleW(L"vrclient.dll") && !GetModuleHandleW(L"vrclient_x64.dll")) {
+        return;
+    }
+
+    static const char* const kCompositorVersions[] = {
+        "IVRCompositor_029", "IVRCompositor_028", "IVRCompositor_027",
+        "IVRCompositor_026", "IVRCompositor_024", "IVRCompositor_022",
+        "IVRCompositor_021", "IVRCompositor_020", "IVRCompositor_016"
+    };
+
+    for (const char* ver : kCompositorVersions) {
+        int err = 0;
+        void* iface = SehGetGenericInterface(g_origGetGenericInterface, ver, &err);
+        if (iface && err == 0) {
+            HookCompositorInstance(ver, iface, false);
+        }
+    }
+}
+
 } // namespace
 
 bool InstallOpenVRHooksWithStatus() {
     if (g_openVrHooksInstalled.load(std::memory_order_acquire)) {
+        ProbeExistingOpenVrCompositors();
         return true;
     }
 
-    std::lock_guard<std::mutex> installLock(g_installMutex);
-    if (g_openVrHooksInstalled.load(std::memory_order_relaxed)) {
-        return true;
+    {
+        std::lock_guard<std::mutex> installLock(g_installMutex);
+        if (g_openVrHooksInstalled.load(std::memory_order_relaxed)) {
+            return true;
+        }
+
+        HMODULE mod = GetModuleHandleW(L"openvr_api.dll");
+        if (!mod) return false;
+
+        auto fn = reinterpret_cast<VRGetGenericInterfaceFn>(GetProcAddress(mod, "VR_GetGenericInterface"));
+        if (!fn) {
+            LogMessage(LogLevel::Error, "OpenVR Hook: VR_GetGenericInterface export not found in openvr_api.dll.");
+            return false;
+        }
+
+        const MH_STATUS stInit = MH_Initialize();
+        if (stInit != MH_OK && stInit != MH_ERROR_ALREADY_INITIALIZED) {
+            LogMessage(LogLevel::Error, "OpenVR Hook: MH_Initialize failed status=" + std::string(MH_StatusToString(stInit)));
+            return false;
+        }
+
+        void* origFn = nullptr;
+        const MH_STATUS stCreate = MH_CreateHook(reinterpret_cast<void*>(fn),
+                                                 reinterpret_cast<void*>(&HookedVRGetGenericInterface),
+                                                 &origFn);
+        if (stCreate != MH_OK || !origFn) {
+            LogMessage(LogLevel::Error, "OpenVR Hook: MH_CreateHook failed on VR_GetGenericInterface status=" +
+                       std::string(MH_StatusToString(stCreate)));
+            return false;
+        }
+
+        g_origGetGenericInterface = reinterpret_cast<VRGetGenericInterfaceFn>(origFn);
+        const MH_STATUS stEnable = MH_EnableHook(reinterpret_cast<void*>(fn));
+        if (stEnable != MH_OK && stEnable != MH_ERROR_ENABLED) {
+            g_origGetGenericInterface = nullptr;
+            MH_RemoveHook(reinterpret_cast<void*>(fn));
+            LogMessage(LogLevel::Error, "OpenVR Hook: MH_EnableHook failed on VR_GetGenericInterface status=" +
+                       std::string(MH_StatusToString(stEnable)));
+            return false;
+        }
+
+        g_openVrHooksInstalled.store(true, std::memory_order_release);
+        LARGE_INTEGER qpcNow{};
+        QueryPerformanceCounter(&qpcNow);
+        LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed [target=" +
+                   PtrToHex(reinterpret_cast<const void*>(fn)) + ", trampoline=" + PtrToHex(origFn) +
+                   ", qpc=" + std::to_string(qpcNow.QuadPart) + "].");
     }
 
-    HMODULE mod = GetModuleHandleW(L"openvr_api.dll");
-    if (!mod) return false;
-
-    auto fn = reinterpret_cast<VRGetGenericInterfaceFn>(GetProcAddress(mod, "VR_GetGenericInterface"));
-    if (!fn) {
-        LogMessage(LogLevel::Error, "OpenVR Hook: VR_GetGenericInterface export not found in openvr_api.dll.");
-        return false;
-    }
-
-    const MH_STATUS stInit = MH_Initialize();
-    if (stInit != MH_OK && stInit != MH_ERROR_ALREADY_INITIALIZED) {
-        LogMessage(LogLevel::Error, "OpenVR Hook: MH_Initialize failed status=" + std::string(MH_StatusToString(stInit)));
-        return false;
-    }
-
-    void* origFn = nullptr;
-    const MH_STATUS stCreate = MH_CreateHook(reinterpret_cast<void*>(fn),
-                                             reinterpret_cast<void*>(&HookedVRGetGenericInterface),
-                                             &origFn);
-    if (stCreate != MH_OK || !origFn) {
-        LogMessage(LogLevel::Error, "OpenVR Hook: MH_CreateHook failed on VR_GetGenericInterface status=" +
-                   std::string(MH_StatusToString(stCreate)));
-        return false;
-    }
-
-    g_origGetGenericInterface = reinterpret_cast<VRGetGenericInterfaceFn>(origFn);
-    const MH_STATUS stEnable = MH_EnableHook(reinterpret_cast<void*>(fn));
-    if (stEnable != MH_OK && stEnable != MH_ERROR_ENABLED) {
-        g_origGetGenericInterface = nullptr;
-        MH_RemoveHook(reinterpret_cast<void*>(fn));
-        LogMessage(LogLevel::Error, "OpenVR Hook: MH_EnableHook failed on VR_GetGenericInterface status=" +
-                   std::string(MH_StatusToString(stEnable)));
-        return false;
-    }
-
-    g_openVrHooksInstalled.store(true, std::memory_order_release);
-    LARGE_INTEGER qpcNow{};
-    QueryPerformanceCounter(&qpcNow);
-    LogMessage(LogLevel::Info, "OpenVR VR_GetGenericInterface hook installed [target=" +
-               PtrToHex(reinterpret_cast<const void*>(fn)) + ", trampoline=" + PtrToHex(origFn) +
-               ", qpc=" + std::to_string(qpcNow.QuadPart) + "].");
+    ProbeExistingOpenVrCompositors();
     return true;
 }
 

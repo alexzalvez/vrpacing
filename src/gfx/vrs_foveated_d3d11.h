@@ -88,7 +88,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D11NvShadingRateResourceView> view;
     };
 
-    // Estructura clave para el histograma de RTs aceptados
+    // Key structure for accepted render-target histogram entries
     struct RtHistogramKey {
         uint32_t w = 0;
         uint32_t h = 0;
@@ -175,7 +175,7 @@ private:
     uint32_t targetEyeWidth_ = 0;
     uint32_t targetEyeHeight_ = 0;
 
-    // Puntero crudo de la ultima vista enlazada para evitar llamadas redundantes
+    // Raw pointer to the last bound view to skip redundant NVAPI calls
     ID3D11NvShadingRateResourceView* lastBoundView_ = nullptr;
     int lastBoundDebugMode_ = -1;
 

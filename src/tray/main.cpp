@@ -896,7 +896,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SyncUiWithConfig();
             RegisterOpenXrImplicitLayer();
             RegisterHotKey(hwnd, ID_HOTKEY_SCREENSHOT, MOD_CONTROL | MOD_NOREPEAT, VK_F12);
-            SetTimer(hwnd, IDT_SCANNER_TIMER, 2000, nullptr);
+            SetTimer(hwnd, IDT_SCANNER_TIMER, 500, nullptr);
             SetTimer(hwnd, IDT_TELEMETRY_TIMER, 250, nullptr);
             return 0;
         }

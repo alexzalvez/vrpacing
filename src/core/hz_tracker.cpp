@@ -11,7 +11,7 @@ std::optional<double> HzTracker::SnapToCommonHz(double hz) {
         24.0, 30.0, 32.0, 33.333333, 36.0, 40.0, 45.0, 48.0, 50.0,
         60.0, 72.0, 80.0, 90.0, 96.0, 100.0, 120.0, 144.0
     };
-    constexpr double kTolerance = 0.03; // 3% de tolerancia para distinguir 90, 96 y 100 Hz
+    constexpr double kTolerance = 0.03; // 3% tolerance to distinguish 90, 96, and 100 Hz
 
     double bestDiff = 1e9;
     std::optional<double> bestRate = std::nullopt;

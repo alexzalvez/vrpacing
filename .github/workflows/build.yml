@@ -41,7 +41,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           foreach ($file in @("VRPacingLayer.dll", "VRPacingHook.dll", "VRPacingTray.exe", "VRPacingLayer.json")) {
               $found = Get-ChildItem -Path "build/windows-release" -Filter $file -Recurse | Select-Object -First 1
-              if (-not $found) { throw "No se encontro $file en build/windows-release" }
+              if (-not $found) { throw "Missing compiled binary $file in build/windows-release" }
               Copy-Item $found.FullName -Destination $out
           }
 
@@ -87,7 +87,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           foreach ($file in @("VRPacingLayer32.dll", "VRPacingHook32.dll", "VRPacingInjector32.exe", "VRPacingLayer32.json")) {
               $found = Get-ChildItem -Path "build/windows-release-x86" -Filter $file -Recurse | Select-Object -First 1
-              if (-not $found) { throw "No se encontro $file en build/windows-release-x86" }
+              if (-not $found) { throw "Missing compiled binary $file in build/windows-release-x86" }
               Copy-Item $found.FullName -Destination $out
           }
 
