@@ -1163,8 +1163,8 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
         const uint64_t maxPx = static_cast<uint64_t>(maxOutW) * static_cast<uint64_t>(maxOutH);
         if (maxPx > g_cfg.upscaling.maxOutputPixels) {
             const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(maxPx));
-            maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutW * factor)));
-            maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutH * factor)));
+            maxOutW = (std::max)(2u, static_cast<uint32_t>(std::floor(maxOutW * factor)) & ~1u);
+            maxOutH = (std::max)(2u, static_cast<uint32_t>(std::floor(maxOutH * factor)) & ~1u);
         }
 
         const uint32_t outW = (std::min)(maxOutW, static_cast<uint32_t>((std::max)(1L, std::lround(cropW * (static_cast<double>(maxOutW) / fullEyeW)))));
@@ -1393,8 +1393,8 @@ vr::EVRCompositorError __fastcall HookedSubmit(void* self,
     const uint64_t maxPx = static_cast<uint64_t>(maxOutW) * static_cast<uint64_t>(maxOutH);
     if (maxPx > g_cfg.upscaling.maxOutputPixels) {
         const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(maxPx));
-        maxOutW = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutW * factor)));
-        maxOutH = static_cast<uint32_t>((std::max)(1.0, std::floor(maxOutH * factor)));
+        maxOutW = (std::max)(2u, static_cast<uint32_t>(std::floor(maxOutW * factor)) & ~1u);
+        maxOutH = (std::max)(2u, static_cast<uint32_t>(std::floor(maxOutH * factor)) & ~1u);
     }
 
     const double effScaleX = static_cast<double>(maxOutW) / static_cast<double>(fullEyeW);

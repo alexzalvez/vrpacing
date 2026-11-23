@@ -703,8 +703,8 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     const uint64_t px = static_cast<uint64_t>(realW) * static_cast<uint64_t>(realH);
     if (px > g_cfg.upscaling.maxOutputPixels) {
         const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(px));
-        realW = static_cast<uint32_t>((std::max)(1.0, std::floor(realW * factor)));
-        realH = static_cast<uint32_t>((std::max)(1.0, std::floor(realH * factor)));
+        realW = (std::max)(2u, static_cast<uint32_t>(std::floor(realW * factor)) & ~1u);
+        realH = (std::max)(2u, static_cast<uint32_t>(std::floor(realH * factor)) & ~1u);
     }
 
     g_lastInW = appW;

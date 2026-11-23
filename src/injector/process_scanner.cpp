@@ -208,6 +208,7 @@ bool IsBlacklistedProcess(const wchar_t* exeName) {
         L"oculusclient.exe",
         L"oculusdash.exe",
         L"oculusmonitor.exe",
+        L"oculus-platform-runtime.exe",
         L"ovrredir.exe",
         L"ovrservicelauncher.exe",
         L"virtualdesktop.streamer.exe",

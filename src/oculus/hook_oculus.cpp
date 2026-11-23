@@ -363,8 +363,8 @@ bool EnsureOutputChains(ovrSession session, ovrTextureSwapChain leftInput, ovrTe
         const uint64_t px = static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH);
         if (px > g_cfg.upscaling.maxOutputPixels) {
             const double factor = std::sqrt(static_cast<double>(g_cfg.upscaling.maxOutputPixels) / static_cast<double>(px));
-            outW = static_cast<int>((std::max)(1.0, std::floor(outW * factor)));
-            outH = static_cast<int>((std::max)(1.0, std::floor(outH * factor)));
+            outW = (std::max)(2, static_cast<int>(std::floor(outW * factor)) & ~1);
+            outH = (std::max)(2, static_cast<int>(std::floor(outH * factor)) & ~1);
         }
 
         g_lastOutW = outW;
