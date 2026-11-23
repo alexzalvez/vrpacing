@@ -78,8 +78,8 @@ void DirectCopy(uint2 blockIdx, uint threadIdx)
         const float2 uv = float2(srcCenterX * kSrcNormX, srcCenterY * kSrcNormY);
 #endif
 
-        float3 c = in_texture.SampleLevel(samplerLinearClamp, uv, 0).rgb;
+        float4 c = in_texture.SampleLevel(samplerLinearClamp, uv, 0);
         const uint2 outCoord = uint2(dstX + kOutputViewportOriginX, dstY + kOutputViewportOriginY);
-        out_texture[outCoord] = float4(c, 1.0f) * mul;
+        out_texture[outCoord] = c * mul;
     }
 }

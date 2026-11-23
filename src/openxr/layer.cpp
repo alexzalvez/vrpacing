@@ -82,6 +82,9 @@ struct ProxySwapchain {
     uint32_t realHeight = 0;
     uint32_t arraySize = 1;
     int64_t format = 0;
+    uint32_t sampleCount = 1;
+    bool lastUsedAsQuad = false;
+    bool lastReleaseWas1to1 = false;
 };
 
 std::mutex g_layerMutex;
@@ -739,6 +742,7 @@ XrResult XRAPI_CALL Impl_xrCreateSwapchain(XrSession session, const XrSwapchainC
     proxy.realHeight = realH;
     proxy.arraySize = arrSize;
     proxy.format = createInfo->format;
+    proxy.sampleCount = appDesc.SampleDesc.Count;
 
     for (uint32_t i = 0; i < imgCount; ++i) {
         proxy.realTextures.push_back(realImgs[i].texture);
@@ -891,6 +895,19 @@ XrResult XRAPI_CALL Impl_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
                        " -> Real=" + std::to_string(proxy.realWidth) + "x" + std::to_string(proxy.realHeight) +
                        " Scale=" + std::to_string(g_cfg.upscaling.scale));
         }
+
+        if (proxy.lastUsedAsQuad && proxy.sampleCount <= 1 &&
+            proxy.appWidth <= proxy.realWidth && proxy.appHeight <= proxy.realHeight) {
+            for (uint32_t slice = 0; slice < numSlices; ++slice) {
+                const UINT sub = D3D11CalcSubresource(0, slice, 1);
+                g_d3d11Context->CopySubresourceRegion(
+                    proxy.realTextures[idx].Get(), sub, 0, 0, 0,
+                    proxy.appTextures[idx].Get(), sub, nullptr);
+            }
+            proxy.lastReleaseWas1to1 = true;
+            return g_nextReleaseSwapchainImage(proxy.realSwapchain, releaseInfo);
+        }
+        proxy.lastReleaseWas1to1 = false;
 
         if (g_vrsLastEnabled) {
             VrsFoveatedD3D11::Instance().DisableVRS(g_d3d11Context.Get(), true);
@@ -1203,67 +1220,6 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
 
     std::lock_guard<std::mutex> lock(g_layerMutex);
 
-    {
-        static uint64_t s_lastTopoHash = 0;
-        static uint32_t s_topoLogCount = 0;
-        if (s_topoLogCount < 12) {
-            uint64_t h = 14695981039346656037ULL;
-            auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
-            mix(frameEndInfo->layerCount);
-            for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
-                const auto* l = frameEndInfo->layers[i];
-                if (!l) { mix(0); continue; }
-                mix(static_cast<uint64_t>(l->type));
-                mix(static_cast<uint64_t>(l->layerFlags));
-                if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                    const auto* p = reinterpret_cast<const XrCompositionLayerProjection*>(l);
-                    mix(p->viewCount);
-                    if (p->viewCount > 0 && p->views) {
-                        mix(static_cast<uint64_t>(p->views[0].subImage.imageRect.extent.width));
-                        mix(static_cast<uint64_t>(p->views[0].subImage.imageRect.extent.height));
-                        mix(g_swapchains.find(p->views[0].subImage.swapchain) != g_swapchains.end() ? 1u : 0u);
-                    }
-                } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
-                    const auto* q = reinterpret_cast<const XrCompositionLayerQuad*>(l);
-                    mix(static_cast<uint64_t>(q->subImage.imageRect.extent.width));
-                    mix(static_cast<uint64_t>(q->subImage.imageRect.extent.height));
-                    mix(g_swapchains.find(q->subImage.swapchain) != g_swapchains.end() ? 1u : 0u);
-                }
-            }
-            if (h != s_lastTopoHash) {
-                s_lastTopoHash = h;
-                ++s_topoLogCount;
-                std::string diag = "OpenXR [EndFrame] layers=" + std::to_string(frameEndInfo->layerCount);
-                for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
-                    const auto* l = frameEndInfo->layers[i];
-                    if (!l) continue;
-                    diag += " | [" + std::to_string(i) + "] type=" + std::to_string(static_cast<int>(l->type)) +
-                            " flags=" + std::to_string(static_cast<uint64_t>(l->layerFlags));
-                    if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                        const auto* p = reinterpret_cast<const XrCompositionLayerProjection*>(l);
-                        diag += "(PROJ v=" + std::to_string(p->viewCount);
-                        if (p->viewCount > 0 && p->views) {
-                            const auto& r = p->views[0].subImage.imageRect;
-                            const bool isProxy = (g_swapchains.find(p->views[0].subImage.swapchain) != g_swapchains.end());
-                            diag += " proxy=" + std::to_string(isProxy ? 1 : 0) +
-                                    " rect=" + std::to_string(r.offset.x) + "," + std::to_string(r.offset.y) +
-                                    " " + std::to_string(r.extent.width) + "x" + std::to_string(r.extent.height);
-                        }
-                        diag += ")";
-                    } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
-                        const auto* q = reinterpret_cast<const XrCompositionLayerQuad*>(l);
-                        const auto& r = q->subImage.imageRect;
-                        const bool isProxy = (g_swapchains.find(q->subImage.swapchain) != g_swapchains.end());
-                        diag += "(QUAD proxy=" + std::to_string(isProxy ? 1 : 0) +
-                                " rect=" + std::to_string(r.offset.x) + "," + std::to_string(r.offset.y) +
-                                " " + std::to_string(r.extent.width) + "x" + std::to_string(r.extent.height) + ")";
-                    }
-                }
-                LogMessage(LogLevel::Info, diag);
-            }
-        }
-    }
-
     for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
         const auto* layer = frameEndInfo->layers[i];
         if (!layer) continue;
@@ -1277,14 +1233,17 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
                 auto& view = vCopy[v];
                 auto it = g_swapchains.find(view.subImage.swapchain);
                 if (it != g_swapchains.end()) {
-                    const auto& p = it->second;
-                    const double sx = static_cast<double>(p.realWidth) / p.appWidth;
-                    const double sy = static_cast<double>(p.realHeight) / p.appHeight;
+                    auto& p = it->second;
+                    p.lastUsedAsQuad = false;
+                    if (!p.lastReleaseWas1to1) {
+                        const double sx = static_cast<double>(p.realWidth) / p.appWidth;
+                        const double sy = static_cast<double>(p.realHeight) / p.appHeight;
 
-                    view.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(view.subImage.imageRect.offset.x * sx));
-                    view.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(view.subImage.imageRect.offset.y * sy));
-                    view.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(view.subImage.imageRect.extent.width * sx));
-                    view.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(view.subImage.imageRect.extent.height * sy));
+                        view.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(view.subImage.imageRect.offset.x * sx));
+                        view.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(view.subImage.imageRect.offset.y * sy));
+                        view.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(view.subImage.imageRect.extent.width * sx));
+                        view.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(view.subImage.imageRect.extent.height * sy));
+                    }
                 }
             }
             viewsCopies.push_back(std::move(vCopy));
@@ -1295,17 +1254,22 @@ XrResult XRAPI_CALL Impl_xrEndFrame(XrSession session, const XrFrameEndInfo* fra
             const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(layer);
             auto it = g_swapchains.find(quad->subImage.swapchain);
             if (it != g_swapchains.end()) {
-                XrCompositionLayerQuad qCopy = *quad;
-                const auto& p = it->second;
-                const double sx = static_cast<double>(p.realWidth) / p.appWidth;
-                const double sy = static_cast<double>(p.realHeight) / p.appHeight;
+                auto& p = it->second;
+                p.lastUsedAsQuad = true;
+                if (!p.lastReleaseWas1to1) {
+                    XrCompositionLayerQuad qCopy = *quad;
+                    const double sx = static_cast<double>(p.realWidth) / p.appWidth;
+                    const double sy = static_cast<double>(p.realHeight) / p.appHeight;
 
-                qCopy.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.x * sx));
-                qCopy.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.y * sy));
-                qCopy.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.width * sx));
-                qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.height * sy));
-                quadCopies.push_back(qCopy);
-                remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadCopies.back());
+                    qCopy.subImage.imageRect.offset.x = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.x * sx));
+                    qCopy.subImage.imageRect.offset.y = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.offset.y * sy));
+                    qCopy.subImage.imageRect.extent.width = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.width * sx));
+                    qCopy.subImage.imageRect.extent.height = static_cast<int32_t>(std::lround(qCopy.subImage.imageRect.extent.height * sy));
+                    quadCopies.push_back(qCopy);
+                    remapped[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadCopies.back());
+                } else {
+                    remapped[i] = layer;
+                }
             } else {
                 remapped[i] = layer;
             }
